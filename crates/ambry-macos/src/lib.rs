@@ -33,8 +33,8 @@ pub use toolbar::WindowToolbar;
 pub mod layout {
     /// Distance from the window's left and bottom edges.
     pub const INSET: f64 = 20.;
-    pub const HEIGHT: f64 = 36.;
-    pub const AVATAR: f64 = 36.;
+    pub const HEIGHT: f64 = 30.;
+    pub const AVATAR: f64 = 30.;
     pub const GAP_AFTER_AVATAR: f64 = 12.;
     /// Width of the GPUI-drawn switch used where AppKit is not available.
     pub const SEGMENTS_WIDTH: f64 = 70.;

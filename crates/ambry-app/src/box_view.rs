@@ -20,7 +20,7 @@ use crate::native_view::native;
 
 /// Width of each canvas/list tab in the native switch, in points.
 #[cfg(target_os = "macos")]
-const SWITCH_ITEM_WIDTH: f64 = 40.;
+const SWITCH_ITEM_WIDTH: f64 = 34.;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
@@ -140,8 +140,9 @@ struct NativeControls {
     table: ambry_macos::FileTable,
     /// The paths the table shows, to reload it only when the box changes.
     table_paths: Vec<PathBuf>,
-    /// The window toolbar with the canvas/list tabs and the add button.
-    toolbar: ambry_macos::WindowToolbar,
+    avatar: ambry_macos::GlassAvatar,
+    switch: ambry_macos::TabSwitch,
+    add: ambry_macos::GlassButton,
     subtitle: String,
     /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
     tune: String,
@@ -219,17 +220,27 @@ impl BoxView {
                     select.try_send(ControlEvent::Select(row)).ok();
                 },
             )?;
+            table.set_bottom_inset(layout::INSET * 2. + layout::HEIGHT);
             table.native().set_hidden(true);
+            let avatar =
+                ambry_macos::GlassAvatar::new(ns_view, avatar, &user_initial(), layout::AVATAR)?;
             let mode = events.clone();
-            let toolbar = ambry_macos::WindowToolbar::attach(
+            let switch = ambry_macos::TabSwitch::new(
                 ns_view,
                 &[("number", "Canvas"), ("list.bullet", "List")],
+                &[],
                 SWITCH_ITEM_WIDTH,
-                avatar,
-                &user_initial(),
-                move |index| {
-                    mode.try_send(ControlEvent::Mode(index)).ok();
+                move |event| {
+                    if let ambry_macos::TabEvent::Select(index) = event {
+                        mode.try_send(ControlEvent::Mode(index)).ok();
+                    }
                 },
+            )?;
+            let add = ambry_macos::GlassButton::new(
+                ns_view,
+                "plus",
+                "Add files or folders",
+                layout::HEIGHT,
                 move || {
                     events.try_send(ControlEvent::Add).ok();
                 },
@@ -238,7 +249,9 @@ impl BoxView {
                 ns_view,
                 table,
                 table_paths: Vec::new(),
-                toolbar,
+                avatar,
+                switch,
+                add,
                 subtitle: String::new(),
                 tune: String::new(),
                 look: None,
@@ -328,7 +341,7 @@ impl BoxView {
         controls.table.native().set_hidden(self.mode != Mode::List);
         let look = (DARK_MODE.get(), controls.tune.clone());
         if controls.look.as_ref() != Some(&look) {
-            run_probe(controls, &look.1);
+            apply_glass_look(controls, look.0, &look.1);
             controls.look = Some(look);
         }
         if controls.subtitle != status {
@@ -359,7 +372,7 @@ impl BoxView {
         #[cfg(target_os = "macos")]
         if let Some(controls) = &self.controls {
             controls
-                .toolbar
+                .switch
                 .select(if mode == Mode::Canvas { 0 } else { 1 });
         }
         cx.notify();
@@ -795,9 +808,18 @@ impl BoxView {
             .flex()
             .items_center()
             .gap(px(layout::GAP_AFTER_AVATAR as f32));
-        // On macOS the avatar, the switch and the add button live in the window toolbar.
         #[cfg(target_os = "macos")]
-        let _ = cx;
+        let bar = bar.when_some(self.controls.as_ref(), |bar, controls| {
+            let _ = cx;
+            bar.child(native(controls.avatar.native())).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::GAP as f32))
+                    .child(native(controls.switch.native()))
+                    .child(native(controls.add.native())),
+            )
+        });
         #[cfg(not(target_os = "macos"))]
         let bar = bar
             .child(self.render_avatar())
@@ -970,15 +992,39 @@ fn edge_fades() -> [impl IntoElement; 4] {
     ]
 }
 
-/// Runs the `poke` and `dump` lines of `tune` against the toolbar's AppKit views and writes
-/// the report next to the tune file.
+/// Tints the glass controls so they read as one set in either appearance. Lines like
+/// `dark.tabs = 0 0.2` in `tune` (white, alpha, or `none`) override the defaults.
 #[cfg(target_os = "macos")]
-fn run_probe(controls: &NativeControls, tune: &str) {
+fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
+    let theme = if dark { "dark" } else { "light" };
+    let value = |key: &str| {
+        tune.lines().find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == format!("{theme}.{key}")).then(|| value.trim().to_string())
+        })
+    };
+    let tint = |key: &str, default: Option<(f64, f64)>| match value(key) {
+        Some(value) if value == "none" => None,
+        Some(value) => {
+            let mut numbers = value.split_whitespace().filter_map(|n| n.parse().ok());
+            numbers.next().zip(numbers.next()).or(default)
+        }
+        None => default,
+    };
+    let strip = value("strip")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1.);
+    controls.switch.set_look(tint("tabs", None), strip);
+    controls.add.set_tint(tint("add", None));
+    controls.avatar.set_tint(tint("avatar", None));
+
+    // `poke` and `dump` lines look into AppKit's views; the report goes next to the file.
     if tune
         .lines()
         .any(|line| line.starts_with("poke") || line.trim() == "dump")
     {
-        let targets = controls.toolbar.probe_targets();
+        let mut targets = controls.switch.probe_targets();
+        targets.extend(controls.add.probe_targets());
         let report = ambry_macos::probe::run(&targets, tune);
         if let Some(file) = tune_file() {
             std::fs::write(file.with_file_name("probe-out.txt"), report).ok();

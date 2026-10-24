@@ -656,9 +656,9 @@ pub unsafe fn set_window_subtitle(ns_view: NonNull<c_void>, subtitle: &str) {
 /// Extra large is the 36 pt size toolbar controls use; it exists from macOS 26 on.
 pub(crate) fn control_size() -> NSControlSize {
     if has_liquid_glass() {
-        NSControlSize::ExtraLarge
-    } else {
         NSControlSize::Large
+    } else {
+        NSControlSize::Regular
     }
 }
 
