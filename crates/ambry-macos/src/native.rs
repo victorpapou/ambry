@@ -10,9 +10,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSBezelStyle, NSButton, NSColor, NSControlBorderShape, NSControlSize, NSFont,
-    NSGlassEffectView, NSImage, NSImageScaling, NSImageView, NSSegmentedControl, NSTabPosition,
-    NSTabView, NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField,
-    NSView,
+    NSGlassEffectView, NSImage, NSImageScaling, NSImageView, NSResponder, NSSegmentedControl,
+    NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem,
+    NSTextAlignment, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -437,6 +437,21 @@ pub(crate) fn selected_index(tabs: &NSTabView) -> Option<usize> {
     usize::try_from(tabs.indexOfTabViewItem(&item)).ok()
 }
 
+define_class!(
+    // An NSTabView that draws nothing itself: on macOS 26 a borderless tab view still draws a
+    // squashed content box across its tab strip, which shows through toolbar glass. The
+    // strip is a subview and draws as usual.
+    #[unsafe(super(NSTabView, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryTabStrip"]
+    struct TabStrip;
+
+    impl TabStrip {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {}
+    }
+);
+
 /// A borderless NSTabView with `count` empty tabs, decorated with `images` and sized to
 /// its tab strip. `item_width` of 0 keeps AppKit's own segment widths.
 pub(crate) fn icon_tab_view(
@@ -445,7 +460,11 @@ pub(crate) fn icon_tab_view(
     images: &[Retained<NSImage>],
     item_width: f64,
 ) -> Retained<NSTabView> {
-    let tabs = NSTabView::initWithFrame(NSTabView::alloc(mtm), NSRect::ZERO);
+    let tabs: Retained<NSTabView> = {
+        let strip: Retained<TabStrip> =
+            unsafe { msg_send![TabStrip::alloc(mtm), initWithFrame: NSRect::ZERO] };
+        Retained::into_super(strip)
+    };
     tabs.setTabPosition(NSTabPosition::Top);
     tabs.setTabViewBorderType(NSTabViewBorderType::None);
     tabs.setControlSize(control_size());
