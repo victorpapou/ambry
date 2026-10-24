@@ -647,7 +647,7 @@ impl WindowToolbar {
                         NSPoint::new(
                             0.,
                             if button.isFlipped() {
-                                AVATAR_SIZE + 6.
+                                button.bounds().size.height + 6.
                             } else {
                                 -6.
                             },
@@ -1030,22 +1030,10 @@ pub(crate) fn spring(layer: &AnyObject, key_path: &str, from: f64, to: f64, dura
 /// The account picture cut to a circle, or the user's initial as a button, for the toolbar
 /// to put on glass.
 fn account_button(mtm: MainThreadMarker) -> Retained<NSButton> {
+    // A plain bordered button, which the toolbar puts on glass like its other buttons.
     let button =
         unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
-    button.setBordered(false);
     button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown);
-    button.setFont(Some(&NSFont::systemFontOfSize_weight(13., unsafe {
-        objc2_app_kit::NSFontWeightMedium
-    })));
-    button.setTranslatesAutoresizingMaskIntoConstraints(false);
-    button
-        .widthAnchor()
-        .constraintEqualToConstant(AVATAR_SIZE)
-        .setActive(true);
-    button
-        .heightAnchor()
-        .constraintEqualToConstant(AVATAR_SIZE)
-        .setActive(true);
     button.setToolTip(Some(&NSString::from_str("Account")));
     button
 }
