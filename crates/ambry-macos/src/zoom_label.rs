@@ -185,9 +185,8 @@ impl ZoomLabel {
         let Some(class) = AnyClass::get(c"CAKeyframeAnimation") else {
             return;
         };
-        let from = layer
-            .presentationLayer()
-            .map_or(layer.opacity(), |shown| shown.opacity());
+        let from =
+            unsafe { layer.presentationLayer() }.map_or(layer.opacity(), |shown| shown.opacity());
         layer.setOpacity(0.);
         unsafe {
             let fade: Retained<AnyObject> = msg_send![
