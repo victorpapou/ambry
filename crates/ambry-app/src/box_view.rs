@@ -148,7 +148,7 @@ struct NativeControls {
     toolbar: ambry_macos::WindowToolbar,
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
-    shown_boxes: Vec<ambry_macos::BoxLabel>,
+    shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
     vertical: ambry_macos::CanvasScroller,
     horizontal: ambry_macos::CanvasScroller,
@@ -267,7 +267,7 @@ impl BoxView {
                 table_paths: Vec::new(),
                 toolbar,
                 shown_box: None,
-                shown_boxes: Vec::new(),
+                shown_boxes: (Vec::new(), None),
                 vertical,
                 horizontal,
                 shown_scroll: None,
@@ -379,23 +379,33 @@ impl BoxView {
             controls.table.select(selected);
         }
         controls.table.native().set_hidden(self.mode != Mode::List);
-        let shown = (box_label(&self.doc.name, &self.doc.icon), status);
+        let items = self.doc.items.len();
+        let shown = (box_label(&self.doc.name, &self.doc.icon, items), status);
         if controls.shown_box.as_ref() != Some(&shown) {
             controls.toolbar.set_box(&shown.0, &shown.1);
             controls.shown_box = Some(shown);
         }
+        // The open box shows what it holds now, not what was last saved.
+        let current = self
+            .boxes
+            .iter()
+            .position(|entry| entry.path == self.store.path());
         let boxes: Vec<ambry_macos::BoxLabel> = self
             .boxes
             .iter()
-            .map(|entry| box_label(&entry.name, &entry.icon))
+            .enumerate()
+            .map(|(index, entry)| {
+                let items = if Some(index) == current {
+                    items
+                } else {
+                    entry.items
+                };
+                box_label(&entry.name, &entry.icon, items)
+            })
             .collect();
-        if controls.shown_boxes != boxes {
-            let current = self
-                .boxes
-                .iter()
-                .position(|entry| entry.path == self.store.path());
+        if controls.shown_boxes != (boxes.clone(), current) {
             controls.toolbar.set_boxes(boxes.clone(), current);
-            controls.shown_boxes = boxes;
+            controls.shown_boxes = (boxes, current);
         }
         if controls.shown_scroll != Some(scroll) {
             controls.horizontal.set(h_proportion, h_value);
@@ -1183,11 +1193,12 @@ fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
 
 /// How the toolbar shows a box.
 #[cfg(target_os = "macos")]
-fn box_label(name: &str, icon: &BoxIcon) -> ambry_macos::BoxLabel {
+fn box_label(name: &str, icon: &BoxIcon, items: usize) -> ambry_macos::BoxLabel {
     ambry_macos::BoxLabel {
         name: name.to_string(),
         symbol: icon.symbol.clone(),
         color: icon.color.clone(),
+        items,
     }
 }
 

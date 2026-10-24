@@ -14,12 +14,13 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSControlStateValueOn, NSFont,
-    NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSPopover, NSPopoverBehavior,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSStackView, NSTabView, NSTextField, NSToolbar,
-    NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
-    NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSUserInterfaceLayoutOrientation,
-    NSView, NSViewController, NSWindowToolbarStyle,
+    NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSControlSize,
+    NSControlStateValueOn, NSEvent, NSFont, NSImage, NSImageScaling, NSImageSymbolConfiguration,
+    NSImageView, NSPopover, NSPopoverBehavior, NSSegmentSwitchTracking, NSSegmentedControl,
+    NSStackView, NSTabView, NSTextField, NSToolbar, NSToolbarDelegate,
+    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemIdentifier,
+    NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
+    NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindowToolbarStyle,
 };
 use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
 
@@ -31,6 +32,8 @@ const BOX: &str = "box";
 const ADD: &str = "add";
 const MODES: &str = "modes";
 const AVATAR: &str = "avatar";
+/// Width of each canvas/list segment, as in Freeform's Grid/List.
+const MODE_WIDTH: f64 = 38.;
 /// Point size of the account picture inside its glass circle.
 const AVATAR_SIZE: f64 = 28.;
 /// The box's icon tile next to its name.
@@ -71,10 +74,42 @@ pub struct BoxLabel {
     pub name: String,
     pub symbol: String,
     pub color: String,
+    /// How many items the box holds, shown at the end of its row.
+    pub items: usize,
 }
 
 struct DelegateIvars {
     items: Vec<(&'static str, Retained<NSToolbarItem>)>,
+}
+
+define_class!(
+    // Hears the pointer enter and leave a tracking area.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryHover"]
+    #[ivars = Box<dyn Fn(bool)>]
+    struct Hover;
+
+    unsafe impl NSObjectProtocol for Hover {}
+
+    impl Hover {
+        #[unsafe(method(mouseEntered:))]
+        fn entered(&self, _event: &NSEvent) {
+            (self.ivars())(true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn exited(&self, _event: &NSEvent) {
+            (self.ivars())(false);
+        }
+    }
+);
+
+impl Hover {
+    fn new(mtm: MainThreadMarker, on_hover: impl Fn(bool) + 'static) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Box::new(on_hover) as Box<dyn Fn(bool)>);
+        unsafe { msg_send![super(this), init] }
+    }
 }
 
 define_class!(
@@ -169,6 +204,23 @@ impl State {
         for (index, label) in self.boxes.borrow().iter().enumerate() {
             let row = list_row(mtm, &label.name, target, index as isize);
             row.setImage(colored_symbol(&label.symbol, &label.color).as_deref());
+            let count =
+                NSTextField::labelWithString(&NSString::from_str(&label.items.to_string()), mtm);
+            count.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
+                13.,
+                unsafe { objc2_app_kit::NSFontWeightRegular },
+            )));
+            count.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            count.setTranslatesAutoresizingMaskIntoConstraints(false);
+            row.addSubview(&count);
+            count
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&row.trailingAnchor(), -10.)
+                .setActive(true);
+            count
+                .centerYAnchor()
+                .constraintEqualToAnchor(&row.centerYAnchor())
+                .setActive(true);
             if self.current.get() == Some(index) {
                 row.setState(NSControlStateValueOn);
                 if let Some(check) = symbol("checkmark", "Open") {
@@ -247,6 +299,8 @@ pub struct WindowToolbar {
     status: Retained<NSTextField>,
     _delegate: Retained<Delegate>,
     _targets: Vec<Retained<Target>>,
+    /// The tracking area's owner, which it does not retain.
+    _hover: Retained<Hover>,
 }
 
 impl WindowToolbar {
@@ -299,10 +353,25 @@ impl WindowToolbar {
         name.setFont(Some(&NSFont::systemFontOfSize_weight(15., unsafe {
             objc2_app_kit::NSFontWeightSemibold
         })));
-        if let Some(chevron) = small_symbol("chevron.down", "Boxes") {
-            name.setImage(Some(&chevron));
-            name.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageTrailing);
-        }
+        // The chevron shows only under the pointer, pushing the status aside.
+        name.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageTrailing);
+        let chevron = small_symbol("chevron.down", "Boxes");
+        let hover = Hover::new(mtm, {
+            let name = name.clone();
+            move |inside| name.setImage(chevron.as_deref().filter(|_| inside))
+        });
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::ActiveAlways
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(&hover),
+                None,
+            )
+        };
+        name.addTrackingArea(&tracking);
         name.setToolTip(Some(&NSString::from_str("Switch box")));
         let status = NSTextField::labelWithString(&NSString::new(), mtm);
         status.setFont(Some(&NSFont::systemFontOfSize(15.)));
@@ -425,6 +494,8 @@ impl WindowToolbar {
         let tabs = icon_tab_view(mtm, images.len(), &images, 0.);
         let strip = segments(&tabs)?;
         strip.removeFromSuperview();
+        tabs.setControlSize(NSControlSize::ExtraLarge);
+        size_modes(&strip, &images);
         let modes_target = Target::with_tabs(
             mtm,
             {
@@ -435,7 +506,7 @@ impl WindowToolbar {
                         return;
                     };
                     // NSTabView may rebuild its segments on selection; put the icons back.
-                    decorate_strip(&strip, &images, 0.);
+                    size_modes(&strip, &images);
                     if let Some(index) = selected_index(tabs) {
                         (state.on_event)(ToolbarEvent::Mode(index));
                     }
@@ -475,6 +546,7 @@ impl WindowToolbar {
             modes: tabs,
             status,
             _delegate: delegate,
+            _hover: hover,
             _targets: vec![
                 tile_target,
                 menu_target,
@@ -512,6 +584,14 @@ impl WindowToolbar {
         *self.state.boxes.borrow_mut() = boxes;
         self.state.current.set(current);
     }
+}
+
+/// The switch at the size of the toolbar's other glass, like Freeform's Grid/List: extra
+/// large, with segments of one width so the grey pill sits the same on either.
+fn size_modes(strip: &NSSegmentedControl, images: &[Retained<NSImage>]) {
+    decorate_strip(strip, images, MODE_WIDTH);
+    strip.setControlSize(NSControlSize::ExtraLarge);
+    strip.sizeToFit();
 }
 
 fn item(mtm: MainThreadMarker, id: &str, label: &str) -> Retained<NSToolbarItem> {

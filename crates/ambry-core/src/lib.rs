@@ -189,6 +189,8 @@ pub struct BoxEntry {
     pub path: PathBuf,
     pub name: String,
     pub icon: BoxIcon,
+    /// How many items the box holds.
+    pub items: usize,
 }
 
 /// Every box saved in `dir`, by name.
@@ -204,6 +206,7 @@ pub fn list_boxes(dir: &Path) -> Vec<BoxEntry> {
             let doc = Store::new(&path).load_or_new("").ok()?;
             Some(BoxEntry {
                 path,
+                items: doc.items.len(),
                 name: doc.name,
                 icon: doc.icon,
             })
