@@ -495,8 +495,8 @@ impl GlassButton {
         self.button.setBezelColor(tint_color(tint).as_deref());
     }
 
-    /// Fills the glass white and draws the symbol black over it, the look of a window's main
-    /// action.
+    /// Fills the glass white, draws the symbol black over it and casts a shadow under it, the
+    /// look of a window's main action.
     pub fn set_white(&self) {
         self.button.setBezelColor(Some(&NSColor::whiteColor()));
         if self.button.respondsToSelector(sel!(setTintProminence:)) {
@@ -505,6 +505,14 @@ impl GlassButton {
         }
         self.button
             .setContentTintColor(Some(&NSColor::blackColor()));
+        // A soft shadow under it, so it floats over the canvas.
+        self.button.setWantsLayer(true);
+        if let Some(layer) = self.button.layer() {
+            layer.setShadowColor(Some(&NSColor::blackColor().CGColor()));
+            layer.setShadowOpacity(0.3);
+            layer.setShadowRadius(8.);
+            layer.setShadowOffset(NSSize::new(0., -3.));
+        }
     }
 
     /// The button and its insides, by name, for [`crate::probe::run`].

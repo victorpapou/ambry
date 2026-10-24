@@ -27,7 +27,7 @@ use objc2_foundation::{
     NSArray, NSCopying, NSMutableArray, NSNotification, NSNumber, NSPoint, NSRect, NSRectEdge,
     NSSize, NSString, NSURL,
 };
-use objc2_quartz_core::CAMediaTimingFunction;
+use objc2_quartz_core::{CALayer, CAMediaTimingFunction, CATransaction};
 
 use crate::box_list::BoxList;
 use crate::icon_picker::IconPicker;
@@ -45,8 +45,11 @@ const MODE_WIDTH: f64 = 32.;
 const AVATAR_SIZE: f64 = 28.;
 /// The box's icon tile next to its name, as big as a shortcut's in the Shortcuts editor.
 const TILE: f64 = 26.;
-/// Font size of the box's name and status.
-const TITLE_SIZE: f64 = 15.;
+/// Font sizes of the box's name and of the status under it.
+const TITLE_SIZE: f64 = 14.;
+const STATUS_SIZE: f64 = 11.;
+/// One pass of the light sweeping over the status, in seconds.
+const SWEEP: f64 = 1.6;
 const CHEVRON_SIZE: f64 = 12.;
 /// Room the chevron takes after the name when it shows.
 const CHEVRON_GAP: f64 = 5.;
@@ -236,8 +239,57 @@ impl State {
     }
 }
 
+/// A light that sweeps over `label` again and again, the way a thinking agent's status
+/// shimmers: a mask brighter in a band that slides from left to right.
+fn sweep(label: &NSTextField) {
+    label.setWantsLayer(true);
+    let (Some(layer), Some(gradient), Some(basic)) = (
+        label.layer(),
+        AnyClass::get(c"CAGradientLayer"),
+        AnyClass::get(c"CABasicAnimation"),
+    ) else {
+        return;
+    };
+    let dim = NSColor::colorWithWhite_alpha(0., 0.45).CGColor();
+    let bright = NSColor::colorWithWhite_alpha(0., 1.).CGColor();
+    let colors = NSMutableArray::<AnyObject>::new();
+    for color in [&dim, &bright, &dim] {
+        colors.addObject(crate::tilt::bridged(&**color));
+    }
+    let numbers = |values: [f64; 3]| NSArray::from_retained_slice(&values.map(NSNumber::new_f64));
+    unsafe {
+        let mask: Retained<CALayer> = msg_send![gradient, layer];
+        let _: () = msg_send![&*mask, setColors: &*colors];
+        let _: () = msg_send![&*mask, setStartPoint: NSPoint::new(0., 0.5)];
+        let _: () = msg_send![&*mask, setEndPoint: NSPoint::new(1., 0.5)];
+        let _: () = msg_send![&*mask, setLocations: &*numbers([0., 0.15, 0.3])];
+        mask.setFrame(label.bounds());
+        layer.setMask(Some(&mask));
+        let animation: Retained<AnyObject> =
+            msg_send![basic, animationWithKeyPath: &*NSString::from_str("locations")];
+        let _: () = msg_send![&*animation, setFromValue: &*numbers([-0.3, -0.15, 0.])];
+        let _: () = msg_send![&*animation, setToValue: &*numbers([1., 1.15, 1.3])];
+        let _: () = msg_send![&*animation, setDuration: SWEEP];
+        let _: () = msg_send![&*animation, setRepeatCount: f32::INFINITY];
+        let _: () =
+            msg_send![&*mask, addAnimation: &*animation, forKey: &*NSString::from_str("sweep")];
+    }
+}
+
+/// Sizes the sweep's mask to the label's text after it changes.
+fn fit_sweep(label: &NSTextField) {
+    let Some(mask) = label.layer().and_then(|layer| layer.mask()) else {
+        return;
+    };
+    let size = label.fittingSize();
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    mask.setFrame(NSRect::new(NSPoint::ZERO, size));
+    CATransaction::commit();
+}
+
 /// The chevron after the box's name: it comes out of a blur while the pointer is over the
-/// name or the box list is open, pushing the status aside.
+/// name or the box list is open.
 struct Chevron {
     image: Retained<NSImageView>,
     width: Retained<NSLayoutConstraint>,
@@ -408,6 +460,7 @@ impl WindowToolbar {
             unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
         name.setBordered(false);
         name.setFont(Some(&title_font));
+        name.setContentTintColor(Some(&NSColor::labelColor()));
         name.setToolTip(Some(&NSString::from_str("Switch box")));
 
         // The chevron is smaller than the name and a step heavier, so its strokes come out as
@@ -475,8 +528,9 @@ impl WindowToolbar {
         }
 
         let status = NSTextField::labelWithString(&NSString::new(), mtm);
-        status.setFont(Some(&NSFont::systemFontOfSize(TITLE_SIZE)));
+        status.setFont(Some(&NSFont::systemFontOfSize(STATUS_SIZE)));
         status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        sweep(&status);
         // An empty view after the status gives the chevron its room while it is hidden and
         // shrinks as the chevron opens, so the item keeps its width and both move together.
         let spare_view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
@@ -485,20 +539,33 @@ impl WindowToolbar {
             .widthAnchor()
             .constraintEqualToConstant(open_width);
         spare.setActive(true);
-        let stack = NSStackView::stackViewWithViews(
+        // The name with its chevron, and the status under them.
+        let name_row = NSStackView::stackViewWithViews(
             &NSArray::from_retained_slice(&[
-                tile.clone(),
                 Retained::into_super(Retained::into_super(name.clone())),
                 holder.clone(),
-                Retained::into_super(Retained::into_super(status.clone())),
                 spare_view,
             ]),
             mtm,
         );
+        name_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        name_row.setSpacing(0.);
+        let titles = NSStackView::stackViewWithViews(
+            &NSArray::from_retained_slice(&[
+                Retained::into_super(name_row),
+                Retained::into_super(Retained::into_super(status.clone())),
+            ]),
+            mtm,
+        );
+        titles.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        titles.setAlignment(objc2_app_kit::NSLayoutAttribute::Leading);
+        titles.setSpacing(0.);
+        let stack = NSStackView::stackViewWithViews(
+            &NSArray::from_retained_slice(&[tile.clone(), Retained::into_super(titles)]),
+            mtm,
+        );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         stack.setSpacing(10.);
-        stack.setCustomSpacing_afterView(0., &name);
-        stack.setCustomSpacing_afterView(0., &status);
         // Shortcuts keeps its icon 16 points from the traffic lights.
         stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
             top: 0.,
@@ -696,6 +763,7 @@ impl WindowToolbar {
         state.picker.mark(&label.color, &label.symbol);
         self.state.name.setTitle(&NSString::from_str(&label.name));
         self.status.setStringValue(&NSString::from_str(status));
+        fit_sweep(&self.status);
     }
 
     /// Shows the account's `picture`, or its `initial` when there is none.
