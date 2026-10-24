@@ -282,6 +282,7 @@ impl BoxView {
         let controls = unsafe {
             let scrolled = events.clone();
             let previewed = events.clone();
+            let pinched = events.clone();
             let configured = events.clone();
             ambry_macos::settings::configure(
                 avatar_path().unwrap_or_default(),
@@ -314,7 +315,6 @@ impl BoxView {
                     events.try_send(event).ok();
                 },
             )?;
-            let pinched = events.clone();
             let pinch = ambry_macos::PinchZoom::new(ns_view, move |step, x, y| {
                 pinched.try_send(ControlEvent::Zoom(step, x, y)).ok();
             })?;
