@@ -1008,6 +1008,18 @@ pub(crate) fn paint_tile(tile: &NSView, color: &str, size: f64, radius: f64) {
 /// Runs a spring on `layer`'s `key_path` from `from` to `to`, as SwiftUI's default spring
 /// over `duration` seconds, and leaves the layer at `to`.
 pub(crate) fn spring(layer: &AnyObject, key_path: &str, from: f64, to: f64, duration: f64) {
+    bouncy_spring(layer, key_path, from, to, duration, 0.);
+}
+
+/// [`spring`] with `bounce`: 0 settles without overshoot, 0.3 overshoots a little.
+pub(crate) fn bouncy_spring(
+    layer: &AnyObject,
+    key_path: &str,
+    from: f64,
+    to: f64,
+    duration: f64,
+    bounce: f64,
+) {
     let key = NSString::from_str(key_path);
     let to_value = NSNumber::new_f64(to);
     unsafe {
@@ -1017,7 +1029,7 @@ pub(crate) fn spring(layer: &AnyObject, key_path: &str, from: f64, to: f64, dura
         };
         let animation: Allocated<AnyObject> = msg_send![class, alloc];
         let animation: Retained<AnyObject> =
-            msg_send![animation, initWithPerceptualDuration: duration, bounce: 0.0f64];
+            msg_send![animation, initWithPerceptualDuration: duration, bounce: bounce];
         let _: () = msg_send![&*animation, setKeyPath: &*key];
         let _: () = msg_send![&*animation, setFromValue: &*NSNumber::new_f64(from)];
         let _: () = msg_send![&*animation, setToValue: &*to_value];
