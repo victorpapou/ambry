@@ -18,9 +18,9 @@ use gpui::{
 #[cfg(target_os = "macos")]
 use crate::native_view::native;
 
-/// Width of each canvas/list tab in the native switch, in points.
+/// Space between the round canvas and list tabs, in points.
 #[cfg(target_os = "macos")]
-const SWITCH_ITEM_WIDTH: f64 = 34.;
+const TAB_GAP: f64 = 2.;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
@@ -141,7 +141,7 @@ struct NativeControls {
     /// The paths the table shows, to reload it only when the box changes.
     table_paths: Vec<PathBuf>,
     avatar: ambry_macos::GlassAvatar,
-    switch: ambry_macos::TabSwitch,
+    switch: ambry_macos::GlassTabs,
     add: ambry_macos::GlassButton,
     subtitle: String,
     /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
@@ -225,15 +225,13 @@ impl BoxView {
             let avatar =
                 ambry_macos::GlassAvatar::new(ns_view, avatar, &user_initial(), layout::AVATAR)?;
             let mode = events.clone();
-            let switch = ambry_macos::TabSwitch::new(
+            let switch = ambry_macos::GlassTabs::new(
                 ns_view,
                 &[("number", "Canvas"), ("list.bullet", "List")],
-                &[],
-                SWITCH_ITEM_WIDTH,
-                move |event| {
-                    if let ambry_macos::TabEvent::Select(index) = event {
-                        mode.try_send(ControlEvent::Mode(index)).ok();
-                    }
+                layout::HEIGHT,
+                TAB_GAP,
+                move |index| {
+                    mode.try_send(ControlEvent::Mode(index)).ok();
                 },
             )?;
             let add = ambry_macos::GlassButton::new(
@@ -1011,10 +1009,7 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
         }
         None => default,
     };
-    let strip = value("strip")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1.);
-    controls.switch.set_look(tint("tabs", None), strip);
+    controls.switch.set_selected_tint(tint("selected", None));
     controls.add.set_tint(tint("add", None));
     controls.avatar.set_tint(tint("avatar", None));
 

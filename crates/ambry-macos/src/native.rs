@@ -564,6 +564,133 @@ impl GlassButton {
     }
 }
 
+/// Tabs as round Liquid Glass buttons, the same material as [`GlassButton`], grouped in a
+/// glass container so neighbours melt into one capsule. The selected tab gets a grey tint.
+pub struct GlassTabs {
+    native: NativeView,
+    container: Option<Retained<objc2_app_kit::NSGlassEffectContainerView>>,
+    buttons: Vec<Retained<NSButton>>,
+    selected: Cell<usize>,
+    selected_tint: Cell<Option<(f64, f64)>>,
+}
+
+impl GlassTabs {
+    /// One round glass button `size` points across per `(symbol, description)`, `gap` points
+    /// apart. `on_select` gets the tab the user picks.
+    ///
+    /// # Safety
+    /// `ns_view` must point to a live `NSView`, and this must run on the main thread.
+    pub unsafe fn new(
+        ns_view: NonNull<c_void>,
+        icons: &[(&str, &str)],
+        size: f64,
+        gap: f64,
+        on_select: impl Fn(usize) + 'static,
+    ) -> Option<Self> {
+        let mtm = MainThreadMarker::new()?;
+        let parent: &NSView = unsafe { ns_view.cast().as_ref() };
+        let target = Target::new(mtm, move |sender| {
+            if let Some(button) = sender.downcast_ref::<NSButton>() {
+                on_select(button.tag().max(0) as usize);
+            }
+        });
+        let count = icons.len() as f64;
+        let bounds = NSRect::new(
+            NSPoint::new(0., 0.),
+            NSSize::new(count * size + (count - 1.) * gap, size),
+        );
+        let holder = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+        let mut buttons = Vec::new();
+        for (index, (name, description)) in icons.iter().enumerate() {
+            let image = symbol(name, description)?;
+            let button = unsafe {
+                NSButton::buttonWithImage_target_action(
+                    &image,
+                    Some(&target),
+                    Some(sel!(fire:)),
+                    mtm,
+                )
+            };
+            button.setControlSize(NSControlSize::Large);
+            button.setBezelStyle(if has_liquid_glass() {
+                NSBezelStyle::Glass
+            } else {
+                NSBezelStyle::Circular
+            });
+            button.setToolTip(Some(&NSString::from_str(description)));
+            button.setTag(index as isize);
+            button.setFrame(NSRect::new(
+                NSPoint::new(index as f64 * (size + gap), 0.),
+                NSSize::new(size, size),
+            ));
+            holder.addSubview(&button);
+            buttons.push(button);
+        }
+        let container = has_liquid_glass().then(|| {
+            let container = objc2_app_kit::NSGlassEffectContainerView::initWithFrame(
+                objc2_app_kit::NSGlassEffectContainerView::alloc(mtm),
+                bounds,
+            );
+            // Glass shapes closer than this melt together.
+            container.setSpacing(gap + 2.);
+            container.setContentView(Some(&holder));
+            container
+        });
+        let view: Retained<NSView> = match &container {
+            Some(container) => Retained::into_super(container.clone()),
+            None => holder,
+        };
+        let tabs = Self {
+            native: NativeView::host(parent, view, target),
+            container,
+            buttons,
+            selected: Cell::new(usize::MAX),
+            selected_tint: Cell::new(None),
+        };
+        tabs.select(0);
+        Some(tabs)
+    }
+
+    pub fn native(&self) -> &NativeView {
+        &self.native
+    }
+
+    /// Marks tab `index` as the selected one.
+    pub fn select(&self, index: usize) {
+        if self.selected.replace(index) == index {
+            return;
+        }
+        self.paint();
+    }
+
+    /// Tint for the selected tab as `(white, alpha)`; `None` uses the system fill color.
+    pub fn set_selected_tint(&self, tint: Option<(f64, f64)>) {
+        self.selected_tint.set(tint);
+        self.paint();
+    }
+
+    fn paint(&self) {
+        let selected = self.selected.get();
+        let tint = tint_color(self.selected_tint.get()).unwrap_or_else(NSColor::systemFillColor);
+        for (index, button) in self.buttons.iter().enumerate() {
+            button.setBezelColor((index == selected).then_some(&*tint));
+        }
+    }
+
+    /// The container and buttons, by name, for [`crate::probe::run`].
+    pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
+        let mut targets = Vec::new();
+        if let Some(container) = &self.container {
+            targets.push(("container".to_string(), object(container.clone())));
+            targets.push(("tabs-root".to_string(), object(container.clone())));
+        }
+        for (index, button) in self.buttons.iter().enumerate() {
+            targets.push((format!("b{index}"), object(button.clone())));
+        }
+        targets
+    }
+}
+
 /// The account picture (or initial) on a round Liquid Glass disc.
 pub struct GlassAvatar {
     native: NativeView,

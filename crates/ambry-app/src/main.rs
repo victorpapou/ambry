@@ -23,7 +23,7 @@ fn main() {
                 BoxDoc::new(DEFAULT_BOX)
             });
 
-            let bounds = Bounds::centered(None, size(px(960.), px(680.)), cx);
+            let bounds = Bounds::centered(None, size(px(720.), px(520.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
