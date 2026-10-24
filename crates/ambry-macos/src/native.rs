@@ -328,6 +328,110 @@ fn tint_color(tint: Option<(f64, f64)>) -> Option<Retained<NSColor>> {
     tint.map(|(white, alpha)| NSColor::colorWithWhite_alpha(white, alpha))
 }
 
+/// Icon segments on Liquid Glass with a grey selection pill, the look of a segmented control
+/// in a window toolbar, for windows that put their controls elsewhere.
+pub struct GlassSegments {
+    native: NativeView,
+    control: Retained<NSSegmentedControl>,
+    glass: Option<Retained<NSGlassEffectView>>,
+}
+
+impl GlassSegments {
+    /// Adds one icon segment per `(symbol, description)` to `ns_view`; `on_select` gets the
+    /// segment the user picks.
+    ///
+    /// # Safety
+    /// `ns_view` must point to a live `NSView`, and this must run on the main thread.
+    pub unsafe fn new(
+        ns_view: NonNull<c_void>,
+        icons: &[(&str, &str)],
+        item_width: f64,
+        on_select: impl Fn(usize) + 'static,
+    ) -> Option<Self> {
+        let mtm = MainThreadMarker::new()?;
+        let parent: &NSView = unsafe { ns_view.cast().as_ref() };
+        let images = icon_images(icons)?;
+        let target = Target::new(mtm, move |sender| {
+            if let Some(control) = sender.downcast_ref::<NSSegmentedControl>() {
+                if let Ok(index) = usize::try_from(control.selectedSegment()) {
+                    on_select(index);
+                }
+            }
+        });
+        let control = unsafe {
+            NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
+                &objc2_foundation::NSArray::from_retained_slice(&images),
+                objc2_app_kit::NSSegmentSwitchTracking::SelectOne,
+                Some(&target),
+                Some(sel!(fire:)),
+                mtm,
+            )
+        };
+        control.setControlSize(control_size());
+        let glass = has_liquid_glass();
+        if glass {
+            control.setBorderShape(NSControlBorderShape::Capsule);
+        }
+        for segment in 0..icons.len() as isize {
+            if item_width > 0. {
+                control.setWidth_forSegment(item_width, segment);
+            }
+        }
+        control.setSelectedSegmentBezelColor(Some(&NSColor::systemFillColor()));
+        control.setSelectedSegment(0);
+        control.sizeToFit();
+        let glass = glass.then(|| {
+            let frame = control.frame();
+            let bounds = NSRect::new(NSPoint::new(0., 0.), frame.size);
+            control.setFrameOrigin(NSPoint::new(0., 0.));
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
+            glass.setCornerRadius(frame.size.height / 2.);
+            glass.setContentView(Some(&control));
+            glass
+        });
+        let view: Retained<NSView> = match &glass {
+            Some(glass) => Retained::into_super(glass.clone()),
+            None => Retained::into_super(Retained::into_super(control.clone())),
+        };
+        Some(Self {
+            native: NativeView::host(parent, view, target),
+            control,
+            glass,
+        })
+    }
+
+    pub fn native(&self) -> &NativeView {
+        &self.native
+    }
+
+    /// Selects segment `index` without reporting it.
+    pub fn select(&self, index: usize) {
+        if self.control.selectedSegment() != index as isize {
+            self.control.setSelectedSegment(index as isize);
+        }
+    }
+
+    /// Tints the glass with `(white, alpha)` and fades the segments.
+    pub fn set_look(&self, tint: Option<(f64, f64)>, alpha: f64) {
+        if let Some(glass) = &self.glass {
+            glass.setTintColor(tint_color(tint).as_deref());
+        }
+        self.control.setAlphaValue(alpha);
+    }
+
+    /// The views behind the segments, by name, for [`crate::probe::run`].
+    pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
+        let mut targets = vec![("control".to_string(), object(self.control.clone()))];
+        if let Some(glass) = &self.glass {
+            targets.push(("tabs-root".into(), object(glass.clone())));
+        }
+        if let Some(hosting) = self.control.subviews().firstObject() {
+            targets.push(("hosting".into(), object(hosting)));
+        }
+        targets
+    }
+}
+
 fn selected_index(tabs: &NSTabView) -> Option<usize> {
     let item = tabs.selectedTabViewItem()?;
     usize::try_from(tabs.indexOfTabViewItem(&item)).ok()

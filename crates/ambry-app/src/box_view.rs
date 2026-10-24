@@ -141,7 +141,7 @@ struct NativeControls {
     /// The paths the table shows, to reload it only when the box changes.
     table_paths: Vec<PathBuf>,
     avatar: ambry_macos::GlassAvatar,
-    switch: ambry_macos::TabSwitch,
+    switch: ambry_macos::GlassSegments,
     add: ambry_macos::GlassButton,
     subtitle: String,
     /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
@@ -225,15 +225,12 @@ impl BoxView {
             let avatar =
                 ambry_macos::GlassAvatar::new(ns_view, avatar, &user_initial(), layout::AVATAR)?;
             let mode = events.clone();
-            let switch = ambry_macos::TabSwitch::new(
+            let switch = ambry_macos::GlassSegments::new(
                 ns_view,
                 &[("number", "Canvas"), ("list.bullet", "List")],
-                &[],
                 SWITCH_ITEM_WIDTH,
-                move |event| {
-                    if let ambry_macos::TabEvent::Select(index) = event {
-                        mode.try_send(ControlEvent::Mode(index)).ok();
-                    }
+                move |index| {
+                    mode.try_send(ControlEvent::Mode(index)).ok();
                 },
             )?;
             let add = ambry_macos::GlassButton::new(

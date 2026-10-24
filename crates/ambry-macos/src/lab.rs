@@ -25,6 +25,13 @@ pub fn open_switch_lab() {
             in_glass(mtm, &toolbar_look_segments(mtm)),
         ),
         ("W segmented, toolbar look", toolbar_look_segments(mtm)),
+        ("Y segmented, grey, glass", {
+            let control = toolbar_look_segments(mtm);
+            if let Ok(control) = control.clone().downcast::<NSSegmentedControl>() {
+                control.setSelectedSegmentBezelColor(Some(&NSColor::systemFillColor()));
+            }
+            in_glass(mtm, &control)
+        }),
         ("R glass + tabs", in_glass(mtm, &icon_tabs(mtm, 40.))),
         ("S glass + tabs, no bg", in_glass(mtm, &bare_tabs(mtm))),
         (

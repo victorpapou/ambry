@@ -19,7 +19,9 @@ mod table;
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
 #[cfg(target_os = "macos")]
-pub use native::{GlassAvatar, GlassButton, NativeView, TabEvent, TabSwitch, set_window_subtitle};
+pub use native::{
+    GlassAvatar, GlassButton, GlassSegments, NativeView, TabEvent, TabSwitch, set_window_subtitle,
+};
 #[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
 
