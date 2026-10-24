@@ -286,12 +286,10 @@ fn tint_color(tint: Option<(f64, f64)>) -> Option<Retained<NSColor>> {
     tint.map(|(white, alpha)| NSColor::colorWithWhite_alpha(white, alpha))
 }
 
-/// Icon segments on Liquid Glass with a grey selection pill, the look of a segmented control
-/// in a window toolbar, for windows that put their controls elsewhere.
+/// A native capsule segmented control with icon segments and a grey selection pill.
 pub struct GlassSegments {
     native: NativeView,
     control: Retained<NSSegmentedControl>,
-    glass: Option<Retained<NSGlassEffectView>>,
 }
 
 impl GlassSegments {
@@ -326,8 +324,7 @@ impl GlassSegments {
             )
         };
         control.setControlSize(control_size());
-        let glass = has_liquid_glass();
-        if glass {
+        if has_liquid_glass() {
             control.setBorderShape(NSControlBorderShape::Capsule);
         }
         for segment in 0..icons.len() as isize {
@@ -338,23 +335,10 @@ impl GlassSegments {
         control.setSelectedSegmentBezelColor(Some(&NSColor::systemFillColor()));
         control.setSelectedSegment(0);
         control.sizeToFit();
-        let glass = glass.then(|| {
-            let frame = control.frame();
-            let bounds = NSRect::new(NSPoint::new(0., 0.), frame.size);
-            control.setFrameOrigin(NSPoint::new(0., 0.));
-            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
-            glass.setCornerRadius(frame.size.height / 2.);
-            glass.setContentView(Some(&control));
-            glass
-        });
-        let view: Retained<NSView> = match &glass {
-            Some(glass) => Retained::into_super(glass.clone()),
-            None => Retained::into_super(Retained::into_super(control.clone())),
-        };
+        let view: Retained<NSView> = Retained::into_super(Retained::into_super(control.clone()));
         Some(Self {
             native: NativeView::host(parent, view, target),
             control,
-            glass,
         })
     }
 
@@ -369,20 +353,14 @@ impl GlassSegments {
         }
     }
 
-    /// Tints the glass with `(white, alpha)` and fades the segments.
-    pub fn set_look(&self, tint: Option<(f64, f64)>, alpha: f64) {
-        if let Some(glass) = &self.glass {
-            glass.setTintColor(tint_color(tint).as_deref());
-        }
+    /// Fades the segments.
+    pub fn set_alpha(&self, alpha: f64) {
         self.control.setAlphaValue(alpha);
     }
 
     /// The views behind the segments, by name, for [`crate::probe::run`].
     pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
         let mut targets = vec![("control".to_string(), object(self.control.clone()))];
-        if let Some(glass) = &self.glass {
-            targets.push(("tabs-root".into(), object(glass.clone())));
-        }
         if let Some(hosting) = self.control.subviews().firstObject() {
             targets.push(("hosting".into(), object(hosting)));
         }

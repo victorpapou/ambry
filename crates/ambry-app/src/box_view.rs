@@ -18,9 +18,9 @@ use gpui::{
 #[cfg(target_os = "macos")]
 use crate::native_view::native;
 
-/// Width of each canvas/list tab in the native switch, in points.
+/// Width of each canvas/list segment in the native switch, in points.
 #[cfg(target_os = "macos")]
-const SWITCH_ITEM_WIDTH: f64 = 30.;
+const SWITCH_ITEM_WIDTH: f64 = 34.;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
@@ -141,9 +141,8 @@ struct NativeControls {
     /// The paths the table shows, to reload it only when the box changes.
     table_paths: Vec<PathBuf>,
     avatar: ambry_macos::GlassAvatar,
-    switch: ambry_macos::TabSwitch,
+    switch: ambry_macos::GlassSegments,
     add: ambry_macos::GlassButton,
-    subtitle: String,
     /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
     tune: String,
     /// The look last applied, to touch AppKit only when it changes.
@@ -207,7 +206,7 @@ impl BoxView {
         let ns_view = appkit.ns_view;
         let (events, received) = async_channel::unbounded();
         // SAFETY: GPUI hands out its own live content view and we are on the main thread.
-        // The table goes in first so the bottom bar floats above it.
+        // The table goes in first so the controls float above it.
         let controls = unsafe {
             let open = events.clone();
             let select = events.clone();
@@ -220,20 +219,16 @@ impl BoxView {
                     select.try_send(ControlEvent::Select(row)).ok();
                 },
             )?;
-            table.set_bottom_inset(layout::INSET * 2. + layout::HEIGHT);
             table.native().set_hidden(true);
             let avatar =
                 ambry_macos::GlassAvatar::new(ns_view, avatar, &user_initial(), layout::AVATAR)?;
             let mode = events.clone();
-            let switch = ambry_macos::TabSwitch::new(
+            let switch = ambry_macos::GlassSegments::new(
                 ns_view,
                 &[("number", "Canvas"), ("list.bullet", "List")],
-                &[],
                 SWITCH_ITEM_WIDTH,
-                move |event| {
-                    if let ambry_macos::TabEvent::Select(index) = event {
-                        mode.try_send(ControlEvent::Mode(index)).ok();
-                    }
+                move |index| {
+                    mode.try_send(ControlEvent::Mode(index)).ok();
                 },
             )?;
             let add = ambry_macos::GlassButton::new(
@@ -252,7 +247,6 @@ impl BoxView {
                 avatar,
                 switch,
                 add,
-                subtitle: String::new(),
                 tune: String::new(),
                 look: None,
             }
@@ -310,7 +304,6 @@ impl BoxView {
     /// item count under the window title.
     #[cfg(target_os = "macos")]
     fn sync_controls(&mut self) {
-        let status = self.status().to_string();
         let Some(controls) = &mut self.controls else {
             return;
         };
@@ -343,11 +336,6 @@ impl BoxView {
         if controls.look.as_ref() != Some(&look) {
             apply_glass_look(controls, look.0, &look.1);
             controls.look = Some(look);
-        }
-        if controls.subtitle != status {
-            // SAFETY: the content view lives as long as the window, and so does this view.
-            unsafe { ambry_macos::set_window_subtitle(controls.ns_view, &status) };
-            controls.subtitle = status;
         }
     }
 
@@ -693,7 +681,10 @@ impl BoxView {
         div()
             .id("list")
             .absolute()
-            .size_full()
+            .top(px(layout::BAR as f32))
+            .left_0()
+            .right_0()
+            .bottom_0()
             .when_some(self.controls.as_ref(), |this, controls| {
                 this.child(native(controls.table.native()).fill())
             })
@@ -799,31 +790,66 @@ impl BoxView {
             })
     }
 
-    /// The account avatar, the canvas/list switch and the add button.
-    fn render_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let bar = div()
+    /// The box's name and status next to the traffic lights, drawn by GPUI in the titlebar.
+    fn render_title(&self) -> impl IntoElement {
+        div()
             .absolute()
-            .left(px(layout::INSET as f32))
-            .bottom(px(layout::INSET as f32))
+            .top_0()
+            .left(px(layout::TITLE_LEFT as f32))
+            .h(px(layout::TITLE_HEIGHT as f32))
             .flex()
             .items_center()
-            .gap(px(layout::GAP_AFTER_AVATAR as f32));
+            .gap(px(8.))
+            .text_size(px(TITLE_SIZE))
+            .child(
+                div()
+                    .size(px(20.))
+                    .rounded(px(5.))
+                    .bg(rgb(ACCENT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path("icons/frame.svg")
+                            .size(px(14.))
+                            .text_color(rgb(0xffffff)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_color(rgb(palette().ink))
+                    .child(self.doc.name.clone()),
+            )
+            .child(div().text_color(rgb(palette().quiet)).child(self.status()))
+    }
+
+    /// The add button, the canvas/list switch and the account avatar, top right.
+    fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bar = div()
+            .absolute()
+            .top(px(layout::TOP as f32))
+            .right(px(layout::TOP as f32))
+            .flex()
+            .items_center()
+            .gap(px(layout::GAP_BEFORE_AVATAR as f32));
         #[cfg(target_os = "macos")]
         let bar = bar.when_some(self.controls.as_ref(), |bar, controls| {
             let _ = cx;
-            bar.child(native(controls.avatar.native())).child(
+            bar.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(layout::GAP as f32))
-                    .child(native(controls.switch.native()))
-                    .child(native(controls.add.native())),
+                    .child(native(controls.add.native()))
+                    .child(native(controls.switch.native())),
             )
+            .child(native(controls.avatar.native()))
         });
         #[cfg(not(target_os = "macos"))]
         let bar = bar
-            .child(self.render_avatar())
-            .child(self.render_fallback_toolbar(cx));
+            .child(self.render_fallback_toolbar(cx))
+            .child(self.render_avatar());
         bar
     }
 
@@ -901,8 +927,7 @@ impl Render for BoxView {
         self.load_icons();
         #[cfg(target_os = "macos")]
         self.sync_controls();
-        #[cfg(not(target_os = "macos"))]
-        window.set_window_title(&format!("{} — {}", self.doc.name, self.status()));
+        window.set_window_title(&self.doc.name);
 
         let root = div()
             .id("box")
@@ -930,7 +955,8 @@ impl Render for BoxView {
                 Mode::Canvas => this.child(self.render_canvas(cx)),
                 Mode::List => this.child(self.render_list(cx)),
             })
-            .child(self.render_bottom_bar(cx));
+            .child(self.render_title())
+            .child(self.render_top_bar(cx));
 
         #[cfg(target_os = "macos")]
         let root = root.font_family(".SystemUIFont");
@@ -1014,7 +1040,7 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
     let strip = value("strip")
         .and_then(|value| value.parse().ok())
         .unwrap_or(1.);
-    controls.switch.set_look(tint("tabs", None), strip);
+    controls.switch.set_alpha(strip);
     controls.add.set_tint(tint("add", None));
     controls.avatar.set_tint(tint("avatar", None));
 

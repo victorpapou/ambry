@@ -30,13 +30,18 @@ pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]
 pub use toolbar::WindowToolbar;
 
-/// Toolbar geometry in points, shared by the native and the GPUI-drawn toolbar.
+/// Titlebar geometry in points, shared by the native and the GPUI-drawn controls.
 pub mod layout {
-    /// Distance from the window's left and bottom edges.
-    pub const INSET: f64 = 20.;
+    /// Distance of the controls from the window's top and right edges.
+    pub const TOP: f64 = 12.;
     pub const HEIGHT: f64 = 30.;
-    pub const AVATAR: f64 = 30.;
-    pub const GAP_AFTER_AVATAR: f64 = 12.;
+    pub const AVATAR: f64 = 34.;
+    pub const GAP_BEFORE_AVATAR: f64 = 16.;
+    /// Height of the band the controls sit in; the list starts under it.
+    pub const BAR: f64 = 54.;
+    /// Where the title starts, right of the traffic lights, and the height it is centred in.
+    pub const TITLE_LEFT: f64 = 80.;
+    pub const TITLE_HEIGHT: f64 = 38.;
     /// Width of the GPUI-drawn switch used where AppKit is not available.
     pub const SEGMENTS_WIDTH: f64 = 70.;
     pub const GAP: f64 = 8.;

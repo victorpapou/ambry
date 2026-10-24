@@ -5,8 +5,8 @@ mod native_view;
 
 use ambry_core::{BoxDoc, Store};
 use gpui::{
-    App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px,
-    size,
+    App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point,
+    px, size,
 };
 
 use crate::box_view::BoxView;
@@ -29,8 +29,9 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
                         title: Some(doc.name.clone().into()),
-                        appears_transparent: false,
-                        traffic_light_position: None,
+                        appears_transparent: true,
+                        // Centred on the title row, which GPUI draws.
+                        traffic_light_position: Some(point(px(13.), px(12.))),
                     }),
                     window_min_size: Some(size(px(480.), px(360.))),
                     ..Default::default()
