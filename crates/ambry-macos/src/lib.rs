@@ -1,13 +1,12 @@
 //! Native AppKit pieces that GPUI does not draw itself.
 //!
 //! Right now that is the floating toolbar in the bottom-left corner of a box window:
-//! a canvas/list segmented control and an "add" button. Both are stock AppKit controls,
-//! so they pick up Liquid Glass on macOS 26 by themselves.
+//! a canvas/list switch on a Liquid Glass capsule and a glass "add" button.
 
 #[cfg(target_os = "macos")]
-mod lab;
+mod glass_switch;
 #[cfg(target_os = "macos")]
-mod tabs;
+mod lab;
 #[cfg(target_os = "macos")]
 mod toolbar;
 

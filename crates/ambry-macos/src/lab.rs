@@ -63,10 +63,14 @@ pub fn open_switch_lab() {
         ),
         ("J tab view, images", tabs(mtm, true)),
         ("K tab view, labels", tabs(mtm, false)),
-        ("L icon tabs, no border", {
-            let view =
-                crate::tabs::icon_tabs(mtm, &[("number", "Canvas"), ("list.bullet", "List")], 36.)
-                    .unwrap();
+        ("L glass switch", {
+            let view = crate::glass_switch::GlassSwitch::new(
+                mtm,
+                &[("number", "Canvas"), ("list.bullet", "List")],
+                36.,
+                |_| {},
+            )
+            .unwrap();
             Retained::into_super(view)
         }),
         ("M labels, no border", tabs_without_border(mtm)),

@@ -1,21 +1,21 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSControlSize, NSImage, NSTabView,
-    NSTabViewDelegate, NSTabViewItem, NSView,
+    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSControlSize, NSImage, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 use crate::ToolbarEvent;
+use crate::glass_switch::GlassSwitch;
 use crate::layout::*;
-use crate::tabs::icon_tabs;
 
 struct TargetIvars {
-    on_event: Box<dyn Fn(ToolbarEvent)>,
+    on_event: Rc<dyn Fn(ToolbarEvent)>,
 }
 
 define_class!(
@@ -28,16 +28,6 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Target {}
 
-    unsafe impl NSTabViewDelegate for Target {
-        #[unsafe(method(tabView:didSelectTabViewItem:))]
-        fn did_select(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) {
-            if let Some(item) = item {
-                let index = tab_view.indexOfTabViewItem(item).max(0) as usize;
-                (self.ivars().on_event)(ToolbarEvent::Mode(index));
-            }
-        }
-    }
-
     impl Target {
         #[unsafe(method(addClicked:))]
         fn add_clicked(&self, _sender: &AnyObject) {
@@ -47,7 +37,7 @@ define_class!(
 );
 
 impl Target {
-    fn new(on_event: Box<dyn Fn(ToolbarEvent)>, mtm: MainThreadMarker) -> Retained<Self> {
+    fn new(on_event: Rc<dyn Fn(ToolbarEvent)>, mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars { on_event });
         unsafe { msg_send![super(this), init] }
     }
@@ -56,7 +46,7 @@ impl Target {
 /// The native toolbar. Dropping it removes the views from the window.
 pub struct Toolbar {
     root: Retained<NSView>,
-    tabs: Retained<NSTabView>,
+    switch: Retained<GlassSwitch>,
     _target: Retained<Target>,
 }
 
@@ -71,16 +61,17 @@ impl Toolbar {
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
-        let target = Target::new(Box::new(on_event), mtm);
+        let on_event: Rc<dyn Fn(ToolbarEvent)> = Rc::new(on_event);
+        let target = Target::new(on_event.clone(), mtm);
 
-        // Canvas / list switch: icon tabs on NSTabView, like Xcode's inspector tabs.
-        let tabs = icon_tabs(
+        // Canvas / list switch on a glass capsule, with the lens that follows the pointer.
+        let switch = GlassSwitch::new(
             mtm,
             &[("number", "Canvas"), ("list.bullet", "List")],
             HEIGHT,
+            move |index| on_event(ToolbarEvent::Mode(index)),
         )?;
-        tabs.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-        let tabs_width = tabs.frame().size.width;
+        let switch_width = switch.frame().size.width;
 
         // Add button: a glass button on macOS 26, a round push button before that.
         let plus = symbol("plus", "Add files")?;
@@ -100,28 +91,22 @@ impl Toolbar {
         });
         add.setToolTip(Some(&NSString::from_str("Add files or folders")));
 
-        let width = tabs_width + GAP + HEIGHT;
+        let width = switch_width + GAP + HEIGHT;
         let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., width, HEIGHT));
         pin_bottom_left(parent, &root, INSET + AVATAR + GAP_AFTER_AVATAR, INSET);
-        add.setFrame(rect(tabs_width + GAP, 0., HEIGHT, HEIGHT));
-        root.addSubview(&tabs);
+        add.setFrame(rect(switch_width + GAP, 0., HEIGHT, HEIGHT));
+        root.addSubview(&switch);
         root.addSubview(&add);
         Some(Self {
             root,
-            tabs,
+            switch,
             _target: target,
         })
     }
 
-    /// Selects the canvas (0) or list (1) tab.
+    /// Selects the canvas (0) or list (1) item without sending an event.
     pub fn set_mode(&self, index: usize) {
-        let current = self
-            .tabs
-            .selectedTabViewItem()
-            .map(|item| self.tabs.indexOfTabViewItem(&item));
-        if current != Some(index as isize) {
-            self.tabs.selectTabViewItemAtIndex(index as isize);
-        }
+        self.switch.select(index);
     }
 }
 
