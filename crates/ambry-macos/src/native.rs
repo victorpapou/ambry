@@ -190,6 +190,7 @@ impl TabSwitch {
         let tab_count = tabs.len();
         let on_event = Rc::new(on_event);
         let on_action = on_event.clone();
+        let glass = has_liquid_glass();
         let target = Target::with_tabs(
             mtm,
             move |sender| {
@@ -198,6 +199,9 @@ impl TabSwitch {
                 };
                 // NSTabView may rebuild its segments on selection; put the icons back.
                 decorate(tabs, &images, item_width);
+                if glass {
+                    toolbar_look(tabs);
+                }
                 if let Some(index) = selected_index(tabs) {
                     on_event(TabEvent::Select(index));
                 }
@@ -256,6 +260,7 @@ fn on_glass(
         return None;
     }
     let control = segments(tabs)?;
+    toolbar_look(tabs);
     let strip = control.frame();
     let bounds = NSRect::new(NSPoint::new(0., 0.), strip.size);
     tabs.setFrameOrigin(NSPoint::new(-strip.origin.x, -strip.origin.y));
@@ -265,6 +270,35 @@ fn on_glass(
     glass.setCornerRadius(strip.size.height / 2.);
     glass.setContentView(Some(&holder));
     Some(glass)
+}
+
+/// Asks the tab strip to draw the way segmented controls in a window toolbar do: no track of
+/// its own, a grey pill for the selection, dimmed with the window. NSToolbarItemViewer does
+/// this through the private `setToolbarAppearance:`; it is skipped where that is missing.
+fn toolbar_look(tabs: &NSTabView) {
+    let Some(control) = segments(tabs) else {
+        return;
+    };
+    let selector = sel!(setToolbarAppearance:);
+    let Some(method) = control.class().instance_method(selector) else {
+        return;
+    };
+    let kind = method
+        .argument_type(2)
+        .map(|kind| kind.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // SAFETY: the argument type matches the method's own encoding.
+    unsafe {
+        match kind.as_str() {
+            "B" | "c" => {
+                let _: () = msg_send![&*control, setToolbarAppearance: true];
+            }
+            "q" | "Q" | "l" | "L" | "i" | "I" => {
+                let _: () = msg_send![&*control, setToolbarAppearance: 1isize];
+            }
+            _ => {}
+        }
+    }
 }
 
 fn tint_color(tint: Option<(f64, f64)>) -> Option<Retained<NSColor>> {

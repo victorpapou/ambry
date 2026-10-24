@@ -1014,8 +1014,7 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
     let strip = value("strip")
         .and_then(|value| value.parse().ok())
         .unwrap_or(1.);
-    let tabs_default = if dark { Some((0., 0.2)) } else { None };
-    controls.switch.set_look(tint("tabs", tabs_default), strip);
+    controls.switch.set_look(tint("tabs", None), strip);
     controls.add.set_tint(tint("add", None));
     controls.avatar.set_tint(tint("avatar", None));
 }
