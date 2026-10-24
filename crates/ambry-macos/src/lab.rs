@@ -117,6 +117,7 @@ pub fn open_switch_lab() {
     window.makeKeyAndOrderFront(None);
     dump(&rows);
     std::mem::forget(window);
+    crate::lab_toolbar::open_toolbar_lab(mtm);
 }
 
 /// Writes each variant's view tree and the methods of AppKit's private classes in it to
@@ -259,6 +260,13 @@ fn icons() -> Vec<Retained<NSImage>> {
     )
     .unwrap();
     vec![frame, list, help]
+}
+
+pub(crate) fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
+    NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(name),
+        Some(&NSString::from_str(description)),
+    )
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {

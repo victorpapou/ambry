@@ -6,6 +6,8 @@
 #[cfg(target_os = "macos")]
 mod lab;
 #[cfg(target_os = "macos")]
+mod lab_toolbar;
+#[cfg(target_os = "macos")]
 mod native;
 
 #[cfg(target_os = "macos")]
