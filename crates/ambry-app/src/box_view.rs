@@ -144,6 +144,10 @@ struct NativeControls {
     switch: ambry_macos::TabSwitch,
     add: ambry_macos::GlassButton,
     subtitle: String,
+    /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
+    tune: String,
+    /// The look last applied, to touch AppKit only when it changes.
+    look: Option<(bool, String)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -249,8 +253,31 @@ impl BoxView {
                 switch,
                 add,
                 subtitle: String::new(),
+                tune: String::new(),
+                look: None,
             }
         };
+        cx.spawn(async move |this, cx| {
+            let Some(file) = tune_file() else { return };
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let tune = std::fs::read_to_string(&file).unwrap_or_default();
+                let updated = this.update(cx, |this, cx| {
+                    if let Some(controls) = &mut this.controls {
+                        if controls.tune != tune {
+                            controls.tune = tune;
+                            cx.notify();
+                        }
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
@@ -312,6 +339,11 @@ impl BoxView {
             controls.table.select(selected);
         }
         controls.table.native().set_hidden(self.mode != Mode::List);
+        let look = (DARK_MODE.get(), controls.tune.clone());
+        if controls.look.as_ref() != Some(&look) {
+            apply_glass_look(controls, look.0, &look.1);
+            controls.look = Some(look);
+        }
         if controls.subtitle != status {
             // SAFETY: the content view lives as long as the window, and so does this view.
             unsafe { ambry_macos::set_window_subtitle(controls.ns_view, &status) };
@@ -958,6 +990,44 @@ fn edge_fades() -> [impl IntoElement; 4] {
             .w(px(EDGE_FADE))
             .bg(linear_gradient(270., white, clear)),
     ]
+}
+
+/// Tints the glass controls so they read as one set in either appearance. Lines like
+/// `dark.tabs = 0 0.2` in `tune` (white, alpha, or `none`) override the defaults.
+#[cfg(target_os = "macos")]
+fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
+    let theme = if dark { "dark" } else { "light" };
+    let value = |key: &str| {
+        tune.lines().find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == format!("{theme}.{key}")).then(|| value.trim().to_string())
+        })
+    };
+    let tint = |key: &str, default: Option<(f64, f64)>| match value(key) {
+        Some(value) if value == "none" => None,
+        Some(value) => {
+            let mut numbers = value.split_whitespace().filter_map(|n| n.parse().ok());
+            numbers.next().zip(numbers.next()).or(default)
+        }
+        None => default,
+    };
+    let strip = value("strip")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1.);
+    let tabs_default = if dark { Some((0., 0.2)) } else { None };
+    controls.switch.set_look(tint("tabs", tabs_default), strip);
+    controls.add.set_tint(tint("add", None));
+    controls.avatar.set_tint(tint("avatar", None));
+}
+
+/// `target/glass-tune.txt` in the checkout the app was built from.
+#[cfg(target_os = "macos")]
+fn tune_file() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let root = exe
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").exists())?;
+    Some(root.join("target/glass-tune.txt"))
 }
 
 /// Holds an animation at its start for the first `start` fraction of its duration.

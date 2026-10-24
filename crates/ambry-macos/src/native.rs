@@ -9,9 +9,10 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSBezelStyle, NSButton, NSControlBorderShape, NSControlSize, NSFont, NSGlassEffectView,
-    NSImage, NSImageScaling, NSImageView, NSSegmentedControl, NSTabPosition, NSTabView,
-    NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField, NSView,
+    NSBezelStyle, NSButton, NSColor, NSControlBorderShape, NSControlSize, NSFont,
+    NSGlassEffectView, NSImage, NSImageScaling, NSImageView, NSSegmentedControl, NSTabPosition,
+    NSTabView, NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField,
+    NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -165,6 +166,7 @@ pub enum TabEvent {
 pub struct TabSwitch {
     native: NativeView,
     tabs: Retained<NSTabView>,
+    glass: Option<Retained<NSGlassEffectView>>,
 }
 
 impl TabSwitch {
@@ -211,15 +213,29 @@ impl TabSwitch {
         );
         view.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         view.setDrawsBackground(false);
-        let hosted = on_glass(mtm, &view);
+        let glass = on_glass(mtm, &view);
+        let hosted = match &glass {
+            Some(glass) => Retained::into_super(glass.clone()),
+            None => Retained::into_super(view.clone()),
+        };
         Some(Self {
             native: NativeView::host(parent, hosted, target),
             tabs: view,
+            glass,
         })
     }
 
     pub fn native(&self) -> &NativeView {
         &self.native
+    }
+
+    /// Tints the glass under the strip with `(white, alpha)` and fades the strip itself, to
+    /// match the buttons beside it.
+    pub fn set_look(&self, tint: Option<(f64, f64)>, strip_alpha: f64) {
+        if let Some(glass) = &self.glass {
+            glass.setTintColor(tint_color(tint).as_deref());
+        }
+        self.tabs.setAlphaValue(strip_alpha);
     }
 
     /// Selects tab `index` without reporting a change.
@@ -232,14 +248,14 @@ impl TabSwitch {
 
 /// Puts the tab strip on Liquid Glass cut to the strip itself, so the glass and the strip
 /// read as one capsule, without the margins NSTabView keeps around it.
-fn on_glass(mtm: MainThreadMarker, tabs: &Retained<NSTabView>) -> Retained<NSView> {
-    let plain = || Retained::into_super(tabs.clone());
+fn on_glass(
+    mtm: MainThreadMarker,
+    tabs: &Retained<NSTabView>,
+) -> Option<Retained<NSGlassEffectView>> {
     if !has_liquid_glass() {
-        return plain();
+        return None;
     }
-    let Some(control) = segments(tabs) else {
-        return plain();
-    };
+    let control = segments(tabs)?;
     let strip = control.frame();
     let bounds = NSRect::new(NSPoint::new(0., 0.), strip.size);
     tabs.setFrameOrigin(NSPoint::new(-strip.origin.x, -strip.origin.y));
@@ -248,7 +264,11 @@ fn on_glass(mtm: MainThreadMarker, tabs: &Retained<NSTabView>) -> Retained<NSVie
     let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
     glass.setCornerRadius(strip.size.height / 2.);
     glass.setContentView(Some(&holder));
-    Retained::into_super(glass)
+    Some(glass)
+}
+
+fn tint_color(tint: Option<(f64, f64)>) -> Option<Retained<NSColor>> {
+    tint.map(|(white, alpha)| NSColor::colorWithWhite_alpha(white, alpha))
 }
 
 fn selected_index(tabs: &NSTabView) -> Option<usize> {
@@ -326,6 +346,7 @@ pub(crate) fn icon_images(icons: &[(&str, &str)]) -> Option<Vec<Retained<NSImage
 /// A round Liquid Glass button with an SF Symbol.
 pub struct GlassButton {
     native: NativeView,
+    button: Retained<NSButton>,
 }
 
 impl GlassButton {
@@ -353,20 +374,27 @@ impl GlassButton {
         });
         button.setToolTip(Some(&NSString::from_str(tooltip)));
         button.setFrameSize(NSSize::new(size, size));
-        let view: Retained<NSView> = Retained::into_super(Retained::into_super(button));
+        let view: Retained<NSView> = Retained::into_super(Retained::into_super(button.clone()));
         Some(Self {
             native: NativeView::host(parent, view, target),
+            button,
         })
     }
 
     pub fn native(&self) -> &NativeView {
         &self.native
     }
+
+    /// Tints the glass with `(white, alpha)`.
+    pub fn set_tint(&self, tint: Option<(f64, f64)>) {
+        self.button.setBezelColor(tint_color(tint).as_deref());
+    }
 }
 
 /// The account picture (or initial) on a round Liquid Glass disc.
 pub struct GlassAvatar {
     native: NativeView,
+    glass: Option<Retained<NSGlassEffectView>>,
 }
 
 impl GlassAvatar {
@@ -413,21 +441,31 @@ impl GlassAvatar {
                 holder
             }
         };
-        let view: Retained<NSView> = if has_liquid_glass() {
+        let glass = has_liquid_glass().then(|| {
             let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
             glass.setCornerRadius(size / 2.);
             glass.setContentView(Some(&content));
-            Retained::into_super(glass)
-        } else {
-            content
+            glass
+        });
+        let view: Retained<NSView> = match &glass {
+            Some(glass) => Retained::into_super(glass.clone()),
+            None => content,
         };
         Some(Self {
             native: NativeView::host(parent, view, None),
+            glass,
         })
     }
 
     pub fn native(&self) -> &NativeView {
         &self.native
+    }
+
+    /// Tints the glass with `(white, alpha)`.
+    pub fn set_tint(&self, tint: Option<(f64, f64)>) {
+        if let Some(glass) = &self.glass {
+            glass.setTintColor(tint_color(tint).as_deref());
+        }
     }
 }
 
