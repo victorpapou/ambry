@@ -15,11 +15,12 @@ use objc2::{
     msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAnimationContext, NSBitmapImageRep, NSButton, NSClickGestureRecognizer, NSColor,
-    NSCompositingOperation, NSControlSize, NSDeviceRGBColorSpace, NSEvent, NSFont,
-    NSGraphicsContext, NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageSymbolScale,
-    NSImageView, NSLayoutConstraint, NSPopoverDelegate, NSSegmentedControl, NSStackView, NSTabView,
-    NSTextField, NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSAnimatablePropertyContainer, NSAnimationContext, NSBitmapImageRep, NSButton,
+    NSClickGestureRecognizer, NSColor, NSCompositingOperation, NSControlSize,
+    NSDeviceRGBColorSpace, NSEvent, NSFont, NSGraphicsContext, NSImage, NSImageScaling,
+    NSImageSymbolConfiguration, NSImageSymbolScale, NSImageView, NSLayoutConstraint,
+    NSPopoverDelegate, NSSegmentedControl, NSStackView, NSTabView, NSTextField, NSToolbar,
+    NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
     NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
     NSUserInterfaceLayoutOrientation, NSView, NSWindowToolbarStyle,
 };
@@ -242,9 +243,10 @@ impl State {
 /// The chevron after the box's name: it comes out of a blur while the pointer is over the
 /// name or the box list is open, pushing the status aside.
 struct Chevron {
-    stack: Retained<NSStackView>,
     image: Retained<NSImageView>,
     width: Retained<NSLayoutConstraint>,
+    /// Width of the empty view after the status, which gives the chevron its room.
+    spare: Retained<NSLayoutConstraint>,
     open_width: f64,
     inside: Cell<bool>,
     shown: Cell<bool>,
@@ -267,9 +269,11 @@ impl Chevron {
         context.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
             0.2, 0.9, 0.25, 1.,
         )));
-        self.width
-            .setConstant(if show { self.open_width } else { 0. });
-        self.stack.layoutSubtreeIfNeeded();
+        // The chevron's room and the spare room after the status trade places, so the
+        // toolbar item keeps its width and only the status moves.
+        let open = if show { self.open_width } else { 0. };
+        self.width.animator().setConstant(open);
+        self.spare.animator().setConstant(self.open_width - open);
         NSAnimationContext::endGrouping();
 
         let (alpha, blur) = if show {
@@ -477,25 +481,34 @@ impl WindowToolbar {
         let status = NSTextField::labelWithString(&NSString::new(), mtm);
         status.setFont(Some(&NSFont::systemFontOfSize(TITLE_SIZE)));
         status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        // An empty view after the status gives the chevron its room while it is hidden and
+        // shrinks as the chevron opens, so the item keeps its width and both move together.
+        let spare_view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        spare_view.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let spare = spare_view
+            .widthAnchor()
+            .constraintEqualToConstant(open_width);
+        spare.setActive(true);
         let stack = NSStackView::stackViewWithViews(
             &NSArray::from_retained_slice(&[
                 tile.clone(),
                 Retained::into_super(Retained::into_super(name.clone())),
                 holder.clone(),
                 Retained::into_super(Retained::into_super(status.clone())),
+                spare_view,
             ]),
             mtm,
         );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         stack.setSpacing(10.);
         stack.setCustomSpacing_afterView(0., &name);
-        // Shortcuts keeps its icon 16 points from the traffic lights. The room on the right
-        // is the chevron's, so the toolbar item keeps its width while the chevron opens.
+        stack.setCustomSpacing_afterView(0., &status);
+        // Shortcuts keeps its icon 16 points from the traffic lights.
         stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
             top: 0.,
             left: 5.,
             bottom: 0.,
-            right: open_width,
+            right: 0.,
         });
 
         let state = Rc::new(State {
@@ -508,9 +521,9 @@ impl WindowToolbar {
             picker: IconPicker::new(mtm, colors, symbols, on_event.clone()),
             list: BoxList::new(mtm),
             chevron: Chevron {
-                stack: stack.clone(),
                 image: chevron,
                 width: holder_width,
+                spare,
                 open_width,
                 inside: Cell::new(false),
                 shown: Cell::new(false),
@@ -753,7 +766,8 @@ pub(crate) fn place_symbol(view: &NSImageView, image: Option<&NSImage>, size: f6
 pub(crate) fn centered_symbol(image: &NSImage, side: f64) -> Retained<NSImage> {
     let size = image.size();
     let ink = ink_bounds(image).unwrap_or(NSRect::new(NSPoint::ZERO, size));
-    let round = |value: f64| (value * 4.).round() / 4.;
+    // Whole pixels on a 2x display: a symbol drawn between them snaps by a pixel.
+    let round = |value: f64| (value * 2.).round() / 2.;
     let rect = NSRect::new(
         NSPoint::new(
             round(side / 2. - ink.origin.x - ink.size.width / 2.),

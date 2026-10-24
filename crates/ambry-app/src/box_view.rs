@@ -23,7 +23,7 @@ use crate::native_view::native;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 25.;
-const DOT_RADIUS: f32 = 0.75;
+const DOT_RADIUS: f32 = 1.25;
 const CARD_WIDTH: f32 = 64.;
 const CARD_HEIGHT: f32 = 80.;
 /// Width of a card together with its file name underneath.
@@ -36,6 +36,17 @@ const EDGE_FADE: f32 = 40.;
 const CANVAS_MARGIN: f32 = 400.;
 const TITLE_SIZE: f32 = 15.;
 const LABEL_SIZE: f32 = 13.;
+/// The list's rows and their inset from the window's sides.
+#[cfg(target_os = "macos")]
+const LIST_ROW: f32 = 28.;
+#[cfg(target_os = "macos")]
+const LIST_ROW_PAD: f32 = 10.;
+#[cfg(target_os = "macos")]
+const LIST_SIDE: f32 = 10.;
+#[cfg(target_os = "macos")]
+const LIST_HEADER: f32 = 28.;
+#[cfg(target_os = "macos")]
+const LIST_ICON: f32 = 18.;
 
 const ACCENT: u32 = 0x2f7cf6;
 
@@ -134,6 +145,9 @@ pub struct BoxView {
     focus: FocusHandle,
     /// Finder's icon for each item path, rendered once into the data directory.
     icons: HashMap<PathBuf, Option<PathBuf>>,
+    /// Date modified, size and kind of each item path, as the list shows them.
+    #[cfg(target_os = "macos")]
+    details: HashMap<PathBuf, [String; 3]>,
     #[cfg(target_os = "macos")]
     controls: Option<NativeControls>,
 }
@@ -142,9 +156,6 @@ pub struct BoxView {
 #[cfg(target_os = "macos")]
 struct NativeControls {
     ns_view: std::ptr::NonNull<std::ffi::c_void>,
-    table: ambry_macos::FileTable,
-    /// The paths the table shows, to reload it only when the box changes.
-    table_paths: Vec<PathBuf>,
     toolbar: ambry_macos::WindowToolbar,
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
@@ -167,8 +178,6 @@ enum ControlEvent {
     /// A scroll bar moved the visible part of the canvas to this top-left, counted from the
     /// top-left of [`BoxView::scroll_area`].
     Scroll(f64, f64),
-    Open(usize),
-    Select(Option<usize>),
 }
 
 impl BoxView {
@@ -204,6 +213,8 @@ impl BoxView {
             avatar,
             focus,
             icons: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            details: HashMap::new(),
         }
     }
 
@@ -222,20 +233,7 @@ impl BoxView {
         let ns_view = appkit.ns_view;
         let (events, received) = async_channel::unbounded();
         // SAFETY: GPUI hands out its own live content view and we are on the main thread.
-        // The table goes in first so the controls float above it.
         let controls = unsafe {
-            let open = events.clone();
-            let select = events.clone();
-            let table = ambry_macos::FileTable::new(
-                ns_view,
-                move |row| {
-                    open.try_send(ControlEvent::Open(row)).ok();
-                },
-                move |row| {
-                    select.try_send(ControlEvent::Select(row)).ok();
-                },
-            )?;
-            table.native().set_hidden(true);
             let scrolled = events.clone();
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
@@ -263,8 +261,6 @@ impl BoxView {
             )?;
             NativeControls {
                 ns_view,
-                table,
-                table_paths: Vec::new(),
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
@@ -306,18 +302,7 @@ impl BoxView {
                         }
                         this.open_box(store, cx);
                     }
-                    ControlEvent::Open(row) => {
-                        if let Some(id) = this.doc.items.get(row).map(|item| item.id) {
-                            this.open_item(id, cx);
-                        }
-                    }
                     ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
-                    ControlEvent::Select(row) => {
-                        this.selected = row
-                            .and_then(|row| this.doc.items.get(row))
-                            .map(|item| item.id);
-                        cx.notify();
-                    }
                 });
                 if handled.is_err() {
                     break;
@@ -351,31 +336,6 @@ impl BoxView {
         let Some(controls) = &mut self.controls else {
             return;
         };
-        let selected = self
-            .selected
-            .and_then(|id| self.doc.items.iter().position(|item| item.id == id));
-        let paths: Vec<PathBuf> = self
-            .doc
-            .items
-            .iter()
-            .map(|item| item.path.clone())
-            .collect();
-        if controls.table_paths != paths {
-            let rows: Vec<ambry_macos::FileRow> = self
-                .doc
-                .items
-                .iter()
-                .map(|item| ambry_macos::FileRow {
-                    path: item.path.clone(),
-                    name: item.name(),
-                })
-                .collect();
-            controls.table.set_rows(&rows, selected);
-            controls.table_paths = paths;
-        } else {
-            controls.table.select(selected);
-        }
-        controls.table.native().set_hidden(self.mode != Mode::List);
         let items = self.doc.items.len();
         let shown = (box_label(&self.doc.name, &self.doc.icon, items), status);
         if controls.shown_box.as_ref() != Some(&shown) {
@@ -425,6 +385,12 @@ impl BoxView {
             self.icons
                 .entry(path)
                 .or_insert_with_key(|path| finder_icon_file(path));
+        }
+        #[cfg(target_os = "macos")]
+        for item in &self.doc.items {
+            self.details
+                .entry(item.path.clone())
+                .or_insert_with_key(|path| file_details(path));
         }
     }
 
@@ -864,10 +830,11 @@ impl BoxView {
         self.icons.get(&item.path).cloned().flatten()
     }
 
-    /// The list: AppKit's table with Finder's columns.
+    /// The list: Finder's columns, drawn by GPUI, with rounded rows that fill with the accent
+    /// color when selected.
     #[cfg(target_os = "macos")]
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = cx;
+        let header = |text: &'static str| div().text_color(rgb(palette().quiet)).child(text);
         div()
             .id("list")
             .absolute()
@@ -875,9 +842,123 @@ impl BoxView {
             .left_0()
             .right_0()
             .bottom_0()
-            .when_some(self.controls.as_ref(), |this, controls| {
-                this.child(native(controls.table.native()).fill())
+            .flex()
+            .flex_col()
+            .text_size(px(LABEL_SIZE))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus);
+                    this.selected = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                list_columns(
+                    div()
+                        .flex_none()
+                        .h(px(LIST_HEADER))
+                        .mx(px(LIST_SIDE))
+                        .px(px(LIST_ROW_PAD))
+                        .text_size(px(11.))
+                        .font_weight(gpui::FontWeight::MEDIUM),
+                    header("Name"),
+                    header("Date Modified"),
+                    header("Size"),
+                    header("Kind"),
+                )
+                .border_b_1()
+                .border_color(rgb(palette().hairline)),
+            )
+            .child(
+                div()
+                    .id("list-rows")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px(px(LIST_SIDE))
+                    .pt(px(6.))
+                    .pb(px(24.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .when(self.doc.items.is_empty(), |this| this.child(empty_hint()))
+                    .children(
+                        self.doc
+                            .items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| self.render_list_row(index, item, cx)),
+                    ),
+            )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_list_row(
+        &self,
+        index: usize,
+        item: &Item,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = item.id;
+        let selected = self.selected == Some(id);
+        let (ink, quiet): (Hsla, Hsla) = if selected {
+            (rgb(0xffffff).into(), hsla(0., 0., 1., 0.8))
+        } else {
+            (rgb(palette().ink).into(), rgb(palette().quiet).into())
+        };
+        let icon = self
+            .icon(item)
+            .or_else(|| item.is_image().then(|| item.path.clone()));
+        let blank = [String::new(), String::new(), String::new()];
+        let [date, size, kind] = self.details.get(&item.path).unwrap_or(&blank).clone();
+        let row = div()
+            .id(("row", id as usize))
+            .flex_none()
+            .h(px(LIST_ROW))
+            .px(px(LIST_ROW_PAD))
+            .rounded(px(7.))
+            .when(selected, |this| this.bg(rgb(ACCENT)))
+            .when(!selected, |this| {
+                this.hover(|this| this.bg(rgb(palette().pressed)))
             })
+            .when(!item.exists(), |this| this.opacity(0.4))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, window, cx| {
+                    this.on_item_mouse_down(id, event, window, cx)
+                }),
+            );
+        list_columns(
+            row,
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(match icon {
+                    Some(path) => img(path)
+                        .flex_none()
+                        .size(px(LIST_ICON))
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element(),
+                    None => div().flex_none().size(px(LIST_ICON)).into_any_element(),
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(ink)
+                        .child(item.name()),
+                ),
+            div().truncate().text_color(quiet).child(date),
+            div().text_color(quiet).child(size),
+            div().truncate().text_color(quiet).child(kind),
+        )
+        .with_animation(
+            ("row-appear", id as usize),
+            Animation::new(Duration::from_millis(260 + 20 * index.min(12) as u64))
+                .with_easing(ease_out_quint()),
+            |this, t| this.opacity(t),
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1254,6 +1335,40 @@ fn finder_icon_file(path: &Path) -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn finder_icon_file(_path: &Path) -> Option<PathBuf> {
     None
+}
+
+/// Date modified, size and kind of `path`, written the way Finder's list writes them.
+#[cfg(target_os = "macos")]
+fn file_details(path: &Path) -> [String; 3] {
+    let metadata = std::fs::metadata(path).ok();
+    let date = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .map_or_else(|| "--".to_string(), ambry_macos::finder::date);
+    let size = match &metadata {
+        Some(metadata) if metadata.is_file() => ambry_macos::finder::size(metadata.len()),
+        _ => "--".to_string(),
+    };
+    let kind = ambry_macos::finder::kind(path).unwrap_or_default();
+    [date, size, kind]
+}
+
+/// Lays out a list row's cells in Finder's columns: the name takes the room left.
+#[cfg(target_os = "macos")]
+fn list_columns(
+    row: impl IntoElement + ParentElement + Styled,
+    name: impl IntoElement + Styled,
+    date: impl IntoElement + Styled,
+    size: impl IntoElement + Styled,
+    kind: impl IntoElement + Styled,
+) -> impl IntoElement + ParentElement + Styled {
+    row.flex()
+        .items_center()
+        .gap(px(16.))
+        .child(name.flex_1().min_w_0())
+        .child(date.flex_none().w(px(170.)))
+        .child(size.flex_none().w(px(72.)))
+        .child(kind.flex_none().w(px(150.)))
 }
 
 fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
