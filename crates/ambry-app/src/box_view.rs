@@ -173,12 +173,11 @@ struct NativeControls {
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
-    /// The frosted bands under the toolbar and behind the footer.
-    top_edge: ambry_macos::SoftEdge,
-    bottom_edge: ambry_macos::SoftEdge,
+    /// The blur behind the toolbar.
+    _toolbar_blur: ambry_macos::SoftEdge,
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
     scroll: ambry_macos::CanvasScrollView,
-    /// The accent add button in the footer.
+    /// The add button, bottom right.
     add: ambry_macos::GlassButton,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
@@ -270,14 +269,7 @@ impl BoxView {
                     configured.try_send(ControlEvent::Settings(event)).ok();
                 },
             );
-            // Created first, so the scroll bars and the add button sit on top of them.
-            let top_edge =
-                ambry_macos::SoftEdge::new(ns_view, ambry_macos::Edge::Top, layout::TOP_EDGE)?;
-            let bottom_edge = ambry_macos::SoftEdge::new(
-                ns_view,
-                ambry_macos::Edge::Bottom,
-                layout::BOTTOM_EDGE,
-            )?;
+            let toolbar_blur = ambry_macos::SoftEdge::new(ns_view, layout::TOOLBAR_BLUR)?;
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
@@ -311,14 +303,13 @@ impl BoxView {
                     added.try_send(ControlEvent::Add).ok();
                 },
             )?;
-            add.set_accent();
+            add.set_white();
             NativeControls {
                 ns_view,
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
-                top_edge,
-                bottom_edge,
+                _toolbar_blur: toolbar_blur,
                 scroll,
                 add,
                 shown_scroll: None,
@@ -1050,8 +1041,8 @@ impl BoxView {
                     .overflow_y_scroll()
                     .px(px(LIST_SIDE))
                     .pt(px(6.))
-                    // Room for the last rows to scroll out from under the footer.
-                    .pb(px(layout::BOTTOM_EDGE as f32))
+                    // Room for the last rows to scroll out from under the add button.
+                    .pb(px((layout::ADD + layout::ADD_MARGIN * 2.) as f32))
                     .flex()
                     .flex_col()
                     .when(self.doc.items.is_empty(), |this| this.child(empty_hint()))
@@ -1380,33 +1371,12 @@ impl Render for BoxView {
                         .bottom_0()
                         .child(native(controls.scroll.native()).fill()),
                 )
+                // The window's main action, bottom right.
                 .child(
                     div()
                         .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(layout::TOP_EDGE as f32))
-                        .child(native(controls.top_edge.native()).fill()),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(layout::BOTTOM_EDGE as f32))
-                        .child(native(controls.bottom_edge.native()).fill()),
-                )
-                // The footer: the window's main action, centred under the content.
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(layout::ADD_BOTTOM as f32))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
+                        .bottom(px(layout::ADD_MARGIN as f32))
+                        .right(px(layout::ADD_MARGIN as f32))
                         .child(native(controls.add.native())),
                 )
             })

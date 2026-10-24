@@ -44,7 +44,7 @@ pub use native::{
 #[cfg(target_os = "macos")]
 pub use scroller::CanvasScrollView;
 #[cfg(target_os = "macos")]
-pub use soft_edge::{Edge, SoftEdge};
+pub use soft_edge::SoftEdge;
 #[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]
@@ -59,12 +59,11 @@ pub mod layout {
     pub const GAP_BEFORE_AVATAR: f64 = 16.;
     /// Height of the band the controls sit in; the list starts under it.
     pub const BAR: f64 = 54.;
-    /// The frosted bands under the toolbar and the footer, fading out toward the content.
-    pub const TOP_EDGE: f64 = 64.;
-    pub const BOTTOM_EDGE: f64 = 72.;
-    /// The add button in the footer, and its distance from the window's bottom edge.
+    /// The blur behind the toolbar, fading out toward the content.
+    pub const TOOLBAR_BLUR: f64 = 60.;
+    /// The add button, and its distance from the window's bottom and right edges.
     pub const ADD: f64 = 36.;
-    pub const ADD_BOTTOM: f64 = 16.;
+    pub const ADD_MARGIN: f64 = 20.;
     /// Where the title starts, right of the traffic lights, and the height it is centred in.
     pub const TITLE_LEFT: f64 = 80.;
     pub const TITLE_HEIGHT: f64 = 38.;

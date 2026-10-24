@@ -495,17 +495,16 @@ impl GlassButton {
         self.button.setBezelColor(tint_color(tint).as_deref());
     }
 
-    /// Fills the glass with the accent color and draws the symbol white over it, the look of
-    /// a window's main action.
-    pub fn set_accent(&self) {
-        self.button
-            .setBezelColor(Some(&NSColor::controlAccentColor()));
+    /// Fills the glass white and draws the symbol black over it, the look of a window's main
+    /// action.
+    pub fn set_white(&self) {
+        self.button.setBezelColor(Some(&NSColor::whiteColor()));
         if self.button.respondsToSelector(sel!(setTintProminence:)) {
             self.button
                 .setTintProminence(objc2_app_kit::NSTintProminence::Primary);
         }
         self.button
-            .setContentTintColor(Some(&NSColor::whiteColor()));
+            .setContentTintColor(Some(&NSColor::blackColor()));
     }
 
     /// The button and its insides, by name, for [`crate::probe::run`].
