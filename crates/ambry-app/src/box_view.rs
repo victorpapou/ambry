@@ -117,9 +117,10 @@ impl BoxView {
                 events.try_send(event).ok();
             })
         }?;
-        if std::env::var_os("AMBRY_SWITCH_GALLERY").is_some() {
-            // SAFETY: as above.
-            unsafe { ambry_macos::Toolbar::attach_switch_gallery(appkit.ns_view) };
+        // Temporary: show the switch variants until one is picked.
+        // SAFETY: as above.
+        if unsafe { ambry_macos::Toolbar::attach_switch_gallery(appkit.ns_view) }.is_none() {
+            eprintln!("switch gallery could not be created");
         }
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
