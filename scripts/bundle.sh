@@ -1,8 +1,19 @@
 #!/bin/sh
 # Builds Ambry and wraps the binary in target/release/Ambry.app, then opens it.
 # A real bundle gets a bundle id, a Dock icon and its own name in the menu bar.
+# --classic turns off the macOS 26 design (Liquid Glass) to see the app as it looks on
+# earlier systems; other arguments go to the app.
 set -eu
 cd "$(dirname "$0")/.."
+compatibility=""
+for arg in "$@"; do
+  shift
+  if [ "$arg" = "--classic" ]; then
+    compatibility="<key>UIDesignRequiresCompatibility</key><true/>"
+  else
+    set -- "$@" "$arg"
+  fi
+done
 cargo build --release
 app=target/release/Ambry.app
 pkill -x Ambry 2>/dev/null && sleep 1 || true
@@ -24,6 +35,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
+  $compatibility
 </dict>
 </plist>
 PLIST
