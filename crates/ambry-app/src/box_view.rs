@@ -887,7 +887,10 @@ impl BoxView {
                             .items
                             .iter()
                             .enumerate()
-                            .map(|(index, item)| self.render_list_row(index, item, cx)),
+                            .map(|(index, item)| {
+                                self.render_list_row(index, item, cx).into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
                     ),
             )
     }
