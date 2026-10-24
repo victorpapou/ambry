@@ -335,6 +335,22 @@ impl BoxView {
     #[cfg(target_os = "macos")]
     fn sync_controls(&mut self) {
         let status = self.status().to_string();
+        let area = self.scroll_area();
+        let (x, y) = (-f32::from(self.pan.x), -f32::from(self.pan.y));
+        let (width, height) = (
+            f32::from(self.viewport.width),
+            f32::from(self.viewport.height),
+        );
+        let knob = |min: f32, max: f32, at: f32, visible: f32| {
+            let total = (max - min).max(visible);
+            let travel = total - visible;
+            let value = if travel > 0. { (at - min) / travel } else { 0. };
+            (f64::from(visible / total), f64::from(value))
+        };
+        let (h_proportion, h_value) = knob(area.0, area.2, x, width);
+        let (v_proportion, v_value) = knob(area.1, area.3, y, height);
+        let scroll = [h_proportion, h_value, v_proportion, v_value];
+        let in_canvas = self.mode == Mode::Canvas;
         let Some(controls) = &mut self.controls else {
             return;
         };
@@ -381,27 +397,11 @@ impl BoxView {
             controls.toolbar.set_boxes(boxes.clone(), current);
             controls.shown_boxes = boxes;
         }
-        let area = self.scroll_area();
-        let (x, y) = (-f32::from(self.pan.x), -f32::from(self.pan.y));
-        let (width, height) = (
-            f32::from(self.viewport.width),
-            f32::from(self.viewport.height),
-        );
-        let knob = |min: f32, max: f32, at: f32, visible: f32| {
-            let total = (max - min).max(visible);
-            let travel = total - visible;
-            let value = if travel > 0. { (at - min) / travel } else { 0. };
-            (f64::from(visible / total), f64::from(value))
-        };
-        let (h_proportion, h_value) = knob(area.0, area.2, x, width);
-        let (v_proportion, v_value) = knob(area.1, area.3, y, height);
-        let scroll = [h_proportion, h_value, v_proportion, v_value];
         if controls.shown_scroll != Some(scroll) {
             controls.horizontal.set(h_proportion, h_value);
             controls.vertical.set(v_proportion, v_value);
             controls.shown_scroll = Some(scroll);
         }
-        let in_canvas = self.mode == Mode::Canvas;
         controls.horizontal.native().set_hidden(!in_canvas);
         controls.vertical.native().set_hidden(!in_canvas);
     }
