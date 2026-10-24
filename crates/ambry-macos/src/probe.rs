@@ -169,3 +169,19 @@ pub fn run(targets: &[(String, Retained<AnyObject>)], commands: &str) -> String 
     }
     out
 }
+
+/// AppKit's description of the whole window `ns_view` is in, titlebar and toolbar included.
+///
+/// # Safety
+/// `ns_view` must point to a live `NSView`, and this must run on the main thread.
+pub unsafe fn window_tree(ns_view: std::ptr::NonNull<std::ffi::c_void>) -> String {
+    let view: &AnyObject = unsafe { ns_view.cast().as_ref() };
+    let window: Option<Retained<AnyObject>> = unsafe { msg_send![view, window] };
+    let Some(window) = window else {
+        return String::new();
+    };
+    let content: Option<Retained<AnyObject>> = unsafe { msg_send![&*window, contentView] };
+    let frame: Option<Retained<AnyObject>> =
+        content.and_then(|content| unsafe { msg_send![&*content, superview] });
+    frame.map(|frame| subtree(&frame)).unwrap_or_default()
+}

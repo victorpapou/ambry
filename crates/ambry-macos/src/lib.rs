@@ -77,10 +77,10 @@ pub mod layout {
     pub const TOOLBAR_BLUR: f64 = 108.;
     /// The add button, and its distance from the window's bottom and right edges.
     pub const ADD: f64 = 36.;
-    /// The toolbar's buttons sit 8 points from the window's top edge and 13 from its right;
-    /// the footer mirrors them from the bottom edge.
+    /// The toolbar's buttons sit 8 points from the window's top edge and, as in Finder, as
+    /// far from its right; the add button keeps the same 8 from the bottom and right.
     pub const ADD_MARGIN: f64 = 8.;
-    pub const TOOLBAR_SIDE: f64 = 13.;
+    pub const TOOLBAR_SIDE: f64 = 8.;
     /// Where the traffic lights start, which the zoom lines up under.
     pub const LIGHTS_LEFT: f64 = 20.;
     /// Where the title starts, right of the traffic lights, and the height it is centred in.

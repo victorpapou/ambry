@@ -816,6 +816,7 @@ impl WindowToolbar {
         toolbar.setDisplayMode(objc2_app_kit::NSToolbarDisplayMode::IconOnly);
         window.setToolbarStyle(NSWindowToolbarStyle::Unified);
         window.setToolbar(Some(&toolbar));
+        let edge_target = pull_trailing(mtm, &window);
         Some(Self {
             state,
             modes: tabs,
@@ -827,6 +828,7 @@ impl WindowToolbar {
             _targets: [
                 vec![tile_target, name_target, modes_target, account_target],
                 menu_targets,
+                edge_target.into_iter().collect(),
             ]
             .concat(),
         })
@@ -874,6 +876,58 @@ fn size_modes(strip: &NSSegmentedControl, images: &[Retained<NSImage>]) {
     decorate_strip(strip, images, MODE_WIDTH);
     strip.setControlSize(NSControlSize::ExtraLarge);
     strip.sizeToFit();
+}
+
+/// How far from the window's right edge AppKit ends the toolbar's last item, measured on
+/// macOS 26. Finder's sits as far from the right as from the top, so ours is pulled over to
+/// [`crate::layout::TOOLBAR_SIDE`].
+const APPKIT_TRAILING: f64 = 13.;
+
+/// Widens the toolbar's view past the window's right edge so its last item ends
+/// [`crate::layout::TOOLBAR_SIDE`] from it, and keeps it so as the window resizes. Returns
+/// the observer to keep alive.
+fn pull_trailing(mtm: MainThreadMarker, window: &objc2_app_kit::NSWindow) -> Option<Retained<Target>> {
+    let frame_view = unsafe { window.contentView()?.superview() }?;
+    let bar = find_view(&frame_view, "NSToolbarView")?;
+    let pull = APPKIT_TRAILING - crate::layout::TOOLBAR_SIDE;
+    let apply = {
+        let bar = bar.clone();
+        move || {
+            let Some(parent) = (unsafe { bar.superview() }) else {
+                return;
+            };
+            let frame = bar.frame();
+            let width = parent.bounds().size.width + pull;
+            if frame.size.width != width {
+                bar.setFrame(NSRect::new(frame.origin, NSSize::new(width, frame.size.height)));
+            }
+        }
+    };
+    apply();
+    let target = Target::new(mtm, move |_| apply());
+    bar.setPostsFrameChangedNotifications(true);
+    unsafe {
+        objc2_foundation::NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &target,
+            sel!(fire:),
+            Some(objc2_app_kit::NSViewFrameDidChangeNotification),
+            Some(&bar),
+        );
+    }
+    Some(target)
+}
+
+/// The first view of class `class` in `view`'s tree.
+fn find_view(view: &NSView, class: &str) -> Option<Retained<NSView>> {
+    for child in view.subviews() {
+        if child.class().name().to_bytes() == class.as_bytes() {
+            return Some(child);
+        }
+        if let Some(found) = find_view(&child, class) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn item(mtm: MainThreadMarker, id: &str, label: &str) -> Retained<NSToolbarItem> {
