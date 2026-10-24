@@ -9,20 +9,25 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSControlSize,
-    NSControlStateValueOn, NSEvent, NSFont, NSImage, NSImageScaling, NSImageSymbolConfiguration,
-    NSImageView, NSPopover, NSPopoverBehavior, NSSegmentedControl, NSStackView, NSTabView,
-    NSTextField, NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
-    NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
-    NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindowToolbarStyle,
+    NSAnimatablePropertyContainer, NSAnimationContext, NSButton, NSClickGestureRecognizer, NSColor,
+    NSControlSize, NSEvent, NSFont, NSImage, NSImageScaling, NSImageSymbolConfiguration,
+    NSImageSymbolScale, NSImageView, NSLayoutConstraint, NSPopoverDelegate, NSSegmentedControl,
+    NSStackView, NSTabView, NSTextField, NSToolbar, NSToolbarDelegate,
+    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemIdentifier,
+    NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindowToolbarStyle,
 };
-use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
+use objc2_foundation::{
+    NSArray, NSCopying, NSNotification, NSNumber, NSPoint, NSRect, NSRectEdge, NSSize, NSString,
+};
 
+use crate::box_list::BoxList;
+use crate::icon_picker::IconPicker;
 use crate::native::{
     Target, decorate_strip, icon_images, icon_tab_view, segments, selected_index, symbol,
 };
@@ -37,24 +42,13 @@ const MODE_WIDTH: f64 = 32.;
 const AVATAR_SIZE: f64 = 28.;
 /// The box's icon tile next to its name, as big as a shortcut's in the Shortcuts editor.
 const TILE: f64 = 26.;
-/// The icon picker, laid out like the one under a shortcut's icon in Shortcuts: icon tiles,
-/// a line, then rows of color dots.
-const SWATCH: f64 = 17.;
-const SWATCH_PITCH: f64 = 29.;
-const SWATCH_COLUMNS: usize = 10;
-const GLYPH: f64 = 24.;
-/// The highlight around the chosen icon.
-const GLYPH_SELECTED: f64 = 34.;
-const GLYPH_PITCH: f64 = 44.;
-const GLYPH_COLUMNS: usize = 6;
-const PICKER_PADDING: f64 = 16.;
-/// Tags of the glyph buttons in the picker start here; colors use 0 up.
-const GLYPH_TAG: isize = 100;
-/// Tag of the "New Box" row in the box list.
-const NEW_BOX_TAG: isize = -1;
-/// Width of the box list's rows.
-const ROW_WIDTH: f64 = 220.;
-const ROW_HEIGHT: f64 = 28.;
+/// Font size of the box's name and status.
+const TITLE_SIZE: f64 = 15.;
+/// Room the chevron takes after the name when it shows.
+const CHEVRON_GAP: f64 = 5.;
+const CHEVRON_DURATION: f64 = 0.25;
+/// Blur radius the chevron comes out of.
+const CHEVRON_BLUR: f64 = 6.;
 
 /// What the user did in the toolbar.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,11 +58,14 @@ pub enum ToolbarEvent {
     Add,
     /// Picked a color for the box's icon, one of `colors` given to [`WindowToolbar::attach`].
     Color(usize),
-    /// Picked a glyph for the box's icon, one of `symbols` given to [`WindowToolbar::attach`].
-    Symbol(usize),
+    /// Picked an SF Symbol for the box's icon, one of `symbols` given to
+    /// [`WindowToolbar::attach`].
+    Symbol(String),
     /// Picked box `index` of the list given to [`WindowToolbar::set_boxes`].
     OpenBox(usize),
     NewBox,
+    /// Renamed box `index` of the list given to [`WindowToolbar::set_boxes`].
+    RenameBox(usize, String),
 }
 
 /// A box as the switcher menu shows it.
@@ -91,7 +88,7 @@ define_class!(
     #[thread_kind = MainThreadOnly]
     #[name = "AmbryHover"]
     #[ivars = Box<dyn Fn(bool)>]
-    struct Hover;
+    pub(crate) struct Hover;
 
     unsafe impl NSObjectProtocol for Hover {}
 
@@ -109,7 +106,7 @@ define_class!(
 );
 
 impl Hover {
-    fn new(mtm: MainThreadMarker, on_hover: impl Fn(bool) + 'static) -> Retained<Self> {
+    pub(crate) fn new(mtm: MainThreadMarker, on_hover: impl Fn(bool) + 'static) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Box::new(on_hover) as Box<dyn Fn(bool)>);
         unsafe { msg_send![super(this), init] }
     }
@@ -169,130 +166,155 @@ fn ids() -> Retained<NSArray<NSToolbarItemIdentifier>> {
     ])
 }
 
+define_class!(
+    // Hears a popover close.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryPopoverWatcher"]
+    #[ivars = Box<dyn Fn()>]
+    struct PopoverWatcher;
+
+    unsafe impl NSObjectProtocol for PopoverWatcher {}
+
+    unsafe impl NSPopoverDelegate for PopoverWatcher {
+        #[unsafe(method(popoverDidClose:))]
+        fn did_close(&self, _notification: &NSNotification) {
+            (self.ivars())();
+        }
+    }
+);
+
+impl PopoverWatcher {
+    fn new(mtm: MainThreadMarker, on_close: impl Fn() + 'static) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Box::new(on_close) as Box<dyn Fn()>);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// What the toolbar's controls share: the box list and the icon picker.
 struct State {
-    on_event: Box<dyn Fn(ToolbarEvent)>,
+    on_event: Rc<dyn Fn(ToolbarEvent)>,
     boxes: RefCell<Vec<BoxLabel>>,
     current: Cell<Option<usize>>,
     tile: Retained<NSView>,
     glyph: Retained<NSImageView>,
     name: Retained<NSButton>,
-    picker: Retained<NSPopover>,
-    picker_view: Picker,
-    list: Retained<NSPopover>,
+    picker: Rc<IconPicker>,
+    list: BoxList,
+    chevron: Chevron,
 }
 
 impl State {
-    fn toggle(popover: &NSPopover, anchor: &NSView) {
+    fn toggle_picker(&self) {
+        let popover = &self.picker.popover;
         if popover.isShown() {
             unsafe { popover.performClose(None) };
         } else {
             popover.showRelativeToRect_ofView_preferredEdge(
-                anchor.bounds(),
-                anchor,
+                self.tile.bounds(),
+                &self.tile,
                 NSRectEdge::MaxY,
             );
         }
     }
 
-    /// The list of boxes under the name, with the open box marked and "New Box" at the end,
-    /// in a popover like Finder's share list.
-    fn show_boxes(&self, target: &Target) {
-        if self.list.isShown() {
-            unsafe { self.list.performClose(None) };
+    fn toggle_boxes(&self) {
+        if self.list.popover.isShown() {
+            self.list.close();
             return;
         }
-        let mtm = MainThreadMarker::from(target);
-        let mut rows: Vec<Retained<NSView>> = Vec::new();
-        for (index, label) in self.boxes.borrow().iter().enumerate() {
-            let row = list_row(mtm, &label.name, target, index as isize);
-            row.setImage(colored_symbol(&label.symbol, &label.color).as_deref());
-            let count =
-                NSTextField::labelWithString(&NSString::from_str(&label.items.to_string()), mtm);
-            count.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
-                13.,
-                unsafe { objc2_app_kit::NSFontWeightRegular },
-            )));
-            count.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            count.setTranslatesAutoresizingMaskIntoConstraints(false);
-            row.addSubview(&count);
-            count
-                .trailingAnchor()
-                .constraintEqualToAnchor_constant(&row.trailingAnchor(), -10.)
-                .setActive(true);
-            count
-                .centerYAnchor()
-                .constraintEqualToAnchor(&row.centerYAnchor())
-                .setActive(true);
-            if self.current.get() == Some(index) {
-                row.setState(NSControlStateValueOn);
-                if let Some(check) = symbol("checkmark", "Open") {
-                    row.setAlternateImage(Some(&check));
-                }
-                row.setFont(Some(&NSFont::systemFontOfSize_weight(13., unsafe {
-                    objc2_app_kit::NSFontWeightSemibold
-                })));
-            }
-            rows.push(Retained::into_super(Retained::into_super(row)));
-        }
-        let separator = NSBox::initWithFrame(
-            NSBox::alloc(mtm),
-            NSRect::new(NSPoint::ZERO, NSSize::new(ROW_WIDTH, 1.)),
-        );
-        separator.setBoxType(NSBoxType::Separator);
-        rows.push(Retained::into_super(separator));
-        let new = list_row(mtm, "New Box", target, NEW_BOX_TAG);
-        new.setImage(symbol("plus", "New Box").as_deref());
-        rows.push(Retained::into_super(Retained::into_super(new)));
-
-        let stack = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&rows), mtm);
-        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-        stack.setAlignment(objc2_app_kit::NSLayoutAttribute::Leading);
-        stack.setSpacing(2.);
-        stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-            top: 6.,
-            left: 6.,
-            bottom: 6.,
-            right: 6.,
-        });
-        let size = stack.fittingSize();
-        stack.setFrameSize(size);
-        let controller =
-            NSViewController::initWithNibName_bundle(NSViewController::alloc(mtm), None, None);
-        controller.setView(&stack);
-        self.list.setContentViewController(Some(&controller));
-        self.list.setContentSize(size);
-        self.list.showRelativeToRect_ofView_preferredEdge(
-            self.name.bounds(),
+        let mtm = MainThreadMarker::from(&*self.name);
+        self.list.show(
+            mtm,
             &self.name,
-            NSRectEdge::MaxY,
+            &self.boxes.borrow(),
+            self.current.get(),
+            self.on_event.clone(),
         );
+        self.chevron.update(true);
     }
 }
 
-/// A row of the box list: an icon and a name, highlighted under the pointer.
-fn list_row(mtm: MainThreadMarker, title: &str, target: &Target, tag: isize) -> Retained<NSButton> {
-    let row = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            &NSString::from_str(title),
-            Some(target),
-            Some(sel!(fire:)),
-            mtm,
-        )
+/// The chevron after the box's name: it comes out of a blur while the pointer is over the
+/// name or the box list is open, pushing the status aside.
+struct Chevron {
+    stack: Retained<NSStackView>,
+    image: Retained<NSImageView>,
+    width: Retained<NSLayoutConstraint>,
+    open_width: f64,
+    inside: Cell<bool>,
+    shown: Cell<bool>,
+}
+
+impl Chevron {
+    fn update(&self, list_shown: bool) {
+        let show = self.inside.get() || list_shown;
+        if self.shown.replace(show) == show {
+            return;
+        }
+        NSAnimationContext::beginGrouping();
+        let context = NSAnimationContext::currentContext();
+        context.setDuration(CHEVRON_DURATION);
+        context.setAllowsImplicitAnimation(true);
+        self.width
+            .animator()
+            .setConstant(if show { self.open_width } else { 0. });
+        self.image
+            .animator()
+            .setAlphaValue(if show { 1. } else { 0. });
+        self.stack.layoutSubtreeIfNeeded();
+        NSAnimationContext::endGrouping();
+        let (from, to) = if show {
+            (CHEVRON_BLUR, 0.)
+        } else {
+            (0., CHEVRON_BLUR)
+        };
+        animate_blur(&self.image, from, to);
+    }
+}
+
+/// Animates a Gaussian blur on `view` from `from` to `to` points of radius.
+fn animate_blur(view: &NSView, from: f64, to: f64) {
+    let Some(layer) = view.layer() else {
+        return;
     };
-    row.setBezelStyle(objc2_app_kit::NSBezelStyle::AccessoryBarAction);
-    row.setShowsBorderOnlyWhileMouseInside(true);
-    row.setAlignment(objc2_app_kit::NSTextAlignment::Left);
-    row.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageLeading);
-    row.setTag(tag);
-    row.setTranslatesAutoresizingMaskIntoConstraints(false);
-    row.widthAnchor()
-        .constraintEqualToConstant(ROW_WIDTH)
-        .setActive(true);
-    row.heightAnchor()
-        .constraintEqualToConstant(ROW_HEIGHT)
-        .setActive(true);
-    row
+    let key = NSString::from_str("filters.blur.inputRadius");
+    let has_blur = layer.filters().is_some_and(|filters| filters.count() > 0);
+    if !has_blur {
+        let Some(class) = AnyClass::get(c"CIFilter") else {
+            return;
+        };
+        let filter: Option<Retained<AnyObject>> =
+            unsafe { msg_send![class, filterWithName: &*NSString::from_str("CIGaussianBlur")] };
+        let Some(filter) = filter else {
+            return;
+        };
+        unsafe {
+            let _: () = msg_send![&*filter, setDefaults];
+            let _: () = msg_send![&*filter, setName: &*NSString::from_str("blur")];
+        }
+        view.setLayerUsesCoreImageFilters(true);
+        let filters = NSArray::from_retained_slice(&[filter]);
+        unsafe {
+            let _: () = msg_send![view, setContentFilters: &*filters];
+        }
+    }
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    let to_value = NSNumber::new_f64(to);
+    unsafe {
+        let _: () = msg_send![&*layer, setValue: &*to_value, forKeyPath: &*key];
+        let Some(class) = AnyClass::get(c"CABasicAnimation") else {
+            return;
+        };
+        let animation: Retained<AnyObject> = msg_send![class, animationWithKeyPath: &*key];
+        let _: () = msg_send![&*animation, setFromValue: &*NSNumber::new_f64(from)];
+        let _: () = msg_send![&*animation, setToValue: &*to_value];
+        let _: () = msg_send![&*animation, setDuration: CHEVRON_DURATION];
+        let _: () =
+            msg_send![&*layer, addAnimation: &*animation, forKey: &*NSString::from_str("blur")];
+    }
 }
 
 /// The toolbar of the window that holds `ns_view`.
@@ -302,13 +324,14 @@ pub struct WindowToolbar {
     status: Retained<NSTextField>,
     _delegate: Retained<Delegate>,
     _targets: Vec<Retained<Target>>,
-    /// The tracking area's owner, which it does not retain.
+    /// The tracking area's owner and the box list's delegate, which AppKit does not retain.
     _hover: Retained<Hover>,
+    _list_watcher: Retained<PopoverWatcher>,
 }
 
 impl WindowToolbar {
-    /// `colors` and `symbols` are what the icon picker offers; picks come back as indexes into
-    /// them.
+    /// `colors` and `symbols` are what the icon picker offers, the symbols in named groups;
+    /// a picked color comes back as its index.
     ///
     /// # Safety
     /// `ns_view` must point to a live `NSView` in a window, and this must run on the main
@@ -316,7 +339,7 @@ impl WindowToolbar {
     pub unsafe fn attach(
         ns_view: NonNull<c_void>,
         colors: &[&str],
-        symbols: &[&str],
+        symbols: &[(&str, &[&str])],
         avatar: Option<&Path>,
         initial: &str,
         on_event: impl Fn(ToolbarEvent) + 'static,
@@ -325,7 +348,10 @@ impl WindowToolbar {
         let view: &NSView = unsafe { ns_view.cast().as_ref() };
         let window = view.window()?;
 
-        // The box: a colored tile with its glyph, the name with a chevron, and a grey status.
+        let on_event: Rc<dyn Fn(ToolbarEvent)> = Rc::new(on_event);
+
+        // The box: a colored tile with its glyph, the name, a chevron that shows under the
+        // pointer, and a grey status.
         let tile = NSView::initWithFrame(
             NSView::alloc(mtm),
             NSRect::new(NSPoint::ZERO, NSSize::new(TILE, TILE)),
@@ -342,26 +368,124 @@ impl WindowToolbar {
             .constraintEqualToConstant(TILE)
             .setActive(true);
         tile.setToolTip(Some(&NSString::from_str("Change icon")));
-        let glyph = NSImageView::initWithFrame(
-            NSImageView::alloc(mtm),
-            NSRect::new(NSPoint::ZERO, NSSize::new(TILE, TILE)),
-        );
+        let glyph = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
         glyph.setImageScaling(NSImageScaling::ScaleNone);
         glyph.setContentTintColor(Some(&NSColor::whiteColor()));
         tile.addSubview(&glyph);
 
+        let title_font = NSFont::systemFontOfSize_weight(TITLE_SIZE, unsafe {
+            objc2_app_kit::NSFontWeightSemibold
+        });
         let name =
             unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
         name.setBordered(false);
-        name.setFont(Some(&NSFont::systemFontOfSize_weight(15., unsafe {
-            objc2_app_kit::NSFontWeightSemibold
-        })));
-        // The chevron shows only under the pointer, pushing the status aside.
-        name.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageTrailing);
-        let chevron = small_symbol("chevron.down", "Boxes");
+        name.setFont(Some(&title_font));
+        name.setToolTip(Some(&NSString::from_str("Switch box")));
+
+        // The chevron is drawn at the name's size and weight, so its strokes match the text.
+        let chevron_image = symbol("chevron.down", "Boxes").and_then(|image| {
+            let config = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+                TITLE_SIZE,
+                unsafe { objc2_app_kit::NSFontWeightSemibold },
+                NSImageSymbolScale::Small,
+            );
+            image.imageWithSymbolConfiguration(&config)
+        });
+        let chevron_size = chevron_image
+            .as_ref()
+            .map_or(NSSize::new(10., 10.), |image| image.size());
+        let chevron = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
+        chevron.setImage(chevron_image.as_deref());
+        chevron.setImageScaling(NSImageScaling::ScaleNone);
+        chevron.setContentTintColor(Some(&NSColor::labelColor()));
+        chevron.setWantsLayer(true);
+        chevron.setAlphaValue(0.);
+        chevron.setTranslatesAutoresizingMaskIntoConstraints(false);
+        // The chevron sits in a holder that opens from nothing, so the status slides aside.
+        let holder = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        holder.setTranslatesAutoresizingMaskIntoConstraints(false);
+        holder.addSubview(&chevron);
+        chevron
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&holder.leadingAnchor(), CHEVRON_GAP)
+            .setActive(true);
+        chevron
+            .centerYAnchor()
+            .constraintEqualToAnchor(&holder.centerYAnchor())
+            .setActive(true);
+        chevron
+            .widthAnchor()
+            .constraintEqualToConstant(chevron_size.width)
+            .setActive(true);
+        chevron
+            .heightAnchor()
+            .constraintEqualToConstant(chevron_size.height)
+            .setActive(true);
+        holder
+            .heightAnchor()
+            .constraintEqualToConstant(chevron_size.height)
+            .setActive(true);
+        let open_width = CHEVRON_GAP + chevron_size.width;
+        let holder_width = holder.widthAnchor().constraintEqualToConstant(0.);
+        holder_width.setActive(true);
+        if let Some(layer) = {
+            holder.setWantsLayer(true);
+            holder.layer()
+        } {
+            layer.setMasksToBounds(false);
+        }
+
+        let status = NSTextField::labelWithString(&NSString::new(), mtm);
+        status.setFont(Some(&NSFont::systemFontOfSize(TITLE_SIZE)));
+        status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        let stack = NSStackView::stackViewWithViews(
+            &NSArray::from_retained_slice(&[
+                tile.clone(),
+                Retained::into_super(Retained::into_super(name.clone())),
+                holder.clone(),
+                Retained::into_super(Retained::into_super(status.clone())),
+            ]),
+            mtm,
+        );
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        stack.setSpacing(10.);
+        stack.setCustomSpacing_afterView(0., &name);
+        // Shortcuts keeps its icon 16 points from the traffic lights. The room on the right
+        // is the chevron's, so the toolbar item keeps its width while the chevron opens.
+        stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+            top: 0.,
+            left: 5.,
+            bottom: 0.,
+            right: open_width,
+        });
+
+        let state = Rc::new(State {
+            on_event: on_event.clone(),
+            boxes: RefCell::new(Vec::new()),
+            current: Cell::new(None),
+            tile: tile.clone(),
+            glyph,
+            name: name.clone(),
+            picker: IconPicker::new(mtm, colors, symbols, on_event.clone()),
+            list: BoxList::new(mtm),
+            chevron: Chevron {
+                stack: stack.clone(),
+                image: chevron,
+                width: holder_width,
+                open_width,
+                inside: Cell::new(false),
+                shown: Cell::new(false),
+            },
+        });
+
         let hover = Hover::new(mtm, {
-            let name = name.clone();
-            move |inside| name.setImage(chevron.as_deref().filter(|_| inside))
+            let state = Rc::downgrade(&state);
+            move |inside| {
+                if let Some(state) = state.upgrade() {
+                    state.chevron.inside.set(inside);
+                    state.chevron.update(state.list.popover.isShown());
+                }
+            }
         });
         let tracking = unsafe {
             NSTrackingArea::initWithRect_options_owner_userInfo(
@@ -375,75 +499,22 @@ impl WindowToolbar {
             )
         };
         name.addTrackingArea(&tracking);
-        name.setToolTip(Some(&NSString::from_str("Switch box")));
-        let status = NSTextField::labelWithString(&NSString::new(), mtm);
-        status.setFont(Some(&NSFont::systemFontOfSize(15.)));
-        status.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        let stack = NSStackView::stackViewWithViews(
-            &NSArray::from_retained_slice(&[
-                tile.clone(),
-                Retained::into_super(Retained::into_super(name.clone())),
-                Retained::into_super(Retained::into_super(status.clone())),
-            ]),
-            mtm,
-        );
-        stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        stack.setSpacing(10.);
-        // Shortcuts keeps its icon 16 points from the traffic lights.
-        stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
-            top: 0.,
-            left: 5.,
-            bottom: 0.,
-            right: 0.,
-        });
-
-        let picker = NSPopover::new(mtm);
-        picker.setBehavior(NSPopoverBehavior::Transient);
-        let list = NSPopover::new(mtm);
-        list.setBehavior(NSPopoverBehavior::Transient);
-
-        // The picker's buttons report to a target made before the state that holds them.
-        let picker_events: Rc<RefCell<Option<Rc<State>>>> = Rc::new(RefCell::new(None));
-        let picker_target = Target::new(mtm, {
-            let state = picker_events.clone();
-            move |sender| {
-                let Some(state) = state.borrow().clone() else {
-                    return;
-                };
-                let Some(button) = sender.downcast_ref::<NSButton>() else {
-                    return;
-                };
-                let tag = button.tag();
-                (state.on_event)(if tag >= GLYPH_TAG {
-                    ToolbarEvent::Symbol((tag - GLYPH_TAG) as usize)
-                } else {
-                    ToolbarEvent::Color(tag.max(0) as usize)
-                });
+        let list_watcher = PopoverWatcher::new(mtm, {
+            let state = Rc::downgrade(&state);
+            move || {
+                if let Some(state) = state.upgrade() {
+                    state.chevron.update(false);
+                }
             }
         });
-        let picker_view = Picker::new(mtm, colors, symbols, &picker_target);
-        let controller =
-            NSViewController::initWithNibName_bundle(NSViewController::alloc(mtm), None, None);
-        picker.setContentSize(picker_view.view.frame().size);
-        controller.setView(&picker_view.view);
-        picker.setContentViewController(Some(&controller));
-
-        let state = Rc::new(State {
-            on_event: Box::new(on_event),
-            boxes: RefCell::new(Vec::new()),
-            current: Cell::new(None),
-            tile: tile.clone(),
-            glyph,
-            name: name.clone(),
-            picker,
-            picker_view,
-            list,
-        });
-        *picker_events.borrow_mut() = Some(state.clone());
+        state
+            .list
+            .popover
+            .setDelegate(Some(ProtocolObject::from_ref(&*list_watcher)));
 
         let tile_target = Target::new(mtm, {
             let state = state.clone();
-            move |_| State::toggle(&state.picker, &state.tile)
+            move |_| state.toggle_picker()
         });
         let click = unsafe {
             NSClickGestureRecognizer::initWithTarget_action(
@@ -453,23 +524,9 @@ impl WindowToolbar {
             )
         };
         tile.addGestureRecognizer(&click);
-        let menu_target = Target::new(mtm, {
-            let state = state.clone();
-            move |sender| {
-                let Some(row) = sender.downcast_ref::<NSButton>() else {
-                    return;
-                };
-                unsafe { state.list.performClose(None) };
-                (state.on_event)(match row.tag() {
-                    NEW_BOX_TAG => ToolbarEvent::NewBox,
-                    index => ToolbarEvent::OpenBox(index.max(0) as usize),
-                });
-            }
-        });
         let name_target = Target::new(mtm, {
             let state = state.clone();
-            let menu_target = menu_target.clone();
-            move |_| state.show_boxes(&menu_target)
+            move |_| state.toggle_boxes()
         });
         unsafe {
             name.setTarget(Some(&name_target));
@@ -553,14 +610,8 @@ impl WindowToolbar {
             status,
             _delegate: delegate,
             _hover: hover,
-            _targets: vec![
-                tile_target,
-                menu_target,
-                name_target,
-                picker_target,
-                add_target,
-                modes_target,
-            ],
+            _list_watcher: list_watcher,
+            _targets: vec![tile_target, name_target, add_target, modes_target],
         })
     }
 
@@ -574,13 +625,15 @@ impl WindowToolbar {
     /// Shows the open box: its icon, name and a status such as "3 items".
     pub fn set_box(&self, label: &BoxLabel, status: &str) {
         let state = &self.state;
-        state
-            .glyph
-            .setImage(small_symbol(&label.symbol, &label.name).as_deref());
+        place_symbol(
+            &state.glyph,
+            glyph_image(&label.symbol, 14.).as_deref(),
+            TILE,
+        );
         if let Some(layer) = state.tile.layer() {
             layer.setBackgroundColor(Some(&box_color(&label.color).CGColor()));
         }
-        state.picker_view.mark(&label.color, &label.symbol);
+        state.picker.mark(&label.color, &label.symbol);
         self.state.name.setTitle(&NSString::from_str(&label.name));
         self.status.setStringValue(&NSString::from_str(status));
     }
@@ -607,155 +660,8 @@ fn item(mtm: MainThreadMarker, id: &str, label: &str) -> Retained<NSToolbarItem>
     item
 }
 
-/// The icon picker under the box's icon, like the one under a shortcut's icon in Shortcuts:
-/// tiles of the glyphs in the box's color with the chosen one highlighted, a line, and color
-/// dots with a checkmark on the chosen one.
-struct Picker {
-    view: Retained<NSView>,
-    colors: Vec<(String, Retained<NSImageView>)>,
-    glyphs: Vec<(String, Retained<NSButton>, Retained<NSView>)>,
-}
-
-impl Picker {
-    fn new(mtm: MainThreadMarker, colors: &[&str], symbols: &[&str], target: &Target) -> Self {
-        let dots_width = (SWATCH_COLUMNS - 1) as f64 * SWATCH_PITCH + SWATCH;
-        let width = PICKER_PADDING * 2. + dots_width;
-        let glyph_rows = symbols.len().div_ceil(GLYPH_COLUMNS);
-        let glyphs_height = (glyph_rows - 1) as f64 * GLYPH_PITCH + GLYPH_SELECTED;
-        let dot_rows = colors.len().div_ceil(SWATCH_COLUMNS);
-        let dots_height = (dot_rows - 1) as f64 * SWATCH_PITCH + SWATCH;
-        let height = PICKER_PADDING * 4. + glyphs_height + dots_height;
-        let view = NSView::initWithFrame(
-            NSView::alloc(mtm),
-            NSRect::new(NSPoint::ZERO, NSSize::new(width, height)),
-        );
-
-        // AppKit counts y from the bottom: rows go down from the top.
-        let glyphs_left = (width - (GLYPH_COLUMNS - 1) as f64 * GLYPH_PITCH - GLYPH_SELECTED) / 2.;
-        let glyphs_top = height - PICKER_PADDING;
-        let mut glyphs = Vec::new();
-        for (index, name) in symbols.iter().enumerate() {
-            let row = index / GLYPH_COLUMNS;
-            let column = index % GLYPH_COLUMNS;
-            let button = picker_button(mtm, target, GLYPH_TAG + index as isize, name);
-            if let Some(layer) = button.layer() {
-                layer.setCornerRadius(10.);
-            }
-            button.setFrame(NSRect::new(
-                NSPoint::new(
-                    glyphs_left + column as f64 * GLYPH_PITCH,
-                    glyphs_top - GLYPH_SELECTED - row as f64 * GLYPH_PITCH,
-                ),
-                NSSize::new(GLYPH_SELECTED, GLYPH_SELECTED),
-            ));
-            let inset = (GLYPH_SELECTED - GLYPH) / 2.;
-            let tile = NSView::initWithFrame(
-                NSView::alloc(mtm),
-                NSRect::new(NSPoint::new(inset, inset), NSSize::new(GLYPH, GLYPH)),
-            );
-            tile.setWantsLayer(true);
-            if let Some(layer) = tile.layer() {
-                layer.setCornerRadius(6.);
-            }
-            let image = NSImageView::initWithFrame(
-                NSImageView::alloc(mtm),
-                NSRect::new(NSPoint::ZERO, NSSize::new(GLYPH, GLYPH)),
-            );
-            image.setImageScaling(NSImageScaling::ScaleNone);
-            image.setImage(sized_symbol(name, name, 12.).as_deref());
-            image.setContentTintColor(Some(&NSColor::whiteColor()));
-            tile.addSubview(&image);
-            button.addSubview(&tile);
-            view.addSubview(&button);
-            glyphs.push((name.to_string(), button, tile));
-        }
-
-        let line_y = PICKER_PADDING * 2. + dots_height;
-        let line = NSBox::initWithFrame(
-            NSBox::alloc(mtm),
-            NSRect::new(NSPoint::new(0., line_y), NSSize::new(width, 1.)),
-        );
-        line.setBoxType(NSBoxType::Separator);
-        view.addSubview(&line);
-
-        let dots_top = line_y - PICKER_PADDING;
-        let mut swatches = Vec::new();
-        for (index, color) in colors.iter().enumerate() {
-            let row = index / SWATCH_COLUMNS;
-            let column = index % SWATCH_COLUMNS;
-            let button = picker_button(mtm, target, index as isize, color);
-            if let Some(layer) = button.layer() {
-                layer.setCornerRadius(SWATCH / 2.);
-                layer.setBackgroundColor(Some(&box_color(color).CGColor()));
-            }
-            button.setFrame(NSRect::new(
-                NSPoint::new(
-                    PICKER_PADDING + column as f64 * SWATCH_PITCH,
-                    dots_top - SWATCH - row as f64 * SWATCH_PITCH,
-                ),
-                NSSize::new(SWATCH, SWATCH),
-            ));
-            let check = NSImageView::initWithFrame(
-                NSImageView::alloc(mtm),
-                NSRect::new(NSPoint::ZERO, NSSize::new(SWATCH, SWATCH)),
-            );
-            check.setImageScaling(NSImageScaling::ScaleNone);
-            check.setImage(sized_symbol("checkmark", "Chosen", 9.).as_deref());
-            check.setContentTintColor(Some(&NSColor::whiteColor()));
-            check.setHidden(true);
-            button.addSubview(&check);
-            view.addSubview(&button);
-            swatches.push((color.to_string(), check));
-        }
-        Self {
-            view,
-            colors: swatches,
-            glyphs,
-        }
-    }
-
-    /// Checks the box's color, paints the glyph tiles in it and highlights its glyph.
-    fn mark(&self, color: &str, glyph: &str) {
-        for (name, check) in &self.colors {
-            check.setHidden(name != color);
-        }
-        let fill = box_color(color).CGColor();
-        let highlight = NSColor::quaternaryLabelColor().CGColor();
-        for (name, button, tile) in &self.glyphs {
-            if let Some(layer) = tile.layer() {
-                layer.setBackgroundColor(Some(&fill));
-            }
-            if let Some(layer) = button.layer() {
-                layer.setBackgroundColor((name == glyph).then_some(&*highlight));
-            }
-        }
-    }
-}
-
-/// A borderless, layer-backed button of the icon picker.
-fn picker_button(
-    mtm: MainThreadMarker,
-    target: &Target,
-    tag: isize,
-    tooltip: &str,
-) -> Retained<NSButton> {
-    let button = unsafe {
-        NSButton::buttonWithTitle_target_action(
-            &NSString::new(),
-            Some(target),
-            Some(sel!(fire:)),
-            mtm,
-        )
-    };
-    button.setBordered(false);
-    button.setTag(tag);
-    button.setToolTip(Some(&NSString::from_str(tooltip)));
-    button.setWantsLayer(true);
-    button
-}
-
 /// The color a box color name stands for: Shortcuts' icon colors.
-fn box_color(name: &str) -> Retained<NSColor> {
+pub(crate) fn box_color(name: &str) -> Retained<NSColor> {
     let rgb: u32 = match name {
         "red" => 0xe94f4a,
         "coral" => 0xee7e62,
@@ -766,7 +672,7 @@ fn box_color(name: &str) -> Retained<NSColor> {
         "sky" => 0x77c2e8,
         "indigo" => 0x4b5fc4,
         "violet" | "purple" => 0x7a4cc4,
-        "magenta" => 0xb44fc4,
+        "lavender" | "magenta" => 0xa66bd9,
         "pink" => 0xe27fc6,
         "gray" => 0x78808a,
         "sage" => 0x8da58f,
@@ -777,13 +683,8 @@ fn box_color(name: &str) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(channel(16), channel(8), channel(0), 1.)
 }
 
-/// An SF Symbol at the size of the box's tile.
-fn small_symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
-    sized_symbol(name, description, 14.)
-}
-
 /// A semibold SF Symbol at `size` points.
-fn sized_symbol(name: &str, description: &str, size: f64) -> Option<Retained<NSImage>> {
+pub(crate) fn sized_symbol(name: &str, description: &str, size: f64) -> Option<Retained<NSImage>> {
     let image = symbol(name, description)?;
     let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(size, unsafe {
         objc2_app_kit::NSFontWeightSemibold
@@ -791,13 +692,33 @@ fn sized_symbol(name: &str, description: &str, size: f64) -> Option<Retained<NSI
     image.imageWithSymbolConfiguration(&config)
 }
 
-/// An SF Symbol drawn in a box's color, for the box menu.
-fn colored_symbol(name: &str, color: &str) -> Option<Retained<NSImage>> {
-    let image = symbol(name, name)?;
-    let config = NSImageSymbolConfiguration::configurationWithPaletteColors(
-        &NSArray::from_retained_slice(&[box_color(color)]),
-    );
+/// A box glyph at `size` points: the filled variant of the symbol when there is one, as
+/// Shortcuts shows its glyphs.
+pub(crate) fn glyph_image(name: &str, size: f64) -> Option<Retained<NSImage>> {
+    let image = symbol(&format!("{name}.fill"), name).or_else(|| symbol(name, name))?;
+    let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(size, unsafe {
+        objc2_app_kit::NSFontWeightMedium
+    });
     image.imageWithSymbolConfiguration(&config)
+}
+
+/// Puts `image` in `view` so the symbol itself, not its padded box, sits in the middle of a
+/// `size` square: SF Symbols carry room for descenders that would push them off center.
+pub(crate) fn place_symbol(view: &NSImageView, image: Option<&NSImage>, size: f64) {
+    view.setImage(image);
+    let Some(image) = image else {
+        return;
+    };
+    let bounds = image.size();
+    let glyph = image.alignmentRect();
+    let round = |value: f64| (value * 2.).round() / 2.;
+    view.setFrame(NSRect::new(
+        NSPoint::new(
+            round(size / 2. - glyph.origin.x - glyph.size.width / 2.),
+            round(size / 2. - glyph.origin.y - glyph.size.height / 2.),
+        ),
+        bounds,
+    ));
 }
 
 /// The account picture cut to a circle, or the user's initial as a button, for the toolbar

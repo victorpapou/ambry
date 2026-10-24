@@ -160,9 +160,10 @@ enum ControlEvent {
     Mode(usize),
     Add,
     Color(usize),
-    Symbol(usize),
+    Symbol(String),
     OpenBox(usize),
     NewBox,
+    RenameBox(usize, String),
     /// A scroll bar moved the visible part of the canvas to this top-left, counted from the
     /// top-left of [`BoxView::scroll_area`].
     Scroll(f64, f64),
@@ -242,7 +243,7 @@ impl BoxView {
             let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
                 &BoxIcon::COLORS,
-                &BoxIcon::SYMBOLS,
+                BoxIcon::SYMBOL_GROUPS,
                 avatar,
                 &user_initial(),
                 move |event| {
@@ -250,9 +251,12 @@ impl BoxView {
                         ambry_macos::ToolbarEvent::Mode(index) => ControlEvent::Mode(index),
                         ambry_macos::ToolbarEvent::Add => ControlEvent::Add,
                         ambry_macos::ToolbarEvent::Color(index) => ControlEvent::Color(index),
-                        ambry_macos::ToolbarEvent::Symbol(index) => ControlEvent::Symbol(index),
+                        ambry_macos::ToolbarEvent::Symbol(name) => ControlEvent::Symbol(name),
                         ambry_macos::ToolbarEvent::OpenBox(index) => ControlEvent::OpenBox(index),
                         ambry_macos::ToolbarEvent::NewBox => ControlEvent::NewBox,
+                        ambry_macos::ToolbarEvent::RenameBox(index, name) => {
+                            ControlEvent::RenameBox(index, name)
+                        }
                     };
                     events.try_send(event).ok();
                 },
@@ -282,13 +286,12 @@ impl BoxView {
                             cx.notify();
                         }
                     }
-                    ControlEvent::Symbol(index) => {
-                        if let Some(symbol) = BoxIcon::SYMBOLS.get(index) {
-                            this.doc.icon.symbol = symbol.to_string();
-                            this.save();
-                            cx.notify();
-                        }
+                    ControlEvent::Symbol(name) => {
+                        this.doc.icon.symbol = name;
+                        this.save();
+                        cx.notify();
                     }
+                    ControlEvent::RenameBox(index, name) => this.rename_box(index, name, cx),
                     ControlEvent::OpenBox(index) => {
                         if let Some(entry) = this.boxes.get(index).cloned() {
                             this.open_box(Store::new(entry.path), cx);
@@ -441,6 +444,31 @@ impl BoxView {
             eprintln!("could not save {}: {err:#}", self.store.path().display());
         }
         self.boxes = ambry_core::list_boxes(self.store.dir());
+    }
+
+    /// Renames box `index` of [`Self::boxes`], this one or another saved one.
+    #[cfg(target_os = "macos")]
+    fn rename_box(&mut self, index: usize, name: String, cx: &mut Context<Self>) {
+        let Some(entry) = self.boxes.get(index).cloned() else {
+            return;
+        };
+        if entry.path == self.store.path() {
+            self.doc.name = name;
+            self.save();
+        } else {
+            let store = Store::new(entry.path);
+            match store.load_or_new(&entry.name) {
+                Ok(mut doc) => {
+                    doc.name = name;
+                    if let Err(err) = store.save(&doc) {
+                        eprintln!("could not save {}: {err:#}", store.path().display());
+                    }
+                }
+                Err(err) => eprintln!("could not load {}: {err:#}", store.path().display()),
+            }
+            self.boxes = ambry_core::list_boxes(self.store.dir());
+        }
+        cx.notify();
     }
 
     /// Saves this box and shows the one `store` holds instead.

@@ -4,7 +4,11 @@
 //! its layout through [`NativeView::set_frame`], called from a GPUI element on every frame.
 
 #[cfg(target_os = "macos")]
+mod box_list;
+#[cfg(target_os = "macos")]
 pub mod finder;
+#[cfg(target_os = "macos")]
+mod icon_picker;
 #[cfg(target_os = "macos")]
 mod lab;
 #[cfg(target_os = "macos")]

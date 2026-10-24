@@ -46,7 +46,7 @@ define_class!(
     #[unsafe(super(NSView, NSResponder, objc2::runtime::NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "AmbryCanvasDocument"]
-    struct FlippedView;
+    pub(crate) struct FlippedView;
 
     impl FlippedView {
         #[unsafe(method(isFlipped))]
