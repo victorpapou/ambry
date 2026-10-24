@@ -88,18 +88,19 @@ impl Toolbar {
                 mtm,
             )
         };
-        // Tab-style switch like Xcode's inspector: capsule track, light grey selection
-        // instead of the accent colour. On macOS 26 AppKit adds the glass lens on switch.
+        // Tab-style switch like Xcode's inspector. On macOS 26 AppKit draws the capsule
+        // selection and the glass lens itself, so only older systems get a custom colour.
         segments.setControlSize(NSControlSize::Large);
         segments.setSegmentDistribution(NSSegmentDistribution::FillEqually);
         for segment in 0..2 {
             segments.setWidth_forSegment(SEGMENT_WIDTH, segment);
         }
-        segments.setSelectedSegmentBezelColor(Some(
-            &NSColor::unemphasizedSelectedContentBackgroundColor(),
-        ));
         if has_liquid_glass() {
             segments.setBorderShape(NSControlBorderShape::Capsule);
+        } else {
+            segments.setSelectedSegmentBezelColor(Some(
+                &NSColor::unemphasizedSelectedContentBackgroundColor(),
+            ));
         }
         segments.setSelectedSegment(0);
         segments.setToolTip_forSegment(Some(&NSString::from_str("Canvas")), 0);
