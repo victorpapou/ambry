@@ -6,6 +6,8 @@
 #[cfg(target_os = "macos")]
 mod box_list;
 #[cfg(target_os = "macos")]
+mod columns;
+#[cfg(target_os = "macos")]
 pub mod finder;
 #[cfg(target_os = "macos")]
 mod icon_picker;
@@ -38,6 +40,9 @@ mod zoom;
 #[cfg(target_os = "macos")]
 mod zoom_label;
 
+#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
+pub use columns::{ColumnBrowser, ColumnEvent};
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
 #[cfg(target_os = "macos")]

@@ -24,6 +24,8 @@ const FONT_SIZE: f64 = 11.;
 const DIGITS: usize = 3;
 /// How long a digit takes to roll.
 const ROLL: f64 = 0.28;
+/// The padding a label puts on each side of its text.
+const PAD: f64 = 2.;
 
 /// A pill with the zoom's percentage.
 pub struct ZoomLabel {
@@ -33,6 +35,8 @@ pub struct ZoomLabel {
     percent: Retained<NSTextField>,
     /// The width of a digit's cell and the height of a line of text.
     cell: NSSize,
+    /// How far apart the digits sit: a digit's own advance, without the label's padding.
+    pitch: f64,
     shown: RefCell<String>,
     dark: Cell<Option<bool>>,
     _target: Retained<Target>,
@@ -58,6 +62,8 @@ impl ZoomLabel {
         };
         let probe = cell_label("0").fittingSize();
         let cell = NSSize::new(probe.width.ceil(), probe.height.ceil());
+        // A label pads its text by 2 points a side; the digits sit at their own advance.
+        let pitch = probe.width - 2. * PAD;
 
         let view = NSView::initWithFrame(
             NSView::alloc(mtm),
@@ -101,6 +107,7 @@ impl ZoomLabel {
             digits,
             percent,
             cell,
+            pitch,
             shown: RefCell::new(String::new()),
             dark: Cell::new(None),
             _target: target,
@@ -155,18 +162,21 @@ impl ZoomLabel {
 
     /// Sizes the pill for `count` digits and puts its cells in a row.
     fn arrange(&self, count: usize) {
-        let width = SIDE * 2. + self.cell.width * count as f64 + self.percent.frame().size.width;
+        let percent = self.percent.frame().size.width - 2. * PAD;
+        let width = (SIDE * 2. + self.pitch * count as f64 + percent).round();
         self.view.setFrameSize(NSSize::new(width, HEIGHT));
         let y = ((HEIGHT - self.cell.height) / 2.).round();
+        // Each label overhangs its cell by its padding, so the text runs at the digits' advance.
+        let offset = (self.cell.width - self.pitch) / 2.;
         for (index, cell) in self.digits.iter().enumerate() {
             cell.setHidden(index >= count);
             cell.setFrame(NSRect::new(
-                NSPoint::new(SIDE + self.cell.width * index as f64, y),
+                NSPoint::new(SIDE + self.pitch * index as f64 - offset, y),
                 self.cell,
             ));
         }
         self.percent
-            .setFrameOrigin(NSPoint::new(SIDE + self.cell.width * count as f64, y));
+            .setFrameOrigin(NSPoint::new(SIDE + self.pitch * count as f64 - PAD, y));
     }
 }
 

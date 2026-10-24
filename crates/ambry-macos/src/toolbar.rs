@@ -43,7 +43,7 @@ const AVATAR: &str = "avatar";
 /// Width given to each canvas/list segment; AppKit pads it to about Freeform's 37 and 39.
 const MODE_WIDTH: f64 = 32.;
 /// Point size of the account picture inside its glass circle.
-const AVATAR_SIZE: f64 = 28.;
+const AVATAR_SIZE: f64 = 34.;
 /// The box's icon tile next to its name, as big as a shortcut's in the Shortcuts editor.
 const TILE: f64 = 22.;
 /// Font size of the box's name and status.
@@ -799,6 +799,7 @@ impl WindowToolbar {
             account.setAction(Some(sel!(fire:)));
         }
         let avatar_item = item(mtm, AVATAR, "Account");
+        avatar_item.setBordered(false);
         avatar_item.setView(Some(&account));
 
         let delegate: Retained<Delegate> = {
@@ -1175,6 +1176,8 @@ fn account_button(mtm: MainThreadMarker) -> Retained<NSButton> {
     let button =
         unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
     button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown);
+    // The picture is its own circle, edge to edge, with no glass ring around it.
+    button.setBordered(false);
     button.setToolTip(Some(&NSString::from_str("Account")));
     button
 }
