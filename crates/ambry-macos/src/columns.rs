@@ -30,11 +30,10 @@ pub enum ColumnEvent {
 }
 
 pub(crate) struct SourceIvars {
-    root: Retained<NSString>,
     /// The box's items, the first column.
-    items: RefCell<Vec<Retained<NSString>>>,
-    /// The entries of each folder opened, kept so AppKit's pointers to them stay alive.
-    folders: RefCell<HashMap<String, Vec<Retained<NSString>>>>,
+    items: RefCell<Vec<PathBuf>>,
+    /// The entries of each folder opened.
+    folders: RefCell<HashMap<PathBuf, Vec<PathBuf>>>,
 }
 
 define_class!(
@@ -48,85 +47,59 @@ define_class!(
     unsafe impl NSObjectProtocol for Source {}
 
     impl Source {
-        #[unsafe(method(rootItemForBrowser:))]
-        fn root_item(&self, _browser: &NSBrowser) -> *mut AnyObject {
-            Retained::as_ptr(&self.ivars().root) as *mut AnyObject
-        }
-
-        #[unsafe(method(browser:numberOfChildrenOfItem:))]
-        fn count(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> isize {
-            self.with_children(item, |children| children.len() as isize)
-        }
-
-        #[unsafe(method(browser:child:ofItem:))]
-        fn child(&self, _browser: &NSBrowser, index: isize, item: Option<&AnyObject>) -> *mut AnyObject {
-            self.with_children(item, |children| {
-                children
-                    .get(index as usize)
-                    .map_or(std::ptr::null_mut(), |child| {
-                        Retained::as_ptr(child) as *mut AnyObject
-                    })
-            })
-        }
-
-        #[unsafe(method(browser:isLeafItem:))]
-        fn is_leaf(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> bool {
-            item.and_then(path_of).is_none_or(|path| !path.is_dir())
-        }
-
-        #[unsafe(method(browser:objectValueForItem:))]
-        fn value(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> *mut AnyObject {
-            let name = item
-                .and_then(path_of)
-                .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
-                .unwrap_or_default();
-            Retained::autorelease_return(NSString::from_str(&name)) as *mut AnyObject
+        #[unsafe(method(browser:numberOfRowsInColumn:))]
+        fn rows(&self, browser: &NSBrowser, column: isize) -> isize {
+            self.entries(browser, column).len() as isize
         }
 
         #[unsafe(method(browser:willDisplayCell:atRow:column:))]
         fn will_display(&self, browser: &NSBrowser, cell: &AnyObject, row: isize, column: isize) {
-            let item: *mut AnyObject = unsafe { msg_send![browser, itemAtRow: row, inColumn: column] };
-            let Some(path) = (unsafe { item.as_ref() }).and_then(path_of) else {
+            let Some(path) = self.entries(browser, column).get(row as usize).cloned() else {
                 return;
             };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             let icon = NSWorkspace::sharedWorkspace()
                 .iconForFile(&NSString::from_str(&path.to_string_lossy()));
             icon.setSize(NSSize::new(16., 16.));
-            let _: () = unsafe { msg_send![cell, setImage: &*icon] };
+            unsafe {
+                let _: () = msg_send![cell, setStringValue: &*NSString::from_str(&name)];
+                let _: () = msg_send![cell, setLeaf: !path.is_dir()];
+                let _: () = msg_send![cell, setImage: &*icon];
+            }
         }
     }
 );
 
 impl Source {
-    /// Runs `f` on the children of `item`: the box's items for the root, else the folder's
-    /// entries, read the first time it is opened.
-    fn with_children<R>(
-        &self,
-        item: Option<&AnyObject>,
-        f: impl FnOnce(&[Retained<NSString>]) -> R,
-    ) -> R {
-        let root: &AnyObject = &self.ivars().root;
-        if item.is_none_or(|item| std::ptr::eq(item, root)) {
-            return f(&self.ivars().items.borrow());
+    /// What column `column` lists: the box's items first, then the entries of the folder
+    /// picked in each column before, read the first time it is opened.
+    fn entries(&self, browser: &NSBrowser, column: isize) -> Vec<PathBuf> {
+        let mut entries = self.ivars().items.borrow().clone();
+        for before in 0..column.max(0) {
+            let row: isize = unsafe { msg_send![browser, selectedRowInColumn: before] };
+            let Some(folder) = (row >= 0)
+                .then(|| entries.get(row as usize).cloned())
+                .flatten()
+            else {
+                return Vec::new();
+            };
+            entries = self
+                .ivars()
+                .folders
+                .borrow_mut()
+                .entry(folder.clone())
+                .or_insert_with(|| list(&folder))
+                .clone();
         }
-        let Some(path) = item.and_then(path_of) else {
-            return f(&[]);
-        };
-        let key = path.to_string_lossy().into_owned();
-        let mut folders = self.ivars().folders.borrow_mut();
-        let children = folders.entry(key).or_insert_with(|| list(&path));
-        f(children)
+        entries
     }
 }
 
-fn path_of(item: &AnyObject) -> Option<PathBuf> {
-    let text: *mut NSString = item as *const AnyObject as *mut NSString;
-    let text = unsafe { text.as_ref() }?.to_string();
-    (!text.is_empty()).then(|| PathBuf::from(text))
-}
-
 /// A folder's entries sorted by name the way Finder sorts them, hidden files left out.
-fn list(folder: &Path) -> Vec<Retained<NSString>> {
+fn list(folder: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(folder)
         .into_iter()
         .flatten()
@@ -144,9 +117,6 @@ fn list(folder: &Path) -> Vec<Retained<NSString>> {
     });
     entries.truncate(LIMIT);
     entries
-        .iter()
-        .map(|path| NSString::from_str(&path.to_string_lossy()))
-        .collect()
 }
 
 /// The column view.
@@ -169,13 +139,13 @@ impl ColumnBrowser {
         let frame = NSRect::new(NSPoint::ZERO, NSSize::new(400., 300.));
         let browser = NSBrowser::initWithFrame(NSBrowser::alloc(mtm), frame);
         let source = Source::alloc(mtm).set_ivars(SourceIvars {
-            root: NSString::from_str(""),
             items: RefCell::new(Vec::new()),
             folders: RefCell::new(HashMap::new()),
         });
         let source: Retained<Source> = unsafe { msg_send![super(source), init] };
         let target = Target::new(mtm, {
             let browser = browser.clone();
+            let source = source.clone();
             move |_| {
                 let double = objc2_app_kit::NSApplication::sharedApplication(mtm)
                     .currentEvent()
@@ -183,10 +153,8 @@ impl ColumnBrowser {
                 if double {
                     let row: isize = unsafe { msg_send![&*browser, clickedRow] };
                     let column: isize = unsafe { msg_send![&*browser, clickedColumn] };
-                    let item: *mut AnyObject =
-                        unsafe { msg_send![&*browser, itemAtRow: row, inColumn: column] };
-                    if let Some(path) = (unsafe { item.as_ref() }).and_then(path_of) {
-                        on_event(ColumnEvent::Open(path));
+                    if let Some(path) = source.entries(&browser, column).get(row as usize) {
+                        on_event(ColumnEvent::Open(path.clone()));
                     }
                     return;
                 }
@@ -234,10 +202,7 @@ impl ColumnBrowser {
             return;
         }
         *self.shown.borrow_mut() = paths.to_vec();
-        *self.source.ivars().items.borrow_mut() = paths
-            .iter()
-            .map(|path| NSString::from_str(&path.to_string_lossy()))
-            .collect();
+        *self.source.ivars().items.borrow_mut() = paths.to_vec();
         self.source.ivars().folders.borrow_mut().clear();
         self.browser.loadColumnZero();
     }

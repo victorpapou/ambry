@@ -78,6 +78,8 @@ pub mod layout {
     /// The add button, and its distance from the window's bottom and right edges.
     pub const ADD: f64 = 36.;
     pub const ADD_MARGIN: f64 = 14.;
+    /// How far the footer keeps from the window's sides, the toolbar's own inset.
+    pub const TOOLBAR_SIDE: f64 = 20.;
     /// Where the title starts, right of the traffic lights, and the height it is centred in.
     pub const TITLE_LEFT: f64 = 80.;
     pub const TITLE_HEIGHT: f64 = 38.;

@@ -799,7 +799,6 @@ impl WindowToolbar {
             account.setAction(Some(sel!(fire:)));
         }
         let avatar_item = item(mtm, AVATAR, "Account");
-        avatar_item.setBordered(false);
         avatar_item.setView(Some(&account));
 
         let delegate: Retained<Delegate> = {
@@ -1176,8 +1175,6 @@ fn account_button(mtm: MainThreadMarker) -> Retained<NSButton> {
     let button =
         unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
     button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown);
-    // The picture is its own circle, edge to edge, with no glass ring around it.
-    button.setBordered(false);
     button.setToolTip(Some(&NSString::from_str("Account")));
     button
 }

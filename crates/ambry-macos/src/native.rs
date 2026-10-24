@@ -498,7 +498,11 @@ impl GlassButton {
     /// Fills the glass white, draws the symbol black over it and casts a shadow under it, the
     /// look of a window's main action.
     pub fn set_white(&self) {
-        self.button.setBezelColor(Some(&NSColor::whiteColor()));
+        // White, with a touch of the accent color, like the system's own main actions.
+        let fill = NSColor::whiteColor()
+            .blendedColorWithFraction_ofColor(0.12, &NSColor::controlAccentColor())
+            .unwrap_or_else(NSColor::whiteColor);
+        self.button.setBezelColor(Some(&fill));
         if self.button.respondsToSelector(sel!(setTintProminence:)) {
             self.button
                 .setTintProminence(objc2_app_kit::NSTintProminence::Primary);

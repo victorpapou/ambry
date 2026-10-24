@@ -29,7 +29,14 @@ define_class!(
             let Some(view) = recognizer.view() else {
                 return;
             };
-            if step == 0. {
+            // The fingers lifting is told as a step of 0, for the zoom to settle.
+            let ended = matches!(
+                recognizer.state(),
+                objc2_app_kit::NSGestureRecognizerState::Ended
+                    | objc2_app_kit::NSGestureRecognizerState::Cancelled
+            );
+            let step = if ended { 0. } else { step };
+            if step == 0. && !ended {
                 return;
             }
             let at = recognizer.locationInView(Some(&view));

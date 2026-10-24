@@ -39,8 +39,9 @@ const LABEL_SIZE: f32 = 13.;
 const ACCENT: u32 = 0x2f7cf6;
 
 /// How far the canvas zooms, and how much a key press or a click on a scroll wheel step zooms.
-/// How far past an edge the canvas can be pulled.
-const RUBBER_RANGE: f32 = 160.;
+/// How hard a pinch past the zoom limits pulls: the zoom shown grows as this power of the
+/// zoom asked for.
+const RUBBER: f32 = 0.3;
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 4.;
 const ZOOM_STEP: f32 = 1.25;
@@ -145,8 +146,8 @@ pub struct BoxView {
     zoom: f32,
     /// Counts wheel scrolls, so a spring back to the edge knows it was overtaken.
     scroll_gen: u64,
-    /// Set while the canvas is pulled past an edge and springs back.
-    stretched: bool,
+    /// The zoom a pinch under way asks for, before the resistance past the limits.
+    pinch_raw: Option<f32>,
     selected: Option<u64>,
     /// Items picked by dragging a rectangle over them.
     picked: HashSet<u64>,
@@ -241,7 +242,7 @@ impl BoxView {
             pan: point(px(0.), px(0.)),
             zoom: 1.,
             scroll_gen: 0,
-            stretched: false,
+            pinch_raw: None,
             selected: None,
             picked: HashSet::new(),
             marquee: None,
@@ -405,7 +406,7 @@ impl BoxView {
                         this.zoom_at(1. / this.zoom, centre, cx)
                     }
                     ControlEvent::Zoom(step, x, y) => {
-                        this.zoom_at(1. + step as f32, point(px(x as f32), px(y as f32)), cx)
+                        this.pinch(step as f32, point(px(x as f32), px(y as f32)), cx)
                     }
                     ControlEvent::Settings(event) => this.on_settings(event, cx),
                     ControlEvent::Preview(index) => {
@@ -665,52 +666,56 @@ impl BoxView {
         self.pan = self.rest_pan();
     }
 
-    /// Moves the canvas by a wheel or trackpad `delta`. Past an edge it stretches with growing
-    /// resistance, and once the scrolling stops it springs back.
+    /// Moves the canvas by `delta` and shows the scroll bars while it moves.
     fn scroll_by(&mut self, delta: Point<Pixels>, cx: &mut Context<Self>) {
-        let rest = self.rest_pan();
-        let resist = |pan: Pixels, rest: Pixels, delta: Pixels| {
-            let over = f32::from(pan - rest);
-            let delta = f32::from(delta);
-            // Going further out gets harder the further out it is; coming back is free.
-            let factor = if over * delta > 0. {
-                (1. - over.abs() / RUBBER_RANGE).max(0.) * 0.5
-            } else {
-                1.
-            };
-            pan + px(delta * factor)
+        self.pan = self.pan + delta;
+        self.clamp_pan();
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &self.controls {
+            controls.scroll.flash();
+        }
+        cx.notify();
+    }
+
+    /// Follows a pinch, `step` more magnification about `at`, as Maps and Photos do: past the
+    /// smallest or largest zoom it keeps going with growing resistance, and when the fingers
+    /// lift (`step` 0) it springs back to the limit.
+    fn pinch(&mut self, step: f32, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.mode != Mode::Canvas {
+            return;
+        }
+        if step == 0. {
+            self.pinch_raw = None;
+            return self.spring_zoom(at, cx);
+        }
+        let raw = self.pinch_raw.unwrap_or(self.zoom) * (1. + step);
+        self.pinch_raw = Some(raw);
+        let shown = if raw > MAX_ZOOM {
+            MAX_ZOOM * (raw / MAX_ZOOM).powf(RUBBER)
+        } else if raw < MIN_ZOOM {
+            MIN_ZOOM * (raw / MIN_ZOOM).powf(RUBBER)
+        } else {
+            raw
         };
-        self.pan = point(
-            resist(self.pan.x, rest.x, delta.x),
-            resist(self.pan.y, rest.y, delta.y),
-        );
+        self.zoom_to(shown, at, cx);
+    }
+
+    /// Eases the zoom back inside its limits after a pinch went past them.
+    fn spring_zoom(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.scroll_gen += 1;
-        self.stretched = true;
         let generation = self.scroll_gen;
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(80))
-                .await;
             loop {
                 let more = this
                     .update(cx, |this, cx| {
-                        if this.scroll_gen != generation {
+                        if this.scroll_gen != generation || this.pinch_raw.is_some() {
                             return false;
                         }
-                        let rest = this.rest_pan();
-                        let step = |pan: Pixels, rest: Pixels| {
-                            let gap = f32::from(rest - pan);
-                            if gap.abs() < 0.5 {
-                                rest
-                            } else {
-                                pan + px(gap * 0.22)
-                            }
-                        };
-                        let pan = point(step(this.pan.x, rest.x), step(this.pan.y, rest.y));
-                        let done = pan == rest;
-                        this.pan = pan;
-                        this.stretched = !done;
-                        cx.notify();
+                        let rest = this.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                        let gap = rest - this.zoom;
+                        let done = gap.abs() < 0.002;
+                        let next = if done { rest } else { this.zoom + gap * 0.25 };
+                        this.zoom_to(next, at, cx);
                         !done
                     })
                     .unwrap_or(false);
@@ -723,11 +728,6 @@ impl BoxView {
             }
         })
         .detach();
-        #[cfg(target_os = "macos")]
-        if let Some(controls) = &self.controls {
-            controls.scroll.flash();
-        }
-        cx.notify();
     }
 
     /// Zooms by `factor` about the window position `at`, which stays under the pointer.
@@ -735,8 +735,13 @@ impl BoxView {
         if self.mode != Mode::Canvas {
             return;
         }
+        let new = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_to(new, at, cx);
+    }
+
+    /// Shows the canvas at zoom `new` about the window position `at`.
+    fn zoom_to(&mut self, new: f32, at: Point<Pixels>, cx: &mut Context<Self>) {
         let old = self.zoom;
-        let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if (new - old).abs() < f32::EPSILON {
             return;
         }
@@ -1397,7 +1402,7 @@ impl BoxView {
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport = window.viewport_size();
-        if self.drag.is_none() && !self.stretched {
+        if self.drag.is_none() {
             self.clamp_pan();
         }
         DARK_MODE.set(matches!(
@@ -1479,8 +1484,8 @@ impl Render for BoxView {
                     root.child(
                         div()
                             .absolute()
-                            .bottom(px((layout::ADD_MARGIN + (layout::ADD - 22.) / 2.) as f32))
-                            .left(px(layout::ADD_MARGIN as f32))
+                            .bottom(px(layout::ADD_MARGIN as f32))
+                            .left(px(layout::TOOLBAR_SIDE as f32))
                             .child(native(controls.zoom_label.native())),
                     )
                 })
@@ -1489,7 +1494,7 @@ impl Render for BoxView {
                     div()
                         .absolute()
                         .bottom(px(layout::ADD_MARGIN as f32))
-                        .right(px(layout::ADD_MARGIN as f32))
+                        .right(px(layout::TOOLBAR_SIDE as f32))
                         .child(native(controls.add.native())),
                 )
             })
