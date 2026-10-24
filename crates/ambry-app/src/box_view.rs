@@ -54,6 +54,8 @@ const ROW_FADE: u64 = 180;
 const ACCENT: u32 = 0x2f7cf6;
 
 /// How far the canvas zooms, and how much a key press or a click on a scroll wheel step zooms.
+/// How far past an edge the canvas can be pulled.
+const RUBBER_RANGE: f32 = 160.;
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 4.;
 const ZOOM_STEP: f32 = 1.25;
@@ -150,6 +152,8 @@ pub struct BoxView {
     pan: Point<Pixels>,
     /// How big the canvas is drawn, 1 for actual size.
     zoom: f32,
+    /// Counts wheel scrolls, so a spring back to the edge knows it was overtaken.
+    scroll_gen: u64,
     selected: Option<u64>,
     drag: Option<Drag>,
     drop_preview: Option<DropPreview>,
@@ -240,6 +244,7 @@ impl BoxView {
             mode: default_mode(),
             pan: point(px(0.), px(0.)),
             zoom: 1.,
+            scroll_gen: 0,
             selected: None,
             drag: None,
             drop_preview: None,
@@ -290,6 +295,7 @@ impl BoxView {
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
+            let reset = events.clone();
             let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
                 &BoxIcon::COLORS,
@@ -313,7 +319,6 @@ impl BoxView {
             let pinch = ambry_macos::PinchZoom::new(ns_view, move |step, x, y| {
                 pinched.try_send(ControlEvent::Zoom(step, x, y)).ok();
             })?;
-            let reset = events.clone();
             let zoom_label = ambry_macos::ZoomLabel::new(ns_view, move || {
                 reset.try_send(ControlEvent::ZoomReset).ok();
             })?;
@@ -614,24 +619,81 @@ impl BoxView {
         area
     }
 
-    /// Keeps the view inside [`Self::scroll_area`].
-    fn clamp_pan(&mut self) {
+    /// Where the view comes to rest: `pan` held inside [`Self::scroll_area`].
+    fn rest_pan(&self) -> Point<Pixels> {
         let area = self.scroll_area();
         let clamp = |pan: Pixels, min: f32, max: f32, visible: Pixels| {
             let at = -f32::from(pan);
             let at = at.min(max - f32::from(visible)).max(min);
             px(-at)
         };
-        self.pan = point(
+        point(
             clamp(self.pan.x, area.0, area.2, self.viewport.width),
             clamp(self.pan.y, area.1, area.3, self.viewport.height),
-        );
+        )
     }
 
-    /// Moves the canvas by `delta` and shows the scroll bars while it moves.
+    /// Keeps the view inside [`Self::scroll_area`].
+    fn clamp_pan(&mut self) {
+        self.pan = self.rest_pan();
+    }
+
+    /// Moves the canvas by a wheel or trackpad `delta`. Past an edge it stretches with growing
+    /// resistance, and once the scrolling stops it springs back.
     fn scroll_by(&mut self, delta: Point<Pixels>, cx: &mut Context<Self>) {
-        self.pan = self.pan + delta;
-        self.clamp_pan();
+        let rest = self.rest_pan();
+        let resist = |pan: Pixels, rest: Pixels, delta: Pixels| {
+            let over = f32::from(pan - rest);
+            let delta = f32::from(delta);
+            // Going further out gets harder the further out it is; coming back is free.
+            let factor = if over * delta > 0. {
+                (1. - over.abs() / RUBBER_RANGE).max(0.) * 0.5
+            } else {
+                1.
+            };
+            pan + px(delta * factor)
+        };
+        self.pan = point(
+            resist(self.pan.x, rest.x, delta.x),
+            resist(self.pan.y, rest.y, delta.y),
+        );
+        self.scroll_gen += 1;
+        let generation = self.scroll_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(80))
+                .await;
+            loop {
+                let more = this
+                    .update(cx, |this, cx| {
+                        if this.scroll_gen != generation {
+                            return false;
+                        }
+                        let rest = this.rest_pan();
+                        let step = |pan: Pixels, rest: Pixels| {
+                            let gap = f32::from(rest - pan);
+                            if gap.abs() < 0.5 {
+                                rest
+                            } else {
+                                pan + px(gap * 0.22)
+                            }
+                        };
+                        let pan = point(step(this.pan.x, rest.x), step(this.pan.y, rest.y));
+                        let done = pan == rest;
+                        this.pan = pan;
+                        cx.notify();
+                        !done
+                    })
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
         #[cfg(target_os = "macos")]
         if let Some(controls) = &self.controls {
             controls.scroll.flash();
@@ -997,7 +1059,13 @@ impl BoxView {
                     this.on_item_mouse_down(id, event, window, cx)
                 }),
             )
-            .child(finder_face(item, self.icon(item), selected, lifted))
+            .child(finder_face(
+                item,
+                self.icon(item),
+                selected,
+                lifted,
+                self.zoom,
+            ))
             .child(item_label(item.name(), selected, item.exists()))
             .with_animation(
                 ("appear", id as usize),
@@ -1024,7 +1092,7 @@ impl BoxView {
                     .flex_col()
                     .items_center()
                     .gap(px(8.))
-                    .child(ghost_face(item, self.icon(item)))
+                    .child(ghost_face(item, self.icon(item), self.zoom))
                     .child(item_label(item.name(), false, true))
                     .with_animation(
                         ("ghost", index),
@@ -1580,14 +1648,20 @@ fn shadow(x: f32, y: f32, blur: f32, alpha: f32) -> BoxShadow {
 
 /// An item the way Finder's icon view draws it: the file's own icon, or a thumbnail for
 /// images, on a grey rounded backdrop while selected.
-fn finder_face(item: &Item, icon: Option<PathBuf>, selected: bool, lifted: bool) -> gpui::Div {
+fn finder_face(
+    item: &Item,
+    icon: Option<PathBuf>,
+    selected: bool,
+    lifted: bool,
+    scale: f32,
+) -> gpui::Div {
     let picture = if item.is_image() {
         Some(item.path.clone())
     } else {
         icon
     };
     let Some(picture) = picture else {
-        return card_face(item, selected, lifted);
+        return card_face(item, selected, lifted, scale);
     };
     div()
         .p(px(4.))
@@ -1597,7 +1671,7 @@ fn finder_face(item: &Item, icon: Option<PathBuf>, selected: bool, lifted: bool)
         .when(!item.exists(), |this| this.opacity(0.4))
         .child(
             img(picture)
-                .size(px(ICON_SIZE))
+                .size(px(ICON_SIZE * scale))
                 .object_fit(ObjectFit::Contain),
         )
 }
@@ -1659,7 +1733,7 @@ fn list_columns(
         .child(kind.flex_none().w(px(150.)))
 }
 
-fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
+fn card_face(item: &Item, selected: bool, lifted: bool, scale: f32) -> gpui::Div {
     let border: Hsla = if selected {
         rgb(ACCENT).into()
     } else {
@@ -1667,7 +1741,7 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
     };
     let face = match item.kind {
         ItemKind::Folder => div()
-            .size(px(CARD_HEIGHT))
+            .size(px(CARD_HEIGHT * scale))
             .rounded(px(10.))
             .when(selected, |this| this.bg(rgb(palette().pressed)))
             .flex()
@@ -1676,13 +1750,13 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
             .child(
                 svg()
                     .path("icons/folder.svg")
-                    .size(px(64.))
+                    .size(px(64. * scale))
                     .text_color(rgb(0x5aa0f2)),
             ),
         ItemKind::File => div()
             .relative()
-            .w(px(CARD_WIDTH))
-            .h(px(CARD_HEIGHT))
+            .w(px(CARD_WIDTH * scale))
+            .h(px(CARD_HEIGHT * scale))
             .rounded(px(6.))
             .overflow_hidden()
             .bg(linear_gradient(
@@ -1722,21 +1796,25 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
 }
 
 /// The card a file will become, drawn under the cursor while it is dragged in.
-fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
+fn ghost_face(item: &Item, icon: Option<PathBuf>, scale: f32) -> gpui::AnyElement {
     if let Some(icon) = icon {
         return div()
             .p(px(4.))
             .opacity(0.6)
-            .child(img(icon).size(px(ICON_SIZE)).object_fit(ObjectFit::Contain))
+            .child(
+                img(icon)
+                    .size(px(ICON_SIZE * scale))
+                    .object_fit(ObjectFit::Contain),
+            )
             .into_any_element();
     }
     let (width, radius) = match item.kind {
-        ItemKind::Folder => (CARD_HEIGHT, 10.),
-        ItemKind::File => (CARD_WIDTH, 6.),
+        ItemKind::Folder => (CARD_HEIGHT * scale, 10.),
+        ItemKind::File => (CARD_WIDTH * scale, 6.),
     };
     div()
         .w(px(width))
-        .h(px(CARD_HEIGHT))
+        .h(px(CARD_HEIGHT * scale))
         .rounded(px(radius))
         .border_1()
         .border_dashed()
