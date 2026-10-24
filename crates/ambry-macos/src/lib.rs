@@ -26,6 +26,8 @@ mod scroller;
 #[cfg(target_os = "macos")]
 pub mod settings;
 #[cfg(target_os = "macos")]
+mod soft_edge;
+#[cfg(target_os = "macos")]
 mod table;
 #[cfg(target_os = "macos")]
 mod tilt;
@@ -42,6 +44,8 @@ pub use native::{
 #[cfg(target_os = "macos")]
 pub use scroller::CanvasScrollView;
 #[cfg(target_os = "macos")]
+pub use soft_edge::{Edge, SoftEdge};
+#[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]
 pub use toolbar::{BoxLabel, ToolbarEvent, WindowToolbar};
@@ -55,6 +59,12 @@ pub mod layout {
     pub const GAP_BEFORE_AVATAR: f64 = 16.;
     /// Height of the band the controls sit in; the list starts under it.
     pub const BAR: f64 = 54.;
+    /// The frosted bands under the toolbar and the footer, fading out toward the content.
+    pub const TOP_EDGE: f64 = 64.;
+    pub const BOTTOM_EDGE: f64 = 72.;
+    /// The add button in the footer, and its distance from the window's bottom edge.
+    pub const ADD: f64 = 36.;
+    pub const ADD_BOTTOM: f64 = 16.;
     /// Where the title starts, right of the traffic lights, and the height it is centred in.
     pub const TITLE_LEFT: f64 = 80.;
     pub const TITLE_HEIGHT: f64 = 38.;

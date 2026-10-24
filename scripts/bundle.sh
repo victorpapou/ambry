@@ -1,14 +1,17 @@
 #!/bin/sh
 # Builds Ambry and wraps the binary in target/release/Ambry.app, then opens it.
 # A real bundle gets a bundle id, a Dock icon and its own name in the menu bar.
-# --classic turns off the macOS 26 design (Liquid Glass) to see the app as it looks on
-# earlier systems; other arguments go to the app.
+# --classic shows the app without the macOS 26 design (Liquid Glass), as on earlier systems:
+# the binary is marked as built with the macOS 15 SDK, since macOS 27 no longer honours
+# UIDesignRequiresCompatibility for apps built with its own SDK. Other arguments go to the app.
 set -eu
 cd "$(dirname "$0")/.."
 compatibility=""
+classic=""
 for arg in "$@"; do
   shift
   if [ "$arg" = "--classic" ]; then
+    classic=1
     compatibility="<key>UIDesignRequiresCompatibility</key><true/>"
   else
     set -- "$@" "$arg"
@@ -19,7 +22,12 @@ app=target/release/Ambry.app
 pkill -x Ambry 2>/dev/null && sleep 1 || true
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
-cp target/release/ambry "$app/Contents/MacOS/Ambry"
+if [ -n "$classic" ]; then
+  xcrun vtool -set-build-version macos 11.0 15.5 -replace \
+    -output "$app/Contents/MacOS/Ambry" target/release/ambry
+else
+  cp target/release/ambry "$app/Contents/MacOS/Ambry"
+fi
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

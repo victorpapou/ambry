@@ -37,7 +37,6 @@ use crate::native::{
 use crate::settings::{self, Pane};
 
 const BOX: &str = "box";
-const ADD: &str = "add";
 const MODES: &str = "modes";
 const AVATAR: &str = "avatar";
 /// Width given to each canvas/list segment; AppKit pads it to about Freeform's 37 and 39.
@@ -61,7 +60,6 @@ const CHEVRON_PAD: f64 = 6.;
 pub enum ToolbarEvent {
     /// Picked canvas (0) or list (1).
     Mode(usize),
-    Add,
     /// Picked a color for the box's icon, one of `colors` given to [`WindowToolbar::attach`].
     Color(usize),
     /// Picked an SF Symbol for the box's icon, one of `symbols` given to
@@ -156,16 +154,13 @@ define_class!(
     }
 );
 
-/// The box on the left; the add button, the switch and the account on the right, each on its
-/// own glass: a space between items keeps the toolbar from merging them into one platter.
+/// The box on the left; the switch and the account on the right, each on its own glass: a space between items keeps the toolbar from merging them into one platter.
 fn ids() -> Retained<NSArray<NSToolbarItemIdentifier>> {
     let flexible: Retained<NSString> = unsafe { NSToolbarFlexibleSpaceItemIdentifier }.copy();
     let space: Retained<NSString> = unsafe { NSToolbarSpaceItemIdentifier }.copy();
     NSArray::from_retained_slice(&[
         NSString::from_str(BOX),
         flexible,
-        NSString::from_str(ADD),
-        space.clone(),
         NSString::from_str(MODES),
         space,
         NSString::from_str(AVATAR),
@@ -591,19 +586,6 @@ impl WindowToolbar {
         box_item.setView(Some(&stack));
         box_item.setBordered(false);
 
-        // The add button.
-        let add_target = Target::new(mtm, {
-            let state = state.clone();
-            move |_| (state.on_event)(ToolbarEvent::Add)
-        });
-        let add = item(mtm, ADD, "Add");
-        add.setImage(symbol("plus", "Add files or folders").as_deref());
-        add.setToolTip(Some(&NSString::from_str("Add files or folders")));
-        unsafe {
-            add.setTarget(Some(&add_target));
-            add.setAction(Some(sel!(fire:)));
-        }
-
         // Canvas and list: the tab strip of a real NSTabView, which is the control that lifts
         // the glass bubble while pressed. The strip alone goes in the toolbar; the tab view
         // stays out of the window and keeps driving it.
@@ -666,12 +648,7 @@ impl WindowToolbar {
 
         let delegate: Retained<Delegate> = {
             let this = Delegate::alloc(mtm).set_ivars(DelegateIvars {
-                items: vec![
-                    (BOX, box_item),
-                    (ADD, add),
-                    (MODES, modes_item),
-                    (AVATAR, avatar_item),
-                ],
+                items: vec![(BOX, box_item), (MODES, modes_item), (AVATAR, avatar_item)],
             });
             unsafe { msg_send![super(this), init] }
         };
@@ -693,13 +670,7 @@ impl WindowToolbar {
             _list_watcher: list_watcher,
             account,
             _targets: [
-                vec![
-                    tile_target,
-                    name_target,
-                    add_target,
-                    modes_target,
-                    account_target,
-                ],
+                vec![tile_target, name_target, modes_target, account_target],
                 menu_targets,
             ]
             .concat(),

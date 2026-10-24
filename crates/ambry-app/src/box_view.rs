@@ -47,6 +47,9 @@ const LIST_SIDE: f32 = 10.;
 const LIST_HEADER: f32 = 28.;
 #[cfg(target_os = "macos")]
 const LIST_ICON: f32 = 18.;
+/// How long a list row's hover highlight takes to fade in or out, in milliseconds.
+#[cfg(target_os = "macos")]
+const ROW_FADE: u64 = 180;
 
 const ACCENT: u32 = 0x2f7cf6;
 
@@ -155,6 +158,11 @@ pub struct BoxView {
     details: HashMap<PathBuf, [String; 3]>,
     #[cfg(target_os = "macos")]
     controls: Option<NativeControls>,
+    /// The list row under the pointer, and the row it last left.
+    #[cfg(target_os = "macos")]
+    hovered_row: Option<u64>,
+    #[cfg(target_os = "macos")]
+    left_row: Option<u64>,
 }
 
 /// The AppKit views of the window. GPUI lays each out through a `native()` element.
@@ -165,8 +173,13 @@ struct NativeControls {
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
+    /// The frosted bands under the toolbar and behind the footer.
+    top_edge: ambry_macos::SoftEdge,
+    bottom_edge: ambry_macos::SoftEdge,
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
     scroll: ambry_macos::CanvasScrollView,
+    /// The accent add button in the footer.
+    add: ambry_macos::GlassButton,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
     /// Where Quick Look sends the item it moved to.
@@ -224,6 +237,10 @@ impl BoxView {
             icons: HashMap::new(),
             #[cfg(target_os = "macos")]
             details: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            hovered_row: None,
+            #[cfg(target_os = "macos")]
+            left_row: None,
         }
     }
 
@@ -253,6 +270,14 @@ impl BoxView {
                     configured.try_send(ControlEvent::Settings(event)).ok();
                 },
             );
+            // Created first, so the scroll bars and the add button sit on top of them.
+            let top_edge =
+                ambry_macos::SoftEdge::new(ns_view, ambry_macos::Edge::Top, layout::TOP_EDGE)?;
+            let bottom_edge = ambry_macos::SoftEdge::new(
+                ns_view,
+                ambry_macos::Edge::Bottom,
+                layout::BOTTOM_EDGE,
+            )?;
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
@@ -265,7 +290,6 @@ impl BoxView {
                 move |event| {
                     let event = match event {
                         ambry_macos::ToolbarEvent::Mode(index) => ControlEvent::Mode(index),
-                        ambry_macos::ToolbarEvent::Add => ControlEvent::Add,
                         ambry_macos::ToolbarEvent::Color(index) => ControlEvent::Color(index),
                         ambry_macos::ToolbarEvent::Symbol(name) => ControlEvent::Symbol(name),
                         ambry_macos::ToolbarEvent::OpenBox(index) => ControlEvent::OpenBox(index),
@@ -277,12 +301,26 @@ impl BoxView {
                     events.try_send(event).ok();
                 },
             )?;
+            let added = previewed.clone();
+            let add = ambry_macos::GlassButton::new(
+                ns_view,
+                "plus",
+                "Add files or folders",
+                layout::ADD,
+                move || {
+                    added.try_send(ControlEvent::Add).ok();
+                },
+            )?;
+            add.set_accent();
             NativeControls {
                 ns_view,
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
+                top_edge,
+                bottom_edge,
                 scroll,
+                add,
                 shown_scroll: None,
                 events: previewed,
             }
@@ -913,6 +951,58 @@ impl BoxView {
         self.icons.get(&item.path).cloned().flatten()
     }
 
+    /// Notes the row under the pointer, and the one it left, whose highlight fades out.
+    #[cfg(target_os = "macos")]
+    fn hover_row(&mut self, id: u64, inside: bool, cx: &mut Context<Self>) {
+        if inside {
+            if self.hovered_row == Some(id) {
+                return;
+            }
+            // The row left may already have reported it; keep its fade-out then.
+            if let Some(previous) = self.hovered_row.replace(id) {
+                self.left_row = Some(previous);
+            }
+        } else if self.hovered_row == Some(id) {
+            self.hovered_row = None;
+            self.left_row = Some(id);
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
+    /// The grey highlight of a row under the pointer, fading in, or of the row it just left,
+    /// fading out.
+    #[cfg(target_os = "macos")]
+    fn row_hover(&self, id: u64) -> Option<gpui::AnyElement> {
+        let entering = self.hovered_row == Some(id);
+        if !entering && self.left_row != Some(id) {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .rounded(px(7.))
+                .bg(rgb(palette().pressed))
+                .with_animation(
+                    (
+                        if entering {
+                            "row-hover-in"
+                        } else {
+                            "row-hover-out"
+                        },
+                        id as usize,
+                    ),
+                    Animation::new(Duration::from_millis(ROW_FADE)).with_easing(ease_out_quint()),
+                    move |this, t| this.opacity(if entering { t } else { 1. - t }),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The list: Finder's columns, drawn by GPUI, with rounded rows that fill with the accent
     /// color when selected.
     #[cfg(target_os = "macos")]
@@ -960,7 +1050,8 @@ impl BoxView {
                     .overflow_y_scroll()
                     .px(px(LIST_SIDE))
                     .pt(px(6.))
-                    .pb(px(24.))
+                    // Room for the last rows to scroll out from under the footer.
+                    .pb(px(layout::BOTTOM_EDGE as f32))
                     .flex()
                     .flex_col()
                     .when(self.doc.items.is_empty(), |this| this.child(empty_hint()))
@@ -1006,10 +1097,12 @@ impl BoxView {
             .when(!selected && index % 2 == 1, |this| {
                 this.bg(rgb(palette().stripe))
             })
-            .when(!selected, |this| {
-                this.hover(|this| this.bg(rgb(palette().pressed)))
-            })
+            .relative()
+            .when(!selected, |this| this.children(self.row_hover(id)))
             .when(!item.exists(), |this| this.opacity(0.4))
+            .on_hover(
+                cx.listener(move |this, inside: &bool, _, cx| this.hover_row(id, *inside, cx)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event, window, cx| {
@@ -1286,6 +1379,35 @@ impl Render for BoxView {
                         .right_0()
                         .bottom_0()
                         .child(native(controls.scroll.native()).fill()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(layout::TOP_EDGE as f32))
+                        .child(native(controls.top_edge.native()).fill()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(layout::BOTTOM_EDGE as f32))
+                        .child(native(controls.bottom_edge.native()).fill()),
+                )
+                // The footer: the window's main action, centred under the content.
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(layout::ADD_BOTTOM as f32))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(native(controls.add.native())),
                 )
             })
             .font_family(".SystemUIFont");

@@ -241,8 +241,19 @@ impl Row {
             let view = view.clone();
             move |inside| {
                 if let Some(layer) = view.layer() {
-                    let fill = NSColor::quaternaryLabelColor().CGColor();
-                    layer.setBackgroundColor(inside.then_some(&*fill));
+                    let fill = NSColor::quaternaryLabelColor();
+                    let clear = NSColor::clearColor();
+                    let (from, to) = if inside { (clear, fill) } else { (fill, clear) };
+                    let (from, to) = (from.CGColor(), to.CGColor());
+                    layer.setBackgroundColor(Some(&to));
+                    crate::tilt::animate(
+                        &layer,
+                        "backgroundColor",
+                        crate::tilt::bridged(&*from),
+                        crate::tilt::bridged(&*to),
+                        0.2,
+                        0.,
+                    );
                 }
             }
         });
