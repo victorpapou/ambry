@@ -3,16 +3,21 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::path::Path;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{
-    NSButton, NSTabView, NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier,
-    NSToolbarItem, NSToolbarItemIdentifier, NSView, NSWindowToolbarStyle,
+use objc2::{
+    AllocAnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class,
+    msg_send, sel,
 };
-use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSString};
+use objc2_app_kit::{
+    NSButton, NSImage, NSImageScaling, NSImageView, NSSegmentedControl, NSTabView, NSToolbar,
+    NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSView, NSWindowToolbarStyle,
+};
+use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSSize, NSString};
 
 use crate::native::{
     Target, decorate, icon_images, icon_tab_view, object, segments, selected_index, symbol,
@@ -20,6 +25,9 @@ use crate::native::{
 
 const MODES: &str = "modes";
 const ADD: &str = "add";
+const AVATAR: &str = "avatar";
+/// Point size of the account picture inside its glass circle.
+const AVATAR_SIZE: f64 = 28.;
 
 struct DelegateIvars {
     /// The view of each item, made up front so the window can keep hold of them.
@@ -66,19 +74,29 @@ impl Delegate {
         let (_, view) = self.ivars().views.iter().find(|(key, _)| *key == name)?;
         let item = NSToolbarItem::initWithItemIdentifier(NSToolbarItem::alloc(self.mtm()), id);
         item.setView(Some(view));
-        item.setLabel(&NSString::from_str(if name == MODES {
-            "View"
-        } else {
-            "Add"
+        item.setLabel(&NSString::from_str(match name.as_str() {
+            MODES => "View",
+            ADD => "Add",
+            _ => "Account",
         }));
         self.ivars().items.borrow_mut().push(item.clone());
         Some(item)
     }
 }
 
+/// The tabs, the add button and the account, each on its own glass: a space between items
+/// keeps the toolbar from merging them into one platter.
 fn ids() -> Retained<NSArray<NSToolbarItemIdentifier>> {
-    let space: Retained<NSString> = unsafe { NSToolbarFlexibleSpaceItemIdentifier }.copy();
-    NSArray::from_retained_slice(&[space, NSString::from_str(MODES), NSString::from_str(ADD)])
+    let flexible: Retained<NSString> = unsafe { NSToolbarFlexibleSpaceItemIdentifier }.copy();
+    let space: Retained<NSString> = unsafe { NSToolbarSpaceItemIdentifier }.copy();
+    NSArray::from_retained_slice(&[
+        flexible,
+        NSString::from_str(MODES),
+        space.clone(),
+        NSString::from_str(ADD),
+        space,
+        NSString::from_str(AVATAR),
+    ])
 }
 
 /// The toolbar of the window that holds `ns_view`: canvas and list tabs that lift a glass
@@ -97,6 +115,8 @@ impl WindowToolbar {
         ns_view: NonNull<c_void>,
         tabs: &[(&str, &str)],
         item_width: f64,
+        avatar: Option<&Path>,
+        initial: &str,
         on_mode: impl Fn(usize) + 'static,
         on_add: impl Fn() + 'static,
     ) -> Option<Self> {
@@ -140,6 +160,7 @@ impl WindowToolbar {
                 views: vec![
                     (MODES, strip),
                     (ADD, Retained::into_super(Retained::into_super(add))),
+                    (AVATAR, account(mtm, avatar, initial)),
                 ],
                 items: RefCell::new(Vec::new()),
             });
@@ -204,6 +225,44 @@ impl WindowToolbar {
     }
 }
 
+/// The account picture cut to a circle, or the user's initial as a button, for the toolbar
+/// to put on glass.
+fn account(mtm: MainThreadMarker, picture: Option<&Path>, initial: &str) -> Retained<NSView> {
+    let image = picture.and_then(|path| {
+        NSImage::initWithContentsOfFile(
+            NSImage::alloc(),
+            &NSString::from_str(&path.to_string_lossy()),
+        )
+    });
+    match image {
+        Some(image) => {
+            let view = NSImageView::imageViewWithImage(&image, mtm);
+            view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+            view.setFrame(NSRect::new(
+                NSPoint::new(0., 0.),
+                NSSize::new(AVATAR_SIZE, AVATAR_SIZE),
+            ));
+            view.setWantsLayer(true);
+            if let Some(layer) = view.layer() {
+                layer.setCornerRadius(AVATAR_SIZE / 2.);
+                layer.setMasksToBounds(true);
+            }
+            Retained::into_super(Retained::into_super(view))
+        }
+        None => {
+            let button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(initial),
+                    None,
+                    None,
+                    mtm,
+                )
+            };
+            Retained::into_super(Retained::into_super(button))
+        }
+    }
+}
+
 /// A view exactly the size of the tab strip with the tab view inside it, so the toolbar sizes
 /// the item to the strip and not to NSTabView's margins.
 fn cut_to_strip(mtm: MainThreadMarker, tabs: &Retained<NSTabView>) -> Retained<NSView> {
@@ -211,6 +270,12 @@ fn cut_to_strip(mtm: MainThreadMarker, tabs: &Retained<NSTabView>) -> Retained<N
         return Retained::into_super(tabs.clone());
     };
     let strip = control.frame();
+    // NSTabView keeps a few views of its own around the strip; only the strip should show.
+    for view in tabs.subviews().iter() {
+        if !view.isKindOfClass(NSSegmentedControl::class()) {
+            view.setHidden(true);
+        }
+    }
     tabs.setFrameOrigin(NSPoint::new(-strip.origin.x, -strip.origin.y));
     let holder = NSView::initWithFrame(
         NSView::alloc(mtm),
