@@ -14,6 +14,8 @@ mod native;
 #[cfg(target_os = "macos")]
 pub mod probe;
 #[cfg(target_os = "macos")]
+mod scroller;
+#[cfg(target_os = "macos")]
 mod table;
 #[cfg(target_os = "macos")]
 mod toolbar;
@@ -25,6 +27,8 @@ pub use native::{
     GlassAvatar, GlassButton, GlassSegments, GlassTabs, NativeView, TabEvent, TabSwitch,
     set_window_subtitle,
 };
+#[cfg(target_os = "macos")]
+pub use scroller::{CanvasScroller, ScrollerEvent};
 #[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]

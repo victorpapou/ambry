@@ -28,8 +28,12 @@ const CARD_WIDTH: f32 = 64.;
 const CARD_HEIGHT: f32 = 80.;
 /// Width of a card together with its file name underneath.
 const ITEM_WIDTH: f32 = 128.;
+/// Height of a card together with its file name underneath.
+const ITEM_HEIGHT: f32 = CARD_HEIGHT + 40.;
 /// Width of the white fade along the canvas edges.
 const EDGE_FADE: f32 = 40.;
+/// Empty canvas one can scroll to around the items, in points.
+const CANVAS_MARGIN: f32 = 400.;
 const TITLE_SIZE: f32 = 15.;
 const LABEL_SIZE: f32 = 13.;
 
@@ -145,6 +149,11 @@ struct NativeControls {
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: Vec<ambry_macos::BoxLabel>,
+    /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
+    vertical: ambry_macos::CanvasScroller,
+    horizontal: ambry_macos::CanvasScroller,
+    /// The knob proportions and values last shown, to touch AppKit only when they change.
+    shown_scroll: Option<[f64; 4]>,
 }
 
 #[cfg(target_os = "macos")]
@@ -155,6 +164,8 @@ enum ControlEvent {
     Symbol(usize),
     OpenBox(usize),
     NewBox,
+    /// The vertical (true) or horizontal scroll bar moved.
+    Scroll(bool, ambry_macos::ScrollerEvent),
     Open(usize),
     Select(Option<usize>),
 }
@@ -224,6 +235,14 @@ impl BoxView {
                 },
             )?;
             table.native().set_hidden(true);
+            let scrolled = events.clone();
+            let vertical = ambry_macos::CanvasScroller::new(ns_view, true, move |event| {
+                scrolled.try_send(ControlEvent::Scroll(true, event)).ok();
+            })?;
+            let scrolled = events.clone();
+            let horizontal = ambry_macos::CanvasScroller::new(ns_view, false, move |event| {
+                scrolled.try_send(ControlEvent::Scroll(false, event)).ok();
+            })?;
             let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
                 &BoxIcon::COLORS,
@@ -249,6 +268,9 @@ impl BoxView {
                 toolbar,
                 shown_box: None,
                 shown_boxes: Vec::new(),
+                vertical,
+                horizontal,
+                shown_scroll: None,
             }
         };
         cx.spawn(async move |this, cx| {
@@ -291,6 +313,7 @@ impl BoxView {
                             this.open_item(id, cx);
                         }
                     }
+                    ControlEvent::Scroll(vertical, event) => this.on_scroller(vertical, event, cx),
                     ControlEvent::Select(row) => {
                         this.selected = row
                             .and_then(|row| this.doc.items.get(row))
@@ -358,6 +381,29 @@ impl BoxView {
             controls.toolbar.set_boxes(boxes.clone(), current);
             controls.shown_boxes = boxes;
         }
+        let area = self.scroll_area();
+        let (x, y) = (-f32::from(self.pan.x), -f32::from(self.pan.y));
+        let (width, height) = (
+            f32::from(self.viewport.width),
+            f32::from(self.viewport.height),
+        );
+        let knob = |min: f32, max: f32, at: f32, visible: f32| {
+            let total = (max - min).max(visible);
+            let travel = total - visible;
+            let value = if travel > 0. { (at - min) / travel } else { 0. };
+            (f64::from(visible / total), f64::from(value))
+        };
+        let (h_proportion, h_value) = knob(area.0, area.2, x, width);
+        let (v_proportion, v_value) = knob(area.1, area.3, y, height);
+        let scroll = [h_proportion, h_value, v_proportion, v_value];
+        if controls.shown_scroll != Some(scroll) {
+            controls.horizontal.set(h_proportion, h_value);
+            controls.vertical.set(v_proportion, v_value);
+            controls.shown_scroll = Some(scroll);
+        }
+        let in_canvas = self.mode == Mode::Canvas;
+        controls.horizontal.native().set_hidden(!in_canvas);
+        controls.vertical.native().set_hidden(!in_canvas);
     }
 
     /// Renders Finder's icon for every item that has none yet.
@@ -431,6 +477,83 @@ impl BoxView {
             n += 1;
         }
         name
+    }
+
+    /// The part of the canvas one can scroll over, as `(left, top, right, bottom)` in canvas
+    /// coordinates: the items with room around them, and always the first screen.
+    fn scroll_area(&self) -> (f32, f32, f32, f32) {
+        let mut area: (f32, f32, f32, f32) = (
+            0.,
+            0.,
+            f32::from(self.viewport.width),
+            f32::from(self.viewport.height),
+        );
+        for item in &self.doc.items {
+            area.0 = area.0.min(item.x - CANVAS_MARGIN);
+            area.1 = area.1.min(item.y - CANVAS_MARGIN);
+            area.2 = area.2.max(item.x + ITEM_WIDTH + CANVAS_MARGIN);
+            area.3 = area.3.max(item.y + ITEM_HEIGHT + CANVAS_MARGIN);
+        }
+        area
+    }
+
+    /// Keeps the view inside [`Self::scroll_area`].
+    fn clamp_pan(&mut self) {
+        let area = self.scroll_area();
+        let clamp = |pan: Pixels, min: f32, max: f32, visible: Pixels| {
+            let at = -f32::from(pan);
+            let at = at.min(max - f32::from(visible)).max(min);
+            px(-at)
+        };
+        self.pan = point(
+            clamp(self.pan.x, area.0, area.2, self.viewport.width),
+            clamp(self.pan.y, area.1, area.3, self.viewport.height),
+        );
+    }
+
+    /// Moves the canvas by `delta` and shows the scroll bars while it moves.
+    fn scroll_by(&mut self, delta: Point<Pixels>, cx: &mut Context<Self>) {
+        self.pan = self.pan + delta;
+        self.clamp_pan();
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &self.controls {
+            controls.horizontal.flash();
+            controls.vertical.flash();
+        }
+        cx.notify();
+    }
+
+    /// Follows a drag of a scroll bar's knob or a click in its track.
+    #[cfg(target_os = "macos")]
+    fn on_scroller(
+        &mut self,
+        vertical: bool,
+        event: ambry_macos::ScrollerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let area = self.scroll_area();
+        let (min, max, visible, pan) = if vertical {
+            (area.1, area.3, f32::from(self.viewport.height), self.pan.y)
+        } else {
+            (area.0, area.2, f32::from(self.viewport.width), self.pan.x)
+        };
+        let at = match event {
+            ambry_macos::ScrollerEvent::Moved(value) => {
+                min + value as f32 * (max - min - visible).max(0.)
+            }
+            ambry_macos::ScrollerEvent::Page(direction) => {
+                -f32::from(pan) + direction as f32 * visible * 0.9
+            }
+        };
+        let delta = px(-at) - pan;
+        self.scroll_by(
+            if vertical {
+                point(px(0.), delta)
+            } else {
+                point(delta, px(0.))
+            },
+            cx,
+        );
     }
 
     /// Converts a window position into canvas coordinates.
@@ -641,8 +764,7 @@ impl BoxView {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                this.pan = this.pan + event.delta.pixel_delta(window.line_height());
-                cx.notify();
+                this.scroll_by(event.delta.pixel_delta(window.line_height()), cx);
             }))
             .child(
                 canvas(
@@ -930,6 +1052,9 @@ impl BoxView {
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport = window.viewport_size();
+        if self.drag.is_none() {
+            self.clamp_pan();
+        }
         DARK_MODE.set(matches!(
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -975,28 +1100,30 @@ impl Render for BoxView {
         let root = root.child(self.render_top_bar(cx));
 
         #[cfg(target_os = "macos")]
-        let root = root.font_family(".SystemUIFont");
+        let root = root
+            .when_some(self.controls.as_ref(), |root, controls| {
+                let thickness = px(controls.vertical.width() as f32);
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(layout::BAR as f32))
+                        .right_0()
+                        .bottom(thickness)
+                        .w(thickness)
+                        .child(native(controls.vertical.native()).fill()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right(thickness)
+                        .bottom_0()
+                        .h(thickness)
+                        .child(native(controls.horizontal.native()).fill()),
+                )
+            })
+            .font_family(".SystemUIFont");
         root
-    }
-}
-
-fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
-    let color: Rgba = rgb(palette().dot);
-    let start_x = f32::from(pan.x).rem_euclid(DOT_SPACING);
-    let start_y = f32::from(pan.y).rem_euclid(DOT_SPACING);
-    let width = f32::from(bounds.size.width);
-    let height = f32::from(bounds.size.height);
-    let dot = size(px(DOT_RADIUS * 2.), px(DOT_RADIUS * 2.));
-
-    let mut y = start_y;
-    while y < height {
-        let mut x = start_x;
-        while x < width {
-            let origin = bounds.origin + point(px(x - DOT_RADIUS), px(y - DOT_RADIUS));
-            window.paint_quad(fill(Bounds::new(origin, dot), color).corner_radii(px(DOT_RADIUS)));
-            x += DOT_SPACING;
-        }
-        y += DOT_SPACING;
     }
 }
 
@@ -1032,6 +1159,26 @@ fn edge_fades() -> [impl IntoElement; 4] {
             .w(px(EDGE_FADE))
             .bg(linear_gradient(270., white, clear)),
     ]
+}
+
+fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
+    let color: Rgba = rgb(palette().dot);
+    let start_x = f32::from(pan.x).rem_euclid(DOT_SPACING);
+    let start_y = f32::from(pan.y).rem_euclid(DOT_SPACING);
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    let dot = size(px(DOT_RADIUS * 2.), px(DOT_RADIUS * 2.));
+
+    let mut y = start_y;
+    while y < height {
+        let mut x = start_x;
+        while x < width {
+            let origin = bounds.origin + point(px(x - DOT_RADIUS), px(y - DOT_RADIUS));
+            window.paint_quad(fill(Bounds::new(origin, dot), color).corner_radii(px(DOT_RADIUS)));
+            x += DOT_SPACING;
+        }
+        y += DOT_SPACING;
+    }
 }
 
 /// How the toolbar shows a box.
