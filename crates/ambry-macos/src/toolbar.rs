@@ -1176,6 +1176,12 @@ fn account_button(mtm: MainThreadMarker) -> Retained<NSButton> {
         unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
     button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown);
     button.setToolTip(Some(&NSString::from_str("Account")));
+    // A circle, as wide as it is tall: a bordered button pads its sides otherwise.
+    button.setTranslatesAutoresizingMaskIntoConstraints(false);
+    button
+        .widthAnchor()
+        .constraintEqualToAnchor(&button.heightAnchor())
+        .setActive(true);
     button
 }
 

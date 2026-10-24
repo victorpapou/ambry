@@ -42,6 +42,8 @@ const ACCENT: u32 = 0x2f7cf6;
 /// How hard a pinch past the zoom limits pulls: the zoom shown grows as this power of the
 /// zoom asked for.
 const RUBBER: f32 = 0.3;
+/// How long the canvas takes to spring back to an edge, in seconds.
+const SPRING_RESPONSE: f32 = 0.4;
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 4.;
 const ZOOM_STEP: f32 = 1.25;
@@ -146,6 +148,11 @@ pub struct BoxView {
     zoom: f32,
     /// Counts wheel scrolls, so a spring back to the edge knows it was overtaken.
     scroll_gen: u64,
+    /// Whether fingers are on the trackpad, scrolling; whether a pull past an edge is
+    /// springing back, and how fast.
+    fingers: bool,
+    springing: bool,
+    pan_velocity: Point<Pixels>,
     /// The zoom a pinch under way asks for, before the resistance past the limits.
     pinch_raw: Option<f32>,
     selected: Option<u64>,
@@ -243,6 +250,9 @@ impl BoxView {
             zoom: 1.,
             scroll_gen: 0,
             pinch_raw: None,
+            fingers: false,
+            springing: false,
+            pan_velocity: point(px(0.), px(0.)),
             selected: None,
             picked: HashSet::new(),
             marquee: None,
@@ -677,6 +687,139 @@ impl BoxView {
         cx.notify();
     }
 
+    /// Moves the canvas under a trackpad the way an NSScrollView does: past an edge the canvas
+    /// follows the fingers with growing resistance, and the moment they lift, or the coasting
+    /// after a flick runs into the edge, it springs back.
+    fn scroll_elastic(
+        &mut self,
+        delta: Point<Pixels>,
+        phase: gpui::TouchPhase,
+        cx: &mut Context<Self>,
+    ) {
+        match phase {
+            gpui::TouchPhase::Started => self.fingers = true,
+            gpui::TouchPhase::Ended => self.fingers = false,
+            gpui::TouchPhase::Moved => {}
+        }
+        let rest = self.rest_pan();
+        let pull = |pan: Pixels, rest: Pixels, delta: Pixels, extent: Pixels| {
+            // The fingers' own travel past the edge, from which AppKit's rubber band curve
+            // gives how far the canvas goes: it never quite reaches the size of the view.
+            let over = f32::from(pan - rest);
+            let extent = f32::from(extent).max(1.);
+            let travel = unrubber(over, extent) + f32::from(delta);
+            if travel * over > 0. {
+                px(f32::from(rest) + rubber(travel, extent))
+            } else {
+                // Back over the edge: the rest of the move is inside, one to one.
+                px(f32::from(rest) + travel)
+            }
+        };
+        let moved = point(self.pan.x + delta.x, self.pan.y + delta.y);
+        let rest_moved = {
+            let saved = self.pan;
+            self.pan = moved;
+            let rest = self.rest_pan();
+            self.pan = saved;
+            rest
+        };
+        // Inside the edges the canvas moves one to one; only what goes past one stretches.
+        let axis = |pan: Pixels,
+                    moved: Pixels,
+                    rest: Pixels,
+                    rest_moved: Pixels,
+                    delta: Pixels,
+                    extent: Pixels| {
+            if pan == rest && moved == rest_moved {
+                moved
+            } else if pan == rest {
+                // Reaching the edge in this step: up to it freely, the rest stretched.
+                let free = rest_moved - pan;
+                let left = f32::from(delta) - f32::from(free);
+                px(f32::from(rest_moved) + rubber(left, f32::from(extent).max(1.)))
+            } else {
+                pull(pan, rest, delta, extent)
+            }
+        };
+        self.pan = point(
+            axis(
+                self.pan.x,
+                moved.x,
+                rest.x,
+                rest_moved.x,
+                delta.x,
+                self.viewport.width,
+            ),
+            axis(
+                self.pan.y,
+                moved.y,
+                rest.y,
+                rest_moved.y,
+                delta.y,
+                self.viewport.height,
+            ),
+        );
+        let stretched = self.pan != self.rest_pan();
+        if stretched && !self.fingers && !self.springing {
+            self.spring_back(cx);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &self.controls {
+            controls.scroll.flash();
+        }
+        cx.notify();
+    }
+
+    /// Springs a canvas pulled past an edge back to it, on a critically damped spring like
+    /// AppKit's.
+    fn spring_back(&mut self, cx: &mut Context<Self>) {
+        self.springing = true;
+        self.pan_velocity = point(px(0.), px(0.));
+        cx.spawn(async move |this, cx| {
+            loop {
+                let more = this
+                    .update(cx, |this, cx| {
+                        if this.fingers {
+                            this.springing = false;
+                            return false;
+                        }
+                        let rest = this.rest_pan();
+                        let dt = 1. / 60.;
+                        let omega = 2. * std::f32::consts::PI / SPRING_RESPONSE;
+                        let step = |pan: Pixels, velocity: Pixels, rest: Pixels| {
+                            let offset = f32::from(pan - rest);
+                            let velocity = f32::from(velocity);
+                            let accel = -omega * omega * offset - 2. * omega * velocity;
+                            let velocity = velocity + accel * dt;
+                            (px(f32::from(rest) + offset + velocity * dt), px(velocity))
+                        };
+                        let (x, vx) = step(this.pan.x, this.pan_velocity.x, rest.x);
+                        let (y, vy) = step(this.pan.y, this.pan_velocity.y, rest.y);
+                        this.pan = point(x, y);
+                        this.pan_velocity = point(vx, vy);
+                        let near = |a: Pixels, b: Pixels, v: Pixels| {
+                            f32::from(a - b).abs() < 0.3 && f32::from(v).abs() < 5.
+                        };
+                        let done = near(x, rest.x, vx) && near(y, rest.y, vy);
+                        if done {
+                            this.pan = rest;
+                            this.springing = false;
+                        }
+                        cx.notify();
+                        !done
+                    })
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
     /// Follows a pinch, `step` more magnification about `at`, as Maps and Photos do: past the
     /// smallest or largest zoom it keeps going with growing resistance, and when the fingers
     /// lift (`step` 0) it springs back to the limit.
@@ -782,12 +925,24 @@ impl BoxView {
         )
     }
 
-    /// Top-left corner of an item in window coordinates.
+    /// Top-left corner of an item in window coordinates. The item is pinned to the canvas by
+    /// the middle of its top edge, where its icon hangs from, so zooming keeps every icon on
+    /// its own spot instead of sliding it against the dots.
     fn item_origin(&self, item: &Item) -> Point<Pixels> {
         point(
-            self.pan.x + px(item.x * self.zoom),
+            self.screen_left(item.x),
             self.pan.y + px(item.y * self.zoom),
         )
+    }
+
+    /// The window x of the left edge of an item whose canvas left is `x`.
+    fn screen_left(&self, x: f32) -> Pixels {
+        self.pan.x + px((x + ITEM_WIDTH / 2.) * self.zoom - ITEM_WIDTH / 2.)
+    }
+
+    /// The canvas left of an item drawn with its left edge at window x `left`.
+    fn canvas_left(&self, left: Pixels) -> f32 {
+        (f32::from(left - self.pan.x) + ITEM_WIDTH / 2.) / self.zoom - ITEM_WIDTH / 2.
     }
 
     /// Where the first of `count` dropped items lands: centred under the cursor,
@@ -799,12 +954,9 @@ impl BoxView {
             _ => point(self.viewport.width / 2., self.viewport.height / 2.),
         };
         let (x, y) = self.to_canvas(position);
-        // The cards keep their size on screen, so their offsets from the cursor shrink or
-        // grow with the zoom in canvas units.
-        (
-            x - (ITEM_WIDTH / 2. + row_width / 2.) / self.zoom,
-            y - CARD_HEIGHT / 2. / self.zoom,
-        )
+        // Items hang from the middle of their top edge, so the row is centred on the cursor
+        // in canvas units; the card's height shrinks and grows with the zoom.
+        (x - ITEM_WIDTH / 2. - row_width / 2., y - CARD_HEIGHT / 2.)
     }
 
     fn add_paths(
@@ -967,7 +1119,9 @@ impl BoxView {
             return;
         }
         let id = drag.id;
-        let (x, y) = self.to_canvas(event.position - drag.grab);
+        let origin = event.position - drag.grab;
+        let (_, y) = self.to_canvas(origin);
+        let x = self.canvas_left(origin.x);
         self.doc.move_item(id, x, y);
         if let Some(drag) = &mut self.drag {
             drag.moved = true;
@@ -1107,6 +1261,8 @@ impl BoxView {
                 if event.modifiers.platform || event.modifiers.control {
                     let factor = (1. + f32::from(delta.y) * 0.01).max(0.5);
                     this.zoom_at(factor, event.position, cx);
+                } else if matches!(event.delta, gpui::ScrollDelta::Pixels(_)) {
+                    this.scroll_elastic(delta, event.touch_phase, cx);
                 } else {
                     this.scroll_by(delta, cx);
                 }
@@ -1134,7 +1290,7 @@ impl BoxView {
             .drag
             .as_ref()
             .is_some_and(|drag| drag.id == id && drag.moved);
-        let left = self.pan.x + px(item.x * self.zoom);
+        let left = self.screen_left(item.x);
         let top = self.pan.y + px(item.y * self.zoom) - if lifted { px(3.) } else { px(0.) };
         let delay = self.appear_delay.get(&id).copied().unwrap_or(0.);
 
@@ -1185,7 +1341,7 @@ impl BoxView {
                 let top = self.pan.y + px(y * self.zoom);
                 div()
                     .absolute()
-                    .left(self.pan.x + px((x + index as f32 * DROP_STEP_X) * self.zoom))
+                    .left(self.screen_left(x + index as f32 * DROP_STEP_X))
                     .top(top)
                     .w(px(ITEM_WIDTH))
                     .flex()
@@ -1402,7 +1558,8 @@ impl BoxView {
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport = window.viewport_size();
-        if self.drag.is_none() {
+        // A canvas pulled past an edge stays there until it springs back.
+        if self.drag.is_none() && !self.fingers && !self.springing {
             self.clamp_pan();
         }
         DARK_MODE.set(matches!(
@@ -1484,8 +1641,8 @@ impl Render for BoxView {
                     root.child(
                         div()
                             .absolute()
-                            .bottom(px(layout::ADD_MARGIN as f32))
-                            .left(px(layout::TOOLBAR_SIDE as f32))
+                            .bottom(px((layout::ADD_MARGIN + (layout::ADD - 22.) / 2.) as f32))
+                            .left(px(layout::LIGHTS_LEFT as f32))
                             .child(native(controls.zoom_label.native())),
                     )
                 })
@@ -1539,6 +1696,21 @@ fn edge_fades() -> [impl IntoElement; 4] {
 
 /// The dot grid, zoomed with the canvas like Freeform's: the dots spread and grow as it zooms
 /// in, and when they get too close every other one drops out.
+/// AppKit's rubber band: fingers `travel` points past an edge move the content this far, never
+/// quite `extent`, the size of the view.
+fn rubber(travel: f32, extent: f32) -> f32 {
+    let c = 0.55;
+    let x = travel.abs();
+    (1. - 1. / (x * c / extent + 1.)) * extent * travel.signum()
+}
+
+/// The fingers' travel that [`rubber`] turns into `offset`.
+fn unrubber(offset: f32, extent: f32) -> f32 {
+    let c = 0.55;
+    let y = offset.abs().min(extent * 0.999);
+    (extent / c) * (1. / (1. - y / extent) - 1.) * offset.signum()
+}
+
 fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32, window: &mut Window) {
     let color: Rgba = rgb(palette().dot);
     let mut spacing = DOT_SPACING * zoom;

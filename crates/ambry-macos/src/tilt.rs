@@ -23,7 +23,7 @@ use objc2_quartz_core::{
 /// Growth under the pointer, the steepest lean in radians, and the viewer's distance in
 /// points: nearer looks deeper.
 const SCALE: f64 = 1.;
-const LEAN: f64 = 0.24;
+const LEAN: f64 = 0.42;
 const DISTANCE: f64 = 300.;
 /// The springs into the hover, after the moving pointer, and back flat when it leaves.
 const LIFT: (f64, f64) = (0.3, 0.2);

@@ -11,7 +11,9 @@ use std::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSBrowser, NSView, NSWorkspace};
+use objc2_app_kit::{
+    NSBezierPath, NSBrowser, NSBrowserCell, NSCell, NSColor, NSFont, NSView, NSWorkspace,
+};
 use objc2_foundation::{NSIndexSet, NSPoint, NSRect, NSSize, NSString};
 
 use crate::native::{NativeView, Target};
@@ -20,6 +22,52 @@ use crate::native::{NativeView, Target};
 const COLUMN_WIDTH: f64 = 240.;
 /// The most entries one folder's column lists.
 const LIMIT: usize = 500;
+
+/// Height of a row, how far its highlight keeps from the column's sides, and its corners:
+/// Finder's column view on macOS 26.
+const ROW_HEIGHT: f64 = 24.;
+const ROW_INSET: f64 = 6.;
+const ROW_RADIUS: f64 = 6.;
+const FONT_SIZE: f64 = 13.;
+
+define_class!(
+    // A browser row drawn the way Finder draws it: a rounded highlight inset from the column's
+    // edges instead of a bar across it.
+    #[unsafe(super(NSBrowserCell, NSCell, objc2::runtime::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryColumnCell"]
+    struct RoundCell;
+
+    impl RoundCell {
+        #[unsafe(method(highlightColorInView:))]
+        fn highlight_color(&self, _view: &NSView) -> *mut NSColor {
+            Retained::autorelease_return(NSColor::clearColor())
+        }
+
+        #[unsafe(method(drawWithFrame:inView:))]
+        fn draw(&self, frame: NSRect, view: &NSView) {
+            let highlighted: bool = unsafe { msg_send![self, isHighlighted] };
+            let inner = NSRect::new(
+                NSPoint::new(frame.origin.x + ROW_INSET, frame.origin.y + 1.),
+                NSSize::new(frame.size.width - ROW_INSET * 2., frame.size.height - 2.),
+            );
+            if highlighted {
+                NSColor::selectedContentBackgroundColor().setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    inner, ROW_RADIUS, ROW_RADIUS,
+                )
+                .fill();
+            }
+            let text = NSRect::new(
+                NSPoint::new(inner.origin.x + 4., frame.origin.y),
+                NSSize::new(inner.size.width - 4., frame.size.height),
+            );
+            unsafe {
+                let _: () = msg_send![super(self), drawInteriorWithFrame: text, inView: view];
+            }
+        }
+    }
+);
 
 /// What the user did in the column view.
 pub enum ColumnEvent {
@@ -67,6 +115,7 @@ define_class!(
             unsafe {
                 let _: () = msg_send![cell, setStringValue: &*NSString::from_str(&name)];
                 let _: () = msg_send![cell, setLeaf: !path.is_dir()];
+                let _: () = msg_send![cell, setFont: &*NSFont::systemFontOfSize(FONT_SIZE)];
                 let _: () = msg_send![cell, setImage: &*icon];
             }
         }
@@ -175,6 +224,10 @@ impl ColumnBrowser {
             let _: () = msg_send![&*browser, setAction: sel!(fire:)];
         }
         browser.setTitled(false);
+        unsafe {
+            let _: () = msg_send![&*browser, setCellClass: RoundCell::class()];
+            let _: () = msg_send![&*browser, setRowHeight: ROW_HEIGHT];
+        }
         browser.setAllowsMultipleSelection(true);
         browser.setHasHorizontalScroller(true);
         browser.setAutohidesScroller(true);
