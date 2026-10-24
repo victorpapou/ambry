@@ -77,11 +77,11 @@ pub struct BoxView {
     toolbar: Option<NativeToolbar>,
 }
 
-/// The AppKit controls of the bottom bar. GPUI lays them out through `native()` elements.
+/// The AppKit controls of the bottom bar: canvas and list tabs plus an add button, in one
+/// strip. GPUI lays it out through a `native()` element.
 #[cfg(target_os = "macos")]
 struct NativeToolbar {
     switch: ambry_macos::TabSwitch,
-    add: ambry_macos::GlassButton,
 }
 
 #[cfg(target_os = "macos")]
@@ -130,29 +130,23 @@ impl BoxView {
             return None;
         };
         let (events, received) = async_channel::unbounded();
-        let mode_events = events.clone();
         // SAFETY: GPUI hands out its own live content view and we are on the main thread.
-        let toolbar = unsafe {
-            NativeToolbar {
-                switch: ambry_macos::TabSwitch::new(
-                    appkit.ns_view,
-                    &[("number", "Canvas"), ("list.bullet", "List")],
-                    SWITCH_ITEM_WIDTH,
-                    move |index| {
-                        mode_events.try_send(ToolbarEvent::Mode(index)).ok();
-                    },
-                )?,
-                add: ambry_macos::GlassButton::new(
-                    appkit.ns_view,
-                    "plus",
-                    "Add files or folders",
-                    layout::HEIGHT,
-                    move || {
-                        events.try_send(ToolbarEvent::Add).ok();
-                    },
-                )?,
-            }
-        };
+        let switch = unsafe {
+            ambry_macos::TabSwitch::new(
+                appkit.ns_view,
+                &[("number", "Canvas"), ("list.bullet", "List")],
+                &[("plus", "Add files or folders")],
+                SWITCH_ITEM_WIDTH,
+                move |event| {
+                    let event = match event {
+                        ambry_macos::TabEvent::Select(index) => ToolbarEvent::Mode(index),
+                        ambry_macos::TabEvent::Action(_) => ToolbarEvent::Add,
+                    };
+                    events.try_send(event).ok();
+                },
+            )
+        }?;
+        let toolbar = NativeToolbar { switch };
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
@@ -643,14 +637,7 @@ impl BoxView {
             .child(self.render_avatar());
         #[cfg(target_os = "macos")]
         let bar = bar.when_some(self.toolbar.as_ref(), |bar, toolbar| {
-            bar.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::GAP as f32))
-                    .child(native(toolbar.switch.native()))
-                    .child(native(toolbar.add.native())),
-            )
+            bar.child(native(toolbar.switch.native()))
         });
         #[cfg(not(target_os = "macos"))]
         let bar = bar.child(self.render_fallback_toolbar(cx));

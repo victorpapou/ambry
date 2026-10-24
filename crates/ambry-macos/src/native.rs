@@ -18,6 +18,8 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 struct TargetIvars {
     on_action: Box<dyn Fn(&AnyObject)>,
+    /// Asked before a tab gets selected; tabs that act as buttons answer `false`.
+    should_select: Option<Box<dyn Fn(&NSTabView, &NSTabViewItem) -> bool>>,
 }
 
 define_class!(
@@ -35,6 +37,14 @@ define_class!(
         fn did_select(&self, tab_view: &NSTabView, _item: Option<&NSTabViewItem>) {
             (self.ivars().on_action)(tab_view.as_ref());
         }
+
+        #[unsafe(method(tabView:shouldSelectTabViewItem:))]
+        fn should_select(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) -> bool {
+            match (&self.ivars().should_select, item) {
+                (Some(should_select), Some(item)) => should_select(tab_view, item),
+                _ => true,
+            }
+        }
     }
 
     impl Target {
@@ -46,9 +56,22 @@ define_class!(
 );
 
 impl Target {
+    fn with_tabs(
+        mtm: MainThreadMarker,
+        on_select: impl Fn(&AnyObject) + 'static,
+        should_select: impl Fn(&NSTabView, &NSTabViewItem) -> bool + 'static,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(TargetIvars {
+            on_action: Box::new(on_select),
+            should_select: Some(Box::new(should_select)),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
     fn new(mtm: MainThreadMarker, on_action: impl Fn(&AnyObject) + 'static) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars {
             on_action: Box::new(on_action),
+            should_select: None,
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -107,47 +130,73 @@ impl NativeView {
     }
 }
 
+/// What the user did in a [`TabSwitch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabEvent {
+    /// A tab was selected.
+    Select(usize),
+    /// An action segment was pressed.
+    Action(usize),
+}
+
 /// Icon tabs: a real NSTabView with only its tab strip showing.
 ///
 /// On macOS 26 only the segmented control NSTabView drives gets the light tab look and the
 /// glass lens that lifts while you press and drag. NSTabView draws text labels only, so its
-/// segments are given SF Symbols and a capsule shape after the fact.
+/// segments are given SF Symbols and a capsule shape after the fact. Action segments after
+/// the tabs never stay selected: they report a press and the selection stays where it was.
 pub struct TabSwitch {
     native: NativeView,
     tabs: Retained<NSTabView>,
 }
 
 impl TabSwitch {
-    /// Adds a switch with one icon per `(symbol, description)` to `ns_view`.
-    /// `on_change` gets the index the user picked.
+    /// Adds a strip with one icon tab per `tabs` entry followed by one icon button per
+    /// `actions` entry, each a `(symbol, description)`, to `ns_view`.
     ///
     /// # Safety
     /// `ns_view` must point to a live `NSView`, and this must run on the main thread.
     pub unsafe fn new(
         ns_view: NonNull<c_void>,
-        icons: &[(&str, &str)],
+        tabs: &[(&str, &str)],
+        actions: &[(&str, &str)],
         item_width: f64,
-        on_change: impl Fn(usize) + 'static,
+        on_event: impl Fn(TabEvent) + 'static,
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
-        let images = icon_images(icons)?;
-        let tabs = icon_tab_view(mtm, icons.len(), &images, item_width);
-        let target = Target::new(mtm, move |sender| {
-            let Some(tabs) = sender.downcast_ref::<NSTabView>() else {
-                return;
-            };
-            // NSTabView may rebuild its segments on selection; put the icons back.
-            decorate(tabs, &images, item_width);
-            if let Some(index) = selected_index(tabs) {
-                on_change(index);
-            }
-        });
-        tabs.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-        let view: Retained<NSView> = Retained::into_super(tabs.clone());
+        let icons: Vec<_> = tabs.iter().chain(actions).copied().collect();
+        let images = icon_images(&icons)?;
+        let view = icon_tab_view(mtm, icons.len(), &images, item_width);
+        let tab_count = tabs.len();
+        let on_event = Rc::new(on_event);
+        let on_action = on_event.clone();
+        let target = Target::with_tabs(
+            mtm,
+            move |sender| {
+                let Some(tabs) = sender.downcast_ref::<NSTabView>() else {
+                    return;
+                };
+                // NSTabView may rebuild its segments on selection; put the icons back.
+                decorate(tabs, &images, item_width);
+                if let Some(index) = selected_index(tabs) {
+                    on_event(TabEvent::Select(index));
+                }
+            },
+            move |tabs, item| {
+                let index = tabs.indexOfTabViewItem(item).max(0) as usize;
+                if index < tab_count {
+                    return true;
+                }
+                on_action(TabEvent::Action(index - tab_count));
+                false
+            },
+        );
+        view.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+        let hosted: Retained<NSView> = Retained::into_super(view.clone());
         Some(Self {
-            native: NativeView::host(parent, view, target),
-            tabs,
+            native: NativeView::host(parent, hosted, target),
+            tabs: view,
         })
     }
 
@@ -155,7 +204,7 @@ impl TabSwitch {
         &self.native
     }
 
-    /// Selects `index` without reporting a change.
+    /// Selects tab `index` without reporting a change.
     pub fn select(&self, index: usize) {
         if selected_index(&self.tabs) != Some(index) {
             self.tabs.selectTabViewItemAtIndex(index as isize);
@@ -179,6 +228,7 @@ pub(crate) fn icon_tab_view(
     let tabs = NSTabView::initWithFrame(NSTabView::alloc(mtm), NSRect::ZERO);
     tabs.setTabPosition(NSTabPosition::Top);
     tabs.setTabViewBorderType(NSTabViewBorderType::None);
+    tabs.setControlSize(control_size());
     for i in 0..count {
         let item = unsafe {
             NSTabViewItem::initWithIdentifier(
@@ -220,6 +270,7 @@ fn decorate(tabs: &NSTabView, images: &[Retained<NSImage>], item_width: f64) {
             control.setWidth_forSegment(item_width, segment);
         }
     }
+    control.setControlSize(control_size());
     if has_liquid_glass() {
         control.setBorderShape(NSControlBorderShape::Capsule);
     }
@@ -301,6 +352,15 @@ pub(crate) fn tab_segmented_control(
 
 fn inherits(class: &AnyClass, ancestor: &AnyClass) -> bool {
     std::iter::successors(Some(class), |class| class.superclass()).any(|class| class == ancestor)
+}
+
+/// Extra large is the 36 pt size toolbar controls use; it exists from macOS 26 on.
+fn control_size() -> NSControlSize {
+    if has_liquid_glass() {
+        NSControlSize::ExtraLarge
+    } else {
+        NSControlSize::Large
+    }
 }
 
 fn has_liquid_glass() -> bool {

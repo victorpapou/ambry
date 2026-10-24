@@ -13,7 +13,7 @@ mod native;
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
 #[cfg(target_os = "macos")]
-pub use native::{GlassButton, NativeView, TabSwitch};
+pub use native::{GlassButton, NativeView, TabEvent, TabSwitch};
 
 /// Toolbar geometry in points, shared by the native and the GPUI-drawn toolbar.
 pub mod layout {
