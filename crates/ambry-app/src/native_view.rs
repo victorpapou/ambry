@@ -1,21 +1,33 @@
 //! A GPUI element that hosts a native AppKit view, so the view takes part in GPUI layout.
 //!
-//! The element sizes itself to the control's own size, and every frame moves the view to
-//! wherever layout put the element.
+//! The element sizes itself to the control's own size, or fills its parent, and every frame
+//! moves the view to wherever layout put the element.
 
 use ambry_macos::NativeView;
 use gpui::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Style, Window, px, size,
+    Pixels, Style, Window, px, relative, size,
 };
 
 pub struct Native {
     view: NativeView,
+    fill: bool,
 }
 
 /// Lays out `view` like any other element.
 pub fn native(view: &NativeView) -> Native {
-    Native { view: view.clone() }
+    Native {
+        view: view.clone(),
+        fill: false,
+    }
+}
+
+impl Native {
+    /// Takes the parent's whole size instead of the view's own.
+    pub fn fill(mut self) -> Self {
+        self.fill = true;
+        self
+    }
 }
 
 impl IntoElement for Native {
@@ -45,10 +57,14 @@ impl Element for Native {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
-        let (width, height) = self.view.size();
         let mut style = Style::default();
-        style.size = size(px(width as f32).into(), px(height as f32).into());
-        style.flex_shrink = 0.;
+        if self.fill {
+            style.size = size(relative(1.).into(), relative(1.).into());
+        } else {
+            let (width, height) = self.view.size();
+            style.size = size(px(width as f32).into(), px(height as f32).into());
+            style.flex_shrink = 0.;
+        }
         (window.request_layout(style, [], cx), ())
     }
 

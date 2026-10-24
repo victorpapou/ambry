@@ -10,13 +10,14 @@ use objc2::{
     msg_send, sel,
 };
 use objc2_app_kit::{
-    NSBezelStyle, NSButton, NSControlBorderShape, NSControlSize, NSImage, NSSegmentSwitchTracking,
-    NSSegmentedControl, NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate,
-    NSTabViewItem, NSView,
+    NSBezelStyle, NSButton, NSControlBorderShape, NSControlSize, NSFont, NSGlassEffectView,
+    NSImage, NSImageScaling, NSImageView, NSSegmentSwitchTracking, NSSegmentedControl,
+    NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem,
+    NSTextAlignment, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-struct TargetIvars {
+pub(crate) struct TargetIvars {
     on_action: Box<dyn Fn(&AnyObject)>,
     /// Asked before a tab gets selected; tabs that act as buttons answer `false`.
     should_select: Option<Box<dyn Fn(&NSTabView, &NSTabViewItem) -> bool>>,
@@ -28,7 +29,7 @@ define_class!(
     #[thread_kind = MainThreadOnly]
     #[name = "AmbryActionTarget"]
     #[ivars = TargetIvars]
-    struct Target;
+    pub(crate) struct Target;
 
     unsafe impl NSObjectProtocol for Target {}
 
@@ -68,7 +69,10 @@ impl Target {
         unsafe { msg_send![super(this), init] }
     }
 
-    fn new(mtm: MainThreadMarker, on_action: impl Fn(&AnyObject) + 'static) -> Retained<Self> {
+    pub(crate) fn new(
+        mtm: MainThreadMarker,
+        on_action: impl Fn(&AnyObject) + 'static,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TargetIvars {
             on_action: Box::new(on_action),
             should_select: None,
@@ -80,7 +84,9 @@ impl Target {
 struct Hosted {
     view: Retained<NSView>,
     frame: Cell<Option<NSRect>>,
-    _target: Retained<Target>,
+    /// Hidden by its owner, whatever GPUI lays out.
+    hidden: Cell<bool>,
+    _target: Option<Retained<Target>>,
 }
 
 impl Drop for Hosted {
@@ -95,14 +101,27 @@ impl Drop for Hosted {
 pub struct NativeView(Rc<Hosted>);
 
 impl NativeView {
-    fn host(parent: &NSView, view: Retained<NSView>, target: Retained<Target>) -> Self {
+    pub(crate) fn host(
+        parent: &NSView,
+        view: Retained<NSView>,
+        target: impl Into<Option<Retained<Target>>>,
+    ) -> Self {
         view.setHidden(true);
         parent.addSubview(&view);
         Self(Rc::new(Hosted {
             view,
             frame: Cell::new(None),
-            _target: target,
+            hidden: Cell::new(false),
+            _target: target.into(),
         }))
+    }
+
+    /// Hides or shows the view whatever GPUI lays out, for views GPUI stops rendering.
+    pub fn set_hidden(&self, hidden: bool) {
+        self.0.hidden.set(hidden);
+        self.0
+            .view
+            .setHidden(hidden || self.0.frame.get().is_none());
     }
 
     /// The size AppKit wants for the control, in points.
@@ -126,7 +145,7 @@ impl NativeView {
         if self.0.frame.replace(Some(frame)) != Some(frame) {
             view.setFrame(frame);
         }
-        view.setHidden(false);
+        view.setHidden(self.0.hidden.get());
     }
 }
 
@@ -322,6 +341,84 @@ impl GlassButton {
 
     pub fn native(&self) -> &NativeView {
         &self.native
+    }
+}
+
+/// The account picture (or initial) on a round Liquid Glass disc.
+pub struct GlassAvatar {
+    native: NativeView,
+}
+
+impl GlassAvatar {
+    /// # Safety
+    /// `ns_view` must point to a live `NSView`, and this must run on the main thread.
+    pub unsafe fn new(
+        ns_view: NonNull<c_void>,
+        picture: Option<&std::path::Path>,
+        initial: &str,
+        size: f64,
+    ) -> Option<Self> {
+        let mtm = MainThreadMarker::new()?;
+        let parent: &NSView = unsafe { ns_view.cast().as_ref() };
+        let bounds = NSRect::new(NSPoint::new(0., 0.), NSSize::new(size, size));
+        let image = picture.and_then(|path| {
+            NSImage::initWithContentsOfFile(
+                NSImage::alloc(),
+                &NSString::from_str(&path.to_string_lossy()),
+            )
+        });
+        let content: Retained<NSView> = match image {
+            Some(image) => {
+                let view = NSImageView::imageViewWithImage(&image, mtm);
+                view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                view.setFrame(bounds);
+                view.setWantsLayer(true);
+                if let Some(layer) = view.layer() {
+                    layer.setCornerRadius(size / 2.);
+                    layer.setMasksToBounds(true);
+                }
+                Retained::into_super(Retained::into_super(view))
+            }
+            None => {
+                let label = NSTextField::labelWithString(&NSString::from_str(initial), mtm);
+                label.setFont(Some(&NSFont::systemFontOfSize(15.)));
+                label.setAlignment(NSTextAlignment::Center);
+                let height = label.fittingSize().height;
+                label.setFrame(NSRect::new(
+                    NSPoint::new(0., (size - height) / 2.),
+                    NSSize::new(size, height),
+                ));
+                let holder = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+                holder.addSubview(&label);
+                holder
+            }
+        };
+        let view: Retained<NSView> = if has_liquid_glass() {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
+            glass.setCornerRadius(size / 2.);
+            glass.setContentView(Some(&content));
+            Retained::into_super(glass)
+        } else {
+            content
+        };
+        Some(Self {
+            native: NativeView::host(parent, view, None),
+        })
+    }
+
+    pub fn native(&self) -> &NativeView {
+        &self.native
+    }
+}
+
+/// Sets the grey line under the window title, like Finder's item count.
+///
+/// # Safety
+/// `ns_view` must point to a live `NSView`, and this must run on the main thread.
+pub unsafe fn set_window_subtitle(ns_view: NonNull<c_void>, subtitle: &str) {
+    let view: &NSView = unsafe { ns_view.cast().as_ref() };
+    if let Some(window) = view.window() {
+        window.setSubtitle(&NSString::from_str(subtitle));
     }
 }
 

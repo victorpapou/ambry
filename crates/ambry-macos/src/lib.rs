@@ -4,16 +4,22 @@
 //! its layout through [`NativeView::set_frame`], called from a GPUI element on every frame.
 
 #[cfg(target_os = "macos")]
+pub mod finder;
+#[cfg(target_os = "macos")]
 mod lab;
 #[cfg(target_os = "macos")]
 mod lab_toolbar;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(target_os = "macos")]
+mod table;
 
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
 #[cfg(target_os = "macos")]
-pub use native::{GlassButton, NativeView, TabEvent, TabSwitch};
+pub use native::{GlassAvatar, GlassButton, NativeView, TabEvent, TabSwitch, set_window_subtitle};
+#[cfg(target_os = "macos")]
+pub use table::{FileRow, FileTable};
 
 /// Toolbar geometry in points, shared by the native and the GPUI-drawn toolbar.
 pub mod layout {
