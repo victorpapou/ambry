@@ -632,6 +632,12 @@ impl WindowToolbar {
         stack.setSpacing(8.);
         stack.setCustomSpacing_afterView(0., &name);
         stack.setCustomSpacing_afterView(0., &status);
+        // Same size, so the name and the status share one baseline.
+        let baseline = status
+            .firstBaselineAnchor()
+            .constraintEqualToAnchor(&name.firstBaselineAnchor());
+        baseline.setPriority(999.);
+        baseline.setActive(true);
         // Shortcuts keeps its icon 16 points from the traffic lights.
         stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
             top: 0.,

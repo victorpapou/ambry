@@ -124,7 +124,7 @@ pub(crate) fn ask_name(
         give_volume(&layer, &label.color);
     }
     // Under the pointer the icon leans toward it in 3D and catches the light.
-    if let Some(tilt) = Tilt::attach(mtm, &tile) {
+    if let Some(tilt) = Tilt::attach(mtm, &tile, &view) {
         parts.push(Retained::into_super(tilt));
     }
     view.addSubview(&tile);

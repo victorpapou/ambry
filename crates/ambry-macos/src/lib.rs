@@ -35,6 +35,8 @@ mod tilt;
 mod toolbar;
 #[cfg(target_os = "macos")]
 mod zoom;
+#[cfg(target_os = "macos")]
+mod zoom_label;
 
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
@@ -53,6 +55,8 @@ pub use table::{FileRow, FileTable};
 pub use toolbar::{BoxLabel, ToolbarEvent, WindowToolbar};
 #[cfg(target_os = "macos")]
 pub use zoom::PinchZoom;
+#[cfg(target_os = "macos")]
+pub use zoom_label::ZoomLabel;
 
 /// Titlebar geometry in points, shared by the native and the GPUI-drawn controls.
 pub mod layout {
@@ -68,7 +72,7 @@ pub mod layout {
     pub const TOOLBAR_BLUR: f64 = 108.;
     /// The add button, and its distance from the window's bottom and right edges.
     pub const ADD: f64 = 36.;
-    pub const ADD_MARGIN: f64 = 20.;
+    pub const ADD_MARGIN: f64 = 14.;
     /// Where the title starts, right of the traffic lights, and the height it is centred in.
     pub const TITLE_LEFT: f64 = 80.;
     pub const TITLE_HEIGHT: f64 = 38.;

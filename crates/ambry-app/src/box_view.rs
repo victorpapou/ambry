@@ -57,8 +57,6 @@ const ACCENT: u32 = 0x2f7cf6;
 const MIN_ZOOM: f32 = 0.3;
 const MAX_ZOOM: f32 = 4.;
 const ZOOM_STEP: f32 = 1.25;
-/// The zoom label's distance from the window's left and bottom edges.
-const ZOOM_LABEL_MARGIN: f32 = 20.;
 
 /// The window's colors in one appearance.
 struct Palette {
@@ -116,16 +114,9 @@ const DARK: Palette = Palette {
 
 thread_local! {
     static DARK_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The canvas's zoom while it renders, for the pieces that draw an item.
-    static ZOOM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.) };
 }
 
 /// The palette for the window's current appearance, set at the start of every render.
-/// `value` points on the canvas at its zoom.
-fn z(value: f32) -> Pixels {
-    px(value * ZOOM.get())
-}
-
 fn palette() -> &'static Palette {
     if DARK_MODE.get() { &DARK } else { &LIGHT }
 }
@@ -197,6 +188,8 @@ struct NativeControls {
     add: ambry_macos::GlassButton,
     /// Pinching over the window zooms the canvas.
     _pinch: ambry_macos::PinchZoom,
+    /// The zoom as a percentage, bottom left.
+    zoom_label: ambry_macos::ZoomLabel,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
     /// Where Quick Look sends the item it moved to.
@@ -219,6 +212,8 @@ enum ControlEvent {
     Preview(usize),
     /// Fingers pinched by this fraction, at this position from the window's top-left.
     Zoom(f64, f64, f64),
+    /// The zoom label was clicked: back to actual size.
+    ZoomReset,
     Settings(ambry_macos::settings::SettingsEvent),
 }
 
@@ -318,6 +313,10 @@ impl BoxView {
             let pinch = ambry_macos::PinchZoom::new(ns_view, move |step, x, y| {
                 pinched.try_send(ControlEvent::Zoom(step, x, y)).ok();
             })?;
+            let reset = events.clone();
+            let zoom_label = ambry_macos::ZoomLabel::new(ns_view, move || {
+                reset.try_send(ControlEvent::ZoomReset).ok();
+            })?;
             let added = previewed.clone();
             let add = ambry_macos::GlassButton::new(
                 ns_view,
@@ -338,6 +337,7 @@ impl BoxView {
                 scroll,
                 add,
                 _pinch: pinch,
+                zoom_label,
                 shown_scroll: None,
                 events: previewed,
             }
@@ -377,6 +377,10 @@ impl BoxView {
                         this.open_box(store, cx);
                     }
                     ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
+                    ControlEvent::ZoomReset => {
+                        let centre = this.viewport_centre();
+                        this.zoom_at(1. / this.zoom, centre, cx)
+                    }
                     ControlEvent::Zoom(step, x, y) => {
                         this.zoom_at(1. + step as f32, point(px(x as f32), px(y as f32)), cx)
                     }
@@ -414,14 +418,14 @@ impl BoxView {
         );
         // The scroll view sits under the toolbar, so its document is the bar shorter than
         // the canvas.
-        let zoom = self.zoom;
         let scroll = [
-            f64::from(((area.2 - area.0) * zoom).max(width)),
-            f64::from(((area.3 - area.1) * zoom).max(height) - layout::BAR as f32),
-            f64::from(x - area.0 * zoom),
-            f64::from(y - area.1 * zoom),
+            f64::from((area.2 - area.0).max(width)),
+            f64::from((area.3 - area.1).max(height) - layout::BAR as f32),
+            f64::from(x - area.0),
+            f64::from(y - area.1),
         ];
         let in_canvas = self.mode == Mode::Canvas;
+        let (zoom, dark) = (self.zoom, DARK_MODE.get());
         let Some(controls) = &mut self.controls else {
             return;
         };
@@ -460,6 +464,10 @@ impl BoxView {
             controls.shown_scroll = Some(scroll);
         }
         controls.scroll.native().set_hidden(!in_canvas);
+        controls
+            .zoom_label
+            .set_percent((zoom * 100.).round() as i32, dark);
+        controls.zoom_label.native().set_hidden(!in_canvas);
         // Only the canvas passes under the toolbar; the list starts below it.
         controls.toolbar_blur.set_hidden(!in_canvas);
     }
@@ -592,14 +600,16 @@ impl BoxView {
         let mut area: (f32, f32, f32, f32) = (
             0.,
             0.,
-            f32::from(self.viewport.width) / self.zoom,
-            f32::from(self.viewport.height) / self.zoom,
+            f32::from(self.viewport.width),
+            f32::from(self.viewport.height),
         );
+        // Zooming spreads the items apart; the items themselves keep their size.
         for item in &self.doc.items {
-            area.0 = area.0.min(item.x - CANVAS_MARGIN);
-            area.1 = area.1.min(item.y - CANVAS_MARGIN);
-            area.2 = area.2.max(item.x + ITEM_WIDTH + CANVAS_MARGIN);
-            area.3 = area.3.max(item.y + ITEM_HEIGHT + CANVAS_MARGIN);
+            let (x, y) = (item.x * self.zoom, item.y * self.zoom);
+            area.0 = area.0.min(x - CANVAS_MARGIN);
+            area.1 = area.1.min(y - CANVAS_MARGIN);
+            area.2 = area.2.max(x + ITEM_WIDTH + CANVAS_MARGIN);
+            area.3 = area.3.max(y + ITEM_HEIGHT + CANVAS_MARGIN);
         }
         area
     }
@@ -607,9 +617,7 @@ impl BoxView {
     /// Keeps the view inside [`Self::scroll_area`].
     fn clamp_pan(&mut self) {
         let area = self.scroll_area();
-        let zoom = self.zoom;
         let clamp = |pan: Pixels, min: f32, max: f32, visible: Pixels| {
-            let (min, max) = (min * zoom, max * zoom);
             let at = -f32::from(pan);
             let at = at.min(max - f32::from(visible)).max(min);
             px(-at)
@@ -665,10 +673,7 @@ impl BoxView {
     #[cfg(target_os = "macos")]
     fn on_scroller(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
         let area = self.scroll_area();
-        self.pan = point(
-            px(-(x as f32 + area.0 * self.zoom)),
-            px(-(y as f32 + area.1 * self.zoom)),
-        );
+        self.pan = point(px(-(x as f32 + area.0)), px(-(y as f32 + area.1)));
         self.clamp_pan();
         cx.notify();
     }
@@ -698,7 +703,12 @@ impl BoxView {
             _ => point(self.viewport.width / 2., self.viewport.height / 2.),
         };
         let (x, y) = self.to_canvas(position);
-        (x - ITEM_WIDTH / 2. - row_width / 2., y - CARD_HEIGHT / 2.)
+        // The cards keep their size on screen, so their offsets from the cursor shrink or
+        // grow with the zoom in canvas units.
+        (
+            x - (ITEM_WIDTH / 2. + row_width / 2.) / self.zoom,
+            y - CARD_HEIGHT / 2. / self.zoom,
+        )
     }
 
     fn add_paths(
@@ -903,7 +913,6 @@ impl BoxView {
 
     fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pan = self.pan;
-        let zoom = self.zoom;
         let mut items: Vec<gpui::AnyElement> = self
             .doc
             .items
@@ -943,7 +952,7 @@ impl BoxView {
             .child(
                 canvas(
                     |_, _, _| (),
-                    move |bounds, _, window, _| paint_dots(bounds, pan, zoom, window),
+                    move |bounds, _, window, _| paint_dots(bounds, pan, window),
                 )
                 .absolute()
                 .size_full(),
@@ -956,32 +965,6 @@ impl BoxView {
             .children(edge_fades())
     }
 
-    /// The zoom as a percentage, bottom left; a click puts it back to actual size.
-    fn render_zoom_label(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let percent = (self.zoom * 100.).round() as i32;
-        div()
-            .id("zoom")
-            .absolute()
-            .left(px(ZOOM_LABEL_MARGIN))
-            .bottom(px(ZOOM_LABEL_MARGIN + 4.))
-            .h(px(28.))
-            .px(px(12.))
-            .flex()
-            .items_center()
-            .rounded_full()
-            .bg(rgb(palette().canvas))
-            .border_1()
-            .border_color(rgb(palette().hairline))
-            .text_size(px(LABEL_SIZE))
-            .text_color(rgb(palette().quiet))
-            .cursor(CursorStyle::PointingHand)
-            .on_click(cx.listener(|this, _, _, cx| {
-                let centre = this.viewport_centre();
-                this.zoom_at(1. / this.zoom, centre, cx);
-            }))
-            .child(format!("{percent}%"))
-    }
-
     fn render_canvas_item(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
         let id = item.id;
         let selected = self.selected == Some(id);
@@ -990,7 +973,7 @@ impl BoxView {
             .as_ref()
             .is_some_and(|drag| drag.id == id && drag.moved);
         let left = self.pan.x + px(item.x * self.zoom);
-        let top = self.pan.y + px(item.y * self.zoom) - if lifted { z(3.) } else { px(0.) };
+        let top = self.pan.y + px(item.y * self.zoom) - if lifted { px(3.) } else { px(0.) };
         let delay = self.appear_delay.get(&id).copied().unwrap_or(0.);
 
         div()
@@ -998,11 +981,11 @@ impl BoxView {
             .absolute()
             .left(left)
             .top(top)
-            .w(z(ITEM_WIDTH))
+            .w(px(ITEM_WIDTH))
             .flex()
             .flex_col()
             .items_center()
-            .gap(z(8.))
+            .gap(px(8.))
             .cursor(if lifted {
                 CursorStyle::ClosedHand
             } else {
@@ -1020,7 +1003,7 @@ impl BoxView {
                 ("appear", id as usize),
                 Animation::new(Duration::from_secs_f32(0.45 + delay))
                     .with_easing(delayed(delay / (0.45 + delay), ease_out_quint())),
-                move |this, t| this.top(top - z(10. * (1. - t))).opacity(t),
+                move |this, t| this.top(top - px(10. * (1. - t))).opacity(t),
             )
     }
 
@@ -1036,17 +1019,17 @@ impl BoxView {
                     .absolute()
                     .left(self.pan.x + px((x + index as f32 * DROP_STEP_X) * self.zoom))
                     .top(top)
-                    .w(z(ITEM_WIDTH))
+                    .w(px(ITEM_WIDTH))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(z(8.))
+                    .gap(px(8.))
                     .child(ghost_face(item, self.icon(item)))
                     .child(item_label(item.name(), false, true))
                     .with_animation(
                         ("ghost", index),
                         Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
-                        move |this, t| this.top(top + z(8. * (1. - t))).opacity(0.75 * t),
+                        move |this, t| this.top(top + px(8. * (1. - t))).opacity(0.75 * t),
                     )
                     .into_any_element()
             })
@@ -1427,7 +1410,6 @@ impl BoxView {
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport = window.viewport_size();
-        ZOOM.set(self.zoom);
         if self.drag.is_none() {
             self.clamp_pan();
         }
@@ -1469,9 +1451,7 @@ impl Render for BoxView {
                 this.add_paths(paths.paths().to_vec(), Some(window.mouse_position()), cx);
             }))
             .map(|this| match self.mode {
-                Mode::Canvas => this
-                    .child(self.render_canvas(cx))
-                    .child(self.render_zoom_label(cx)),
+                Mode::Canvas => this.child(self.render_canvas(cx)),
                 Mode::List => this.child(self.render_list(cx)),
             });
         #[cfg(not(target_os = "macos"))]
@@ -1489,6 +1469,16 @@ impl Render for BoxView {
                         .bottom_0()
                         .child(native(controls.scroll.native()).fill()),
                 )
+                // The zoom, bottom left, level with the add button.
+                .when(self.mode == Mode::Canvas, |root| {
+                    root.child(
+                        div()
+                            .absolute()
+                            .bottom(px((layout::ADD_MARGIN + (layout::ADD - 22.) / 2.) as f32))
+                            .left(px(layout::ADD_MARGIN as f32))
+                            .child(native(controls.zoom_label.native())),
+                    )
+                })
                 // The window's main action, bottom right.
                 .child(
                     div()
@@ -1537,26 +1527,23 @@ fn edge_fades() -> [impl IntoElement; 4] {
     ]
 }
 
-fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32, window: &mut Window) {
+fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
     let color: Rgba = rgb(palette().dot);
-    let spacing = DOT_SPACING * zoom;
-    // The dots grow with the zoom, but not as fast as the grid does.
-    let radius = DOT_RADIUS * zoom.sqrt();
-    let start_x = f32::from(pan.x).rem_euclid(spacing);
-    let start_y = f32::from(pan.y).rem_euclid(spacing);
+    let start_x = f32::from(pan.x).rem_euclid(DOT_SPACING);
+    let start_y = f32::from(pan.y).rem_euclid(DOT_SPACING);
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
-    let dot = size(px(radius * 2.), px(radius * 2.));
+    let dot = size(px(DOT_RADIUS * 2.), px(DOT_RADIUS * 2.));
 
     let mut y = start_y;
     while y < height {
         let mut x = start_x;
         while x < width {
-            let origin = bounds.origin + point(px(x - radius), px(y - radius));
-            window.paint_quad(fill(Bounds::new(origin, dot), color).corner_radii(px(radius)));
-            x += spacing;
+            let origin = bounds.origin + point(px(x - DOT_RADIUS), px(y - DOT_RADIUS));
+            window.paint_quad(fill(Bounds::new(origin, dot), color).corner_radii(px(DOT_RADIUS)));
+            x += DOT_SPACING;
         }
-        y += spacing;
+        y += DOT_SPACING;
     }
 }
 
@@ -1603,14 +1590,14 @@ fn finder_face(item: &Item, icon: Option<PathBuf>, selected: bool, lifted: bool)
         return card_face(item, selected, lifted);
     };
     div()
-        .p(z(4.))
-        .rounded(z(6.))
+        .p(px(4.))
+        .rounded(px(6.))
         .when(selected, |this| this.bg(palette().selection))
         .when(lifted, |this| this.opacity(0.8))
         .when(!item.exists(), |this| this.opacity(0.4))
         .child(
             img(picture)
-                .size(z(ICON_SIZE))
+                .size(px(ICON_SIZE))
                 .object_fit(ObjectFit::Contain),
         )
 }
@@ -1673,7 +1660,6 @@ fn list_columns(
 }
 
 fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
-    let zoom = ZOOM.get();
     let border: Hsla = if selected {
         rgb(ACCENT).into()
     } else {
@@ -1681,8 +1667,8 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
     };
     let face = match item.kind {
         ItemKind::Folder => div()
-            .size(z(CARD_HEIGHT))
-            .rounded(z(10.))
+            .size(px(CARD_HEIGHT))
+            .rounded(px(10.))
             .when(selected, |this| this.bg(rgb(palette().pressed)))
             .flex()
             .items_center()
@@ -1690,14 +1676,14 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
             .child(
                 svg()
                     .path("icons/folder.svg")
-                    .size(z(64.))
+                    .size(px(64.))
                     .text_color(rgb(0x5aa0f2)),
             ),
         ItemKind::File => div()
             .relative()
-            .w(z(CARD_WIDTH))
-            .h(z(CARD_HEIGHT))
-            .rounded(z(6.))
+            .w(px(CARD_WIDTH))
+            .h(px(CARD_HEIGHT))
+            .rounded(px(6.))
             .overflow_hidden()
             .bg(linear_gradient(
                 180.,
@@ -1708,12 +1694,9 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
             .when(selected, |this| this.border_2())
             .border_color(border)
             .shadow(if lifted {
-                vec![
-                    shadow(0., 10. * zoom, 24. * zoom, 0.12),
-                    shadow(0., 2. * zoom, 6. * zoom, 0.1),
-                ]
+                vec![shadow(0., 10., 24., 0.12), shadow(0., 2., 6., 0.1)]
             } else {
-                vec![shadow(0., zoom, 3. * zoom, 0.06)]
+                vec![shadow(0., 1., 3., 0.06)]
             })
             .when(item.is_image(), |this| {
                 this.child(
@@ -1727,9 +1710,9 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
                 this.child(
                     div()
                         .absolute()
-                        .right(z(7.))
-                        .bottom(z(5.))
-                        .text_size(z(LABEL_SIZE))
+                        .right(px(7.))
+                        .bottom(px(5.))
+                        .text_size(px(LABEL_SIZE))
                         .text_color(rgb(palette().faint))
                         .child(item.badge()),
                 )
@@ -1742,9 +1725,9 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
 fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
     if let Some(icon) = icon {
         return div()
-            .p(z(4.))
+            .p(px(4.))
             .opacity(0.6)
-            .child(img(icon).size(z(ICON_SIZE)).object_fit(ObjectFit::Contain))
+            .child(img(icon).size(px(ICON_SIZE)).object_fit(ObjectFit::Contain))
             .into_any_element();
     }
     let (width, radius) = match item.kind {
@@ -1752,9 +1735,9 @@ fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
         ItemKind::File => (CARD_WIDTH, 6.),
     };
     div()
-        .w(z(width))
-        .h(z(CARD_HEIGHT))
-        .rounded(z(radius))
+        .w(px(width))
+        .h(px(CARD_HEIGHT))
+        .rounded(px(radius))
         .border_1()
         .border_dashed()
         .border_color(rgb(ACCENT))
@@ -1762,8 +1745,8 @@ fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
         .flex()
         .items_end()
         .justify_end()
-        .p(z(6.))
-        .text_size(z(LABEL_SIZE))
+        .p(px(6.))
+        .text_size(px(LABEL_SIZE))
         .text_color(rgb(ACCENT))
         .child(item.badge())
         .into_any_element()
@@ -1771,12 +1754,12 @@ fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
 
 fn item_label(name: String, selected: bool, exists: bool) -> impl IntoElement {
     div()
-        .max_w(z(ITEM_WIDTH))
-        .px(z(6.))
-        .rounded(z(4.))
+        .max_w(px(ITEM_WIDTH))
+        .px(px(6.))
+        .rounded(px(4.))
         .when(selected, |this| this.bg(rgb(ACCENT)))
         .when(!exists, |this| this.opacity(0.4))
-        .text_size(z(LABEL_SIZE))
+        .text_size(px(LABEL_SIZE))
         .text_color(if selected {
             gpui::white()
         } else {
