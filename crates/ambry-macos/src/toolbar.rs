@@ -2,22 +2,17 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol};
-use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
-};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor, NSControlBorderShape,
-    NSControlSize, NSImage, NSSegmentDistribution, NSSegmentSwitchTracking, NSSegmentedControl,
-    NSView,
+    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSControlSize, NSImage, NSTabView,
+    NSTabViewDelegate, NSTabViewItem, NSView,
 };
-use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 use crate::ToolbarEvent;
 use crate::layout::*;
-
-const FRAME_ICON: &[u8] = include_bytes!("../assets/frame@3x.png");
-const SEGMENT_WIDTH: f64 = 32.;
+use crate::tabs::icon_tabs;
 
 struct TargetIvars {
     on_event: Box<dyn Fn(ToolbarEvent)>,
@@ -33,13 +28,17 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Target {}
 
-    impl Target {
-        #[unsafe(method(segmentChanged:))]
-        fn segment_changed(&self, sender: &NSSegmentedControl) {
-            let index = sender.selectedSegment().max(0) as usize;
-            (self.ivars().on_event)(ToolbarEvent::Mode(index));
+    unsafe impl NSTabViewDelegate for Target {
+        #[unsafe(method(tabView:didSelectTabViewItem:))]
+        fn did_select(&self, tab_view: &NSTabView, item: Option<&NSTabViewItem>) {
+            if let Some(item) = item {
+                let index = tab_view.indexOfTabViewItem(item).max(0) as usize;
+                (self.ivars().on_event)(ToolbarEvent::Mode(index));
+            }
         }
+    }
 
+    impl Target {
         #[unsafe(method(addClicked:))]
         fn add_clicked(&self, _sender: &AnyObject) {
             (self.ivars().on_event)(ToolbarEvent::Add);
@@ -57,7 +56,7 @@ impl Target {
 /// The native toolbar. Dropping it removes the views from the window.
 pub struct Toolbar {
     root: Retained<NSView>,
-    segments: Retained<NSSegmentedControl>,
+    tabs: Retained<NSTabView>,
     _target: Retained<Target>,
 }
 
@@ -74,38 +73,14 @@ impl Toolbar {
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
         let target = Target::new(Box::new(on_event), mtm);
 
-        // Canvas / list switch: a plain NSSegmentedControl, drawn by AppKit as is.
-        let images = NSArray::from_retained_slice(&[
-            template_png(FRAME_ICON, 18.)?,
-            symbol("list.bullet", "List")?,
-        ]);
-        let segments = unsafe {
-            NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
-                &images,
-                NSSegmentSwitchTracking::SelectOne,
-                Some(&target),
-                Some(sel!(segmentChanged:)),
-                mtm,
-            )
-        };
-        // Tab-style switch like Xcode's inspector. On macOS 26 AppKit draws the capsule
-        // selection and the glass lens itself, so only older systems get a custom colour.
-        segments.setControlSize(NSControlSize::Large);
-        segments.setSegmentDistribution(NSSegmentDistribution::FillEqually);
-        for segment in 0..2 {
-            segments.setWidth_forSegment(SEGMENT_WIDTH, segment);
-        }
-        if has_liquid_glass() {
-            segments.setBorderShape(NSControlBorderShape::Capsule);
-        } else {
-            segments.setSelectedSegmentBezelColor(Some(
-                &NSColor::unemphasizedSelectedContentBackgroundColor(),
-            ));
-        }
-        segments.setSelectedSegment(0);
-        segments.setToolTip_forSegment(Some(&NSString::from_str("Canvas")), 0);
-        segments.setToolTip_forSegment(Some(&NSString::from_str("List")), 1);
-        let segments_size = segments.fittingSize();
+        // Canvas / list switch: icon tabs on NSTabView, like Xcode's inspector tabs.
+        let tabs = icon_tabs(
+            mtm,
+            &[("number", "Canvas"), ("list.bullet", "List")],
+            HEIGHT,
+        )?;
+        tabs.setDelegate(Some(ProtocolObject::from_ref(&*target)));
+        let tabs_width = tabs.frame().size.width;
 
         // Add button: a glass button on macOS 26, a round push button before that.
         let plus = symbol("plus", "Add files")?;
@@ -125,28 +100,28 @@ impl Toolbar {
         });
         add.setToolTip(Some(&NSString::from_str("Add files or folders")));
 
-        let width = segments_size.width + GAP + HEIGHT;
+        let width = tabs_width + GAP + HEIGHT;
         let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., width, HEIGHT));
         pin_bottom_left(parent, &root, INSET + AVATAR + GAP_AFTER_AVATAR, INSET);
-        segments.setFrame(rect(
-            0.,
-            ((HEIGHT - segments_size.height) / 2.).max(0.),
-            segments_size.width,
-            segments_size.height.min(HEIGHT),
-        ));
-        add.setFrame(rect(segments_size.width + GAP, 0., HEIGHT, HEIGHT));
-        root.addSubview(&segments);
+        add.setFrame(rect(tabs_width + GAP, 0., HEIGHT, HEIGHT));
+        root.addSubview(&tabs);
         root.addSubview(&add);
         Some(Self {
             root,
-            segments,
+            tabs,
             _target: target,
         })
     }
 
-    /// Selects the canvas (0) or list (1) segment without sending an event.
+    /// Selects the canvas (0) or list (1) tab.
     pub fn set_mode(&self, index: usize) {
-        self.segments.setSelectedSegment(index as isize);
+        let current = self
+            .tabs
+            .selectedTabViewItem()
+            .map(|item| self.tabs.indexOfTabViewItem(&item));
+        if current != Some(index as isize) {
+            self.tabs.selectTabViewItemAtIndex(index as isize);
+        }
     }
 }
 
@@ -188,12 +163,4 @@ fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
         &NSString::from_str(name),
         Some(&NSString::from_str(description)),
     )
-}
-
-fn template_png(bytes: &[u8], points: f64) -> Option<Retained<NSImage>> {
-    let data = NSData::with_bytes(bytes);
-    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
-    image.setSize(NSSize::new(points, points));
-    image.setTemplate(true);
-    Some(image)
 }

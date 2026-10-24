@@ -6,12 +6,13 @@ use objc2::runtime::AnyClass;
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSControlBorderShape, NSControlSize, NSGlassEffectView, NSImage,
-    NSSegmentStyle, NSSegmentSwitchTracking, NSSegmentedControl, NSTabView, NSTabViewItem,
-    NSTabViewType, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSSegmentStyle, NSSegmentSwitchTracking, NSSegmentedControl, NSTabPosition, NSTabView,
+    NSTabViewBorderType, NSTabViewItem, NSTabViewType, NSTextField, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSSize, NSString};
 
-const ROW: f64 = 64.;
+const ROW: f64 = 56.;
 const CONTROL_X: f64 = 240.;
 
 pub fn open_switch_lab() {
@@ -62,6 +63,13 @@ pub fn open_switch_lab() {
         ),
         ("J tab view, images", tabs(mtm, true)),
         ("K tab view, labels", tabs(mtm, false)),
+        ("L icon tabs, no border", {
+            let view =
+                crate::tabs::icon_tabs(mtm, &[("number", "Canvas"), ("list.bullet", "List")], 36.)
+                    .unwrap();
+            Retained::into_super(view)
+        }),
+        ("M labels, no border", tabs_without_border(mtm)),
     ];
 
     let height = ROW * rows.len() as f64 + 20.;
@@ -151,6 +159,24 @@ fn tabs(mtm: MainThreadMarker, images: bool) -> Retained<NSView> {
         }
         view.addTabViewItem(&item);
     }
+    Retained::into_super(view)
+}
+
+fn tabs_without_border(mtm: MainThreadMarker) -> Retained<NSView> {
+    let view = NSTabView::initWithFrame(NSTabView::alloc(mtm), rect(0., 0., 240., 36.));
+    view.setTabPosition(NSTabPosition::Top);
+    view.setTabViewBorderType(NSTabViewBorderType::None);
+    for name in ["Canvas", "List"] {
+        let item = unsafe {
+            NSTabViewItem::initWithIdentifier(
+                NSTabViewItem::alloc(),
+                Some(&NSString::from_str(name)),
+            )
+        };
+        item.setLabel(&NSString::from_str(name));
+        view.addTabViewItem(&item);
+    }
+    view.setFrameSize(NSSize::new(view.minimumSize().width, 36.));
     Retained::into_super(view)
 }
 
