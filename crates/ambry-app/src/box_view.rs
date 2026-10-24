@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ambry_core::{BoxDoc, DROP_STEP_X, Item, ItemKind, Store};
+#[cfg(target_os = "macos")]
+use ambry_core::BoxIcon;
+use ambry_core::{BoxDoc, BoxEntry, DROP_STEP_X, Item, ItemKind, Store};
 use ambry_macos::layout;
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, BoxShadow, Context, CursorStyle, DragMoveEvent,
@@ -18,9 +20,6 @@ use gpui::{
 #[cfg(target_os = "macos")]
 use crate::native_view::native;
 
-/// Width of each canvas/list segment in the native switch, in points.
-#[cfg(target_os = "macos")]
-const SWITCH_ITEM_WIDTH: f64 = 34.;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
@@ -116,6 +115,8 @@ struct DropPreview {
 pub struct BoxView {
     doc: BoxDoc,
     store: Store,
+    /// Every saved box, for the box switcher.
+    boxes: Vec<BoxEntry>,
     mode: Mode,
     /// Offset of the canvas origin from the top-left of the canvas area.
     pan: Point<Pixels>,
@@ -140,19 +141,20 @@ struct NativeControls {
     table: ambry_macos::FileTable,
     /// The paths the table shows, to reload it only when the box changes.
     table_paths: Vec<PathBuf>,
-    avatar: ambry_macos::GlassAvatar,
-    switch: ambry_macos::GlassSegments,
-    add: ambry_macos::GlassButton,
-    /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
-    tune: String,
-    /// The look last applied, to touch AppKit only when it changes.
-    look: Option<(bool, String)>,
+    toolbar: ambry_macos::WindowToolbar,
+    /// What the toolbar shows, to touch AppKit only when it changes.
+    shown_box: Option<(ambry_macos::BoxLabel, String)>,
+    shown_boxes: Vec<ambry_macos::BoxLabel>,
 }
 
 #[cfg(target_os = "macos")]
 enum ControlEvent {
     Mode(usize),
     Add,
+    Color(usize),
+    Symbol(usize),
+    OpenBox(usize),
+    NewBox,
     Open(usize),
     Select(Option<usize>),
 }
@@ -173,9 +175,11 @@ impl BoxView {
             .ok()
             .map(|dir| dir.join("avatar.png"))
             .filter(|path| path.exists());
+        let boxes = ambry_core::list_boxes(store.dir());
         Self {
             doc,
             store,
+            boxes,
             mode: Mode::Canvas,
             pan: point(px(0.), px(0.)),
             selected: None,
@@ -220,58 +224,33 @@ impl BoxView {
                 },
             )?;
             table.native().set_hidden(true);
-            let avatar =
-                ambry_macos::GlassAvatar::new(ns_view, avatar, &user_initial(), layout::AVATAR)?;
-            let mode = events.clone();
-            let switch = ambry_macos::GlassSegments::new(
+            let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
-                &[("number", "Canvas"), ("list.bullet", "List")],
-                SWITCH_ITEM_WIDTH,
-                move |index| {
-                    mode.try_send(ControlEvent::Mode(index)).ok();
-                },
-            )?;
-            let add = ambry_macos::GlassButton::new(
-                ns_view,
-                "plus",
-                "Add files or folders",
-                layout::HEIGHT,
-                move || {
-                    events.try_send(ControlEvent::Add).ok();
+                &BoxIcon::COLORS,
+                &BoxIcon::SYMBOLS,
+                avatar,
+                &user_initial(),
+                move |event| {
+                    let event = match event {
+                        ambry_macos::ToolbarEvent::Mode(index) => ControlEvent::Mode(index),
+                        ambry_macos::ToolbarEvent::Add => ControlEvent::Add,
+                        ambry_macos::ToolbarEvent::Color(index) => ControlEvent::Color(index),
+                        ambry_macos::ToolbarEvent::Symbol(index) => ControlEvent::Symbol(index),
+                        ambry_macos::ToolbarEvent::OpenBox(index) => ControlEvent::OpenBox(index),
+                        ambry_macos::ToolbarEvent::NewBox => ControlEvent::NewBox,
+                    };
+                    events.try_send(event).ok();
                 },
             )?;
             NativeControls {
                 ns_view,
                 table,
                 table_paths: Vec::new(),
-                avatar,
-                switch,
-                add,
-                tune: String::new(),
-                look: None,
+                toolbar,
+                shown_box: None,
+                shown_boxes: Vec::new(),
             }
         };
-        cx.spawn(async move |this, cx| {
-            let Some(file) = tune_file() else { return };
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
-                let tune = std::fs::read_to_string(&file).unwrap_or_default();
-                let updated = this.update(cx, |this, cx| {
-                    if let Some(controls) = &mut this.controls {
-                        if controls.tune != tune {
-                            controls.tune = tune;
-                            cx.notify();
-                        }
-                    }
-                });
-                if updated.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
@@ -279,6 +258,34 @@ impl BoxView {
                         this.set_mode(if index == 0 { Mode::Canvas } else { Mode::List }, cx)
                     }
                     ControlEvent::Add => this.pick_paths(cx),
+                    ControlEvent::Color(index) => {
+                        if let Some(color) = BoxIcon::COLORS.get(index) {
+                            this.doc.icon.color = color.to_string();
+                            this.save();
+                            cx.notify();
+                        }
+                    }
+                    ControlEvent::Symbol(index) => {
+                        if let Some(symbol) = BoxIcon::SYMBOLS.get(index) {
+                            this.doc.icon.symbol = symbol.to_string();
+                            this.save();
+                            cx.notify();
+                        }
+                    }
+                    ControlEvent::OpenBox(index) => {
+                        if let Some(entry) = this.boxes.get(index).cloned() {
+                            this.open_box(Store::new(entry.path), cx);
+                        }
+                    }
+                    ControlEvent::NewBox => {
+                        let name = this.new_box_name();
+                        let store = Store::new(ambry_core::new_box_path(this.store.dir(), &name));
+                        let doc = BoxDoc::new(name);
+                        if let Err(err) = store.save(&doc) {
+                            eprintln!("could not save {}: {err:#}", store.path().display());
+                        }
+                        this.open_box(store, cx);
+                    }
                     ControlEvent::Open(row) => {
                         if let Some(id) = this.doc.items.get(row).map(|item| item.id) {
                             this.open_item(id, cx);
@@ -304,6 +311,7 @@ impl BoxView {
     /// item count under the window title.
     #[cfg(target_os = "macos")]
     fn sync_controls(&mut self) {
+        let status = self.status().to_string();
         let Some(controls) = &mut self.controls else {
             return;
         };
@@ -332,10 +340,23 @@ impl BoxView {
             controls.table.select(selected);
         }
         controls.table.native().set_hidden(self.mode != Mode::List);
-        let look = (DARK_MODE.get(), controls.tune.clone());
-        if controls.look.as_ref() != Some(&look) {
-            apply_glass_look(controls, look.0, &look.1);
-            controls.look = Some(look);
+        let shown = (box_label(&self.doc.name, &self.doc.icon), status);
+        if controls.shown_box.as_ref() != Some(&shown) {
+            controls.toolbar.set_box(&shown.0, &shown.1);
+            controls.shown_box = Some(shown);
+        }
+        let boxes: Vec<ambry_macos::BoxLabel> = self
+            .boxes
+            .iter()
+            .map(|entry| box_label(&entry.name, &entry.icon))
+            .collect();
+        if controls.shown_boxes != boxes {
+            let current = self
+                .boxes
+                .iter()
+                .position(|entry| entry.path == self.store.path());
+            controls.toolbar.set_boxes(boxes.clone(), current);
+            controls.shown_boxes = boxes;
         }
     }
 
@@ -360,16 +381,56 @@ impl BoxView {
         #[cfg(target_os = "macos")]
         if let Some(controls) = &self.controls {
             controls
-                .switch
-                .select(if mode == Mode::Canvas { 0 } else { 1 });
+                .toolbar
+                .select_mode(if mode == Mode::Canvas { 0 } else { 1 });
         }
         cx.notify();
     }
 
-    fn save(&self) {
+    fn save(&mut self) {
         if let Err(err) = self.store.save(&self.doc) {
             eprintln!("could not save {}: {err:#}", self.store.path().display());
         }
+        self.boxes = ambry_core::list_boxes(self.store.dir());
+    }
+
+    /// Saves this box and shows the one `store` holds instead.
+    #[cfg(target_os = "macos")]
+    fn open_box(&mut self, store: Store, cx: &mut Context<Self>) {
+        if store.path() == self.store.path() {
+            return;
+        }
+        self.save();
+        let doc = store.load_or_new("Untitled").unwrap_or_else(|err| {
+            eprintln!("could not load {}: {err:#}", store.path().display());
+            BoxDoc::new("Untitled")
+        });
+        self.appear_delay = doc
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.id, index.min(12) as f32 * 0.035))
+            .collect();
+        self.doc = doc;
+        self.store = store;
+        self.selected = None;
+        self.drag = None;
+        self.pan = point(px(0.), px(0.));
+        self.boxes = ambry_core::list_boxes(self.store.dir());
+        cx.notify();
+    }
+
+    /// "New Box", or "New Box 2" and up when that name is taken.
+    #[cfg(target_os = "macos")]
+    fn new_box_name(&self) -> String {
+        let taken = |name: &str| self.boxes.iter().any(|entry| entry.name == name);
+        let mut name = "New Box".to_string();
+        let mut n = 2;
+        while taken(&name) {
+            name = format!("New Box {n}");
+            n += 1;
+        }
+        name
     }
 
     /// Converts a window position into canvas coordinates.
@@ -790,67 +851,19 @@ impl BoxView {
             })
     }
 
-    /// The box's name and status next to the traffic lights, drawn by GPUI in the titlebar.
-    fn render_title(&self) -> impl IntoElement {
-        div()
-            .absolute()
-            .top_0()
-            .left(px(layout::TITLE_LEFT as f32))
-            .h(px(layout::TITLE_HEIGHT as f32))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .text_size(px(TITLE_SIZE))
-            .child(
-                div()
-                    .size(px(20.))
-                    .rounded(px(5.))
-                    .bg(rgb(ACCENT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        svg()
-                            .path("icons/frame.svg")
-                            .size(px(14.))
-                            .text_color(rgb(0xffffff)),
-                    ),
-            )
-            .child(
-                div()
-                    .text_color(rgb(palette().ink))
-                    .child(self.doc.name.clone()),
-            )
-            .child(div().text_color(rgb(palette().quiet)).child(self.status()))
-    }
-
-    /// The add button, the canvas/list switch and the account avatar, top right.
+    /// The add button, the canvas/list switch and the account avatar, top right, drawn by
+    /// GPUI where AppKit and its toolbar are not available.
+    #[cfg(not(target_os = "macos"))]
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let bar = div()
+        div()
             .absolute()
             .top(px(layout::TOP as f32))
             .right(px(layout::TOP as f32))
             .flex()
             .items_center()
-            .gap(px(layout::GAP_BEFORE_AVATAR as f32));
-        #[cfg(target_os = "macos")]
-        let bar = bar.when_some(self.controls.as_ref(), |bar, controls| {
-            let _ = cx;
-            bar.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::GAP as f32))
-                    .child(native(controls.add.native()))
-                    .child(native(controls.switch.native())),
-            )
-            .child(native(controls.avatar.native()))
-        });
-        #[cfg(not(target_os = "macos"))]
-        let bar = bar
+            .gap(px(layout::GAP_BEFORE_AVATAR as f32))
             .child(self.render_fallback_toolbar(cx))
-            .child(self.render_avatar());
-        bar
+            .child(self.render_avatar())
     }
 
     /// The canvas/list switch and add button drawn by GPUI where AppKit is not available.
@@ -927,7 +940,10 @@ impl Render for BoxView {
         self.load_icons();
         #[cfg(target_os = "macos")]
         self.sync_controls();
+        #[cfg(target_os = "macos")]
         window.set_window_title(&self.doc.name);
+        #[cfg(not(target_os = "macos"))]
+        window.set_window_title(&format!("{} — {}", self.doc.name, self.status()));
 
         let root = div()
             .id("box")
@@ -954,9 +970,9 @@ impl Render for BoxView {
             .map(|this| match self.mode {
                 Mode::Canvas => this.child(self.render_canvas(cx)),
                 Mode::List => this.child(self.render_list(cx)),
-            })
-            .child(self.render_title())
-            .child(self.render_top_bar(cx));
+            });
+        #[cfg(not(target_os = "macos"))]
+        let root = root.child(self.render_top_bar(cx));
 
         #[cfg(target_os = "macos")]
         let root = root.font_family(".SystemUIFont");
@@ -1018,54 +1034,14 @@ fn edge_fades() -> [impl IntoElement; 4] {
     ]
 }
 
-/// Tints the glass controls so they read as one set in either appearance. Lines like
-/// `dark.tabs = 0 0.2` in `tune` (white, alpha, or `none`) override the defaults.
+/// How the toolbar shows a box.
 #[cfg(target_os = "macos")]
-fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
-    let theme = if dark { "dark" } else { "light" };
-    let value = |key: &str| {
-        tune.lines().find_map(|line| {
-            let (name, value) = line.split_once('=')?;
-            (name.trim() == format!("{theme}.{key}")).then(|| value.trim().to_string())
-        })
-    };
-    let tint = |key: &str, default: Option<(f64, f64)>| match value(key) {
-        Some(value) if value == "none" => None,
-        Some(value) => {
-            let mut numbers = value.split_whitespace().filter_map(|n| n.parse().ok());
-            numbers.next().zip(numbers.next()).or(default)
-        }
-        None => default,
-    };
-    let strip = value("strip")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1.);
-    controls.switch.set_alpha(strip);
-    controls.add.set_tint(tint("add", None));
-    controls.avatar.set_tint(tint("avatar", None));
-
-    // `poke` and `dump` lines look into AppKit's views; the report goes next to the file.
-    if tune
-        .lines()
-        .any(|line| line.starts_with("poke") || line.trim() == "dump")
-    {
-        let mut targets = controls.switch.probe_targets();
-        targets.extend(controls.add.probe_targets());
-        let report = ambry_macos::probe::run(&targets, tune);
-        if let Some(file) = tune_file() {
-            std::fs::write(file.with_file_name("probe-out.txt"), report).ok();
-        }
+fn box_label(name: &str, icon: &BoxIcon) -> ambry_macos::BoxLabel {
+    ambry_macos::BoxLabel {
+        name: name.to_string(),
+        symbol: icon.symbol.clone(),
+        color: icon.color.clone(),
     }
-}
-
-/// `target/glass-tune.txt` in the checkout the app was built from.
-#[cfg(target_os = "macos")]
-fn tune_file() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let root = exe
-        .ancestors()
-        .find(|dir| dir.join("Cargo.toml").exists())?;
-    Some(root.join("target/glass-tune.txt"))
 }
 
 /// Holds an animation at its start for the first `start` fraction of its duration.

@@ -28,7 +28,7 @@ pub use native::{
 #[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]
-pub use toolbar::WindowToolbar;
+pub use toolbar::{BoxLabel, ToolbarEvent, WindowToolbar};
 
 /// Titlebar geometry in points, shared by the native and the GPUI-drawn controls.
 pub mod layout {

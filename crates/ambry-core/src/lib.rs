@@ -61,9 +61,67 @@ impl Item {
     }
 }
 
+/// The glyph and color a box shows next to its name, like a shortcut in Shortcuts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxIcon {
+    /// An SF Symbol name.
+    pub symbol: String,
+    /// One of [`BoxIcon::COLORS`].
+    pub color: String,
+}
+
+impl BoxIcon {
+    pub const COLORS: [&str; 10] = [
+        "red", "orange", "yellow", "green", "mint", "teal", "blue", "indigo", "purple", "pink",
+    ];
+    pub const SYMBOLS: [&str; 30] = [
+        "tray",
+        "archivebox",
+        "folder",
+        "doc.text",
+        "photo",
+        "film",
+        "music.note",
+        "book",
+        "briefcase",
+        "cart",
+        "gift",
+        "heart",
+        "star",
+        "flag",
+        "bookmark",
+        "tag",
+        "lightbulb",
+        "paintbrush",
+        "hammer",
+        "globe",
+        "airplane",
+        "house",
+        "person.2",
+        "bubble.left",
+        "sparkles",
+        "number",
+        "camera",
+        "graduationcap",
+        "leaf",
+        "bolt",
+    ];
+}
+
+impl Default for BoxIcon {
+    fn default() -> Self {
+        Self {
+            symbol: "tray".into(),
+            color: "blue".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BoxDoc {
     pub name: String,
+    #[serde(default)]
+    pub icon: BoxIcon,
     pub items: Vec<Item>,
     next_id: u64,
 }
@@ -125,6 +183,57 @@ pub fn data_dir() -> Result<PathBuf> {
         .join("Ambry"))
 }
 
+/// A saved box as the box switcher lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub icon: BoxIcon,
+}
+
+/// Every box saved in `dir`, by name.
+pub fn list_boxes(dir: &Path) -> Vec<BoxEntry> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut boxes: Vec<BoxEntry> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| {
+            let doc = Store::new(&path).load_or_new("").ok()?;
+            Some(BoxEntry {
+                path,
+                name: doc.name,
+                icon: doc.icon,
+            })
+        })
+        .collect();
+    boxes.sort_by_key(|entry| entry.name.to_lowercase());
+    boxes
+}
+
+/// A file in `dir` for a new box called `name` that no other box uses yet.
+pub fn new_box_path(dir: &Path, name: &str) -> PathBuf {
+    let stem: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let stem = if stem.is_empty() {
+        "box".to_string()
+    } else {
+        stem
+    };
+    let mut path = dir.join(format!("{stem}.json"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem}-{n}.json"));
+        n += 1;
+    }
+    path
+}
+
 /// Reads and writes a box as pretty JSON.
 pub struct Store {
     path: PathBuf,
@@ -143,6 +252,11 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The folder this box is saved in, with the other boxes.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
     }
 
     /// Loads the box, or returns a new empty one named `default_name` if none is saved yet.
@@ -187,6 +301,34 @@ mod tests {
 
         assert!(doc.add_paths(&[file], 0.0, 0.0).is_empty());
         assert_eq!(doc.items.len(), 2);
+    }
+
+    #[test]
+    fn lists_boxes_and_picks_free_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut work = BoxDoc::new("Work");
+        work.icon.symbol = "briefcase".into();
+        Store::new(dir.path().join("work.json"))
+            .save(&work)
+            .unwrap();
+        Store::new(dir.path().join("inbox.json"))
+            .save(&BoxDoc::new("Inbox"))
+            .unwrap();
+
+        let boxes = list_boxes(dir.path());
+        let names: Vec<_> = boxes.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["Inbox", "Work"]);
+        assert_eq!(boxes[1].icon.symbol, "briefcase");
+        assert_eq!(boxes[0].icon, BoxIcon::default());
+
+        assert_eq!(
+            new_box_path(dir.path(), "New Box"),
+            dir.path().join("new-box.json")
+        );
+        assert_eq!(
+            new_box_path(dir.path(), "Work"),
+            dir.path().join("work-2.json")
+        );
     }
 
     #[test]
