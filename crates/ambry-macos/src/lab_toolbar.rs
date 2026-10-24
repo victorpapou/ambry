@@ -21,7 +21,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("scope", "Target"),
 ];
 const MODES: &[(&str, &str)] = &[("number", "Canvas"), ("list.bullet", "List")];
-const IDS: [&str; 3] = ["tools", "modes", "add"];
+const IDS: [&str; 4] = ["tools", "modes", "tabs", "add"];
 
 #[derive(Default)]
 struct LabIvars {
@@ -80,6 +80,12 @@ impl LabDelegate {
                 Retained::into_super(Retained::into_super(control))
             }
             "modes" => Retained::into_super(Retained::into_super(segmented(mtm, MODES)?)),
+            "tabs" => {
+                let images = crate::native::icon_images(MODES)?;
+                let tabs = crate::native::icon_tab_view(mtm, MODES.len(), &images, 40.);
+                tabs.setDrawsBackground(false);
+                Retained::into_super(tabs)
+            }
             _ => {
                 let image = crate::lab::symbol("plus", "Add")?;
                 let button =

@@ -3,17 +3,15 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use objc2::rc::{Allocated, Retained};
+use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
-    AllocAnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class,
-    msg_send, sel,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
     NSBezelStyle, NSButton, NSControlBorderShape, NSControlSize, NSFont, NSGlassEffectView,
-    NSImage, NSImageScaling, NSImageView, NSSegmentSwitchTracking, NSSegmentedControl,
-    NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem,
-    NSTextAlignment, NSTextField, NSView,
+    NSImage, NSImageScaling, NSImageView, NSSegmentedControl, NSTabPosition, NSTabView,
+    NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -212,7 +210,17 @@ impl TabSwitch {
             },
         );
         view.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-        let hosted: Retained<NSView> = Retained::into_super(view.clone());
+        // The strip sits on the same glass as the buttons beside it.
+        view.setDrawsBackground(false);
+        let hosted: Retained<NSView> = if has_liquid_glass() {
+            let frame = view.frame();
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+            glass.setCornerRadius(frame.size.height / 2.);
+            glass.setContentView(Some(&view));
+            Retained::into_super(glass)
+        } else {
+            Retained::into_super(view.clone())
+        };
         Some(Self {
             native: NativeView::host(parent, hosted, target),
             tabs: view,
@@ -420,35 +428,6 @@ pub unsafe fn set_window_subtitle(ns_view: NonNull<c_void>, subtitle: &str) {
     if let Some(window) = view.window() {
         window.setSubtitle(&NSString::from_str(subtitle));
     }
-}
-
-/// The private `NSTabViewSegmentedControl` (a public `NSSegmentedControl` subclass) gives
-/// the light tab look; plain `NSSegmentedControl` stands in where it is missing.
-pub(crate) fn tab_segmented_control(
-    icons: &[(&str, &str)],
-) -> Option<Retained<NSSegmentedControl>> {
-    let class = AnyClass::get(c"NSTabViewSegmentedControl")
-        .filter(|class| inherits(class, NSSegmentedControl::class()))
-        .unwrap_or(NSSegmentedControl::class());
-    let allocated: Allocated<NSSegmentedControl> = unsafe { msg_send![class, alloc] };
-    let control = NSSegmentedControl::initWithFrame(allocated, NSRect::ZERO);
-    control.setSegmentCount(icons.len() as isize);
-    control.setTrackingMode(NSSegmentSwitchTracking::SelectOne);
-    for (i, (name, description)) in icons.iter().enumerate() {
-        let image = symbol(name, description)?;
-        control.setImage_forSegment(Some(&image), i as isize);
-        control.setToolTip_forSegment(Some(&NSString::from_str(description)), i as isize);
-    }
-    if has_liquid_glass() {
-        control.setBorderShape(NSControlBorderShape::Capsule);
-    }
-    control.setSelectedSegment(0);
-    control.sizeToFit();
-    Some(control)
-}
-
-fn inherits(class: &AnyClass, ancestor: &AnyClass) -> bool {
-    std::iter::successors(Some(class), |class| class.superclass()).any(|class| class == ancestor)
 }
 
 /// Extra large is the 36 pt size toolbar controls use; it exists from macOS 26 on.

@@ -3,14 +3,12 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
-use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message, msg_send};
+use objc2::{MainThreadMarker, MainThreadOnly, Message, msg_send};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSControlBorderShape, NSControlSize, NSGlassEffectView, NSImage,
-    NSSegmentStyle, NSSegmentSwitchTracking, NSSegmentedControl, NSTabPosition, NSTabView,
-    NSTabViewBorderType, NSTabViewItem, NSTabViewType, NSTextField, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSGlassEffectContainerView, NSGlassEffectView,
+    NSGlassEffectViewStyle, NSImage, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 const ROW: f64 = 56.;
 const CONTROL_X: f64 = 240.;
@@ -20,69 +18,19 @@ pub fn open_switch_lab() {
         return;
     };
     let rows: Vec<(&str, Retained<NSView>)> = vec![
+        ("R glass + tabs", in_glass(mtm, &icon_tabs(mtm, 40.))),
+        ("S glass + tabs, no bg", in_glass(mtm, &bare_tabs(mtm))),
         (
-            "A current",
-            segmented(mtm, |s| {
-                s.setControlSize(NSControlSize::Large);
-                if glass() {
-                    s.setBorderShape(NSControlBorderShape::Capsule);
-                }
-            }),
+            "T container + glass + tabs",
+            in_container(mtm, &in_glass(mtm, &bare_tabs(mtm))),
         ),
-        ("B default", segmented(mtm, |_| {})),
-        (
-            "C large",
-            segmented(mtm, |s| s.setControlSize(NSControlSize::Large)),
-        ),
-        (
-            "D style Separated",
-            segmented(mtm, |s| s.setSegmentStyle(NSSegmentStyle::Separated)),
-        ),
-        (
-            "E style Capsule",
-            segmented(mtm, |s| s.setSegmentStyle(NSSegmentStyle::Capsule)),
-        ),
-        (
-            "F style RoundRect",
-            segmented(mtm, |s| s.setSegmentStyle(NSSegmentStyle::RoundRect)),
-        ),
-        (
-            "G style TexturedRounded",
-            segmented(mtm, |s| s.setSegmentStyle(NSSegmentStyle::TexturedRounded)),
-        ),
-        (
-            "H glass + default",
-            in_glass(mtm, segmented(mtm, |_| {}).as_ref()),
-        ),
-        (
-            "I glass + Separated",
-            in_glass(
-                mtm,
-                segmented(mtm, |s| s.setSegmentStyle(NSSegmentStyle::Separated)).as_ref(),
-            ),
-        ),
-        ("J tab view, images", tabs(mtm, true)),
-        ("K tab view, labels", tabs(mtm, false)),
-        ("N tab control, capsule", {
-            let control = crate::native::tab_segmented_control(&[
-                ("number", "Canvas"),
-                ("list.bullet", "List"),
-            ])
-            .unwrap();
-            Retained::into_super(Retained::into_super(control))
-        }),
-        ("O tab control, square", {
-            let control = crate::native::tab_segmented_control(&[
-                ("number", "Canvas"),
-                ("list.bullet", "List"),
-            ])
-            .unwrap();
-            if glass() {
-                control.setBorderShape(objc2_app_kit::NSControlBorderShape::Automatic);
+        ("U clear glass + tabs", {
+            let view = in_glass(mtm, &bare_tabs(mtm));
+            if let Ok(glass) = view.clone().downcast::<NSGlassEffectView>() {
+                glass.setStyle(NSGlassEffectViewStyle::Clear);
             }
-            Retained::into_super(Retained::into_super(control))
+            view
         }),
-        ("M labels, no border", tabs_without_border(mtm)),
         ("P tab view, icons", icon_tabs(mtm, 0.)),
         ("Q tab view, icons, wide", icon_tabs(mtm, 40.)),
     ];
@@ -172,24 +120,6 @@ fn glass() -> bool {
     AnyClass::get(c"NSGlassEffectView").is_some()
 }
 
-fn segmented(mtm: MainThreadMarker, style: impl FnOnce(&NSSegmentedControl)) -> Retained<NSView> {
-    let images = NSArray::from_retained_slice(&icons());
-    let s = unsafe {
-        NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
-            &images,
-            NSSegmentSwitchTracking::SelectOne,
-            None,
-            None,
-            mtm,
-        )
-    };
-    style(&s);
-    s.setSelectedSegment(0);
-    let size = s.fittingSize();
-    s.setFrame(rect(0., 0., size.width, size.height));
-    Retained::into_super(Retained::into_super(s))
-}
-
 fn in_glass(mtm: MainThreadMarker, inner: &NSView) -> Retained<NSView> {
     let size = inner.frame().size;
     if !glass() {
@@ -204,66 +134,6 @@ fn in_glass(mtm: MainThreadMarker, inner: &NSView) -> Retained<NSView> {
     Retained::into_super(g)
 }
 
-fn tabs(mtm: MainThreadMarker, images: bool) -> Retained<NSView> {
-    let view = NSTabView::initWithFrame(NSTabView::alloc(mtm), rect(0., 0., 240., 40.));
-    view.setTabViewType(NSTabViewType::TopTabsBezelBorder);
-    for (i, (name, image)) in ["Canvas", "List", "Help"].iter().zip(icons()).enumerate() {
-        let item = unsafe {
-            NSTabViewItem::initWithIdentifier(
-                NSTabViewItem::alloc(),
-                Some(&NSString::from_str(&i.to_string())),
-            )
-        };
-        if images {
-            item.setLabel(&NSString::from_str(""));
-            item.setImage(Some(&image));
-        } else {
-            item.setLabel(&NSString::from_str(name));
-        }
-        view.addTabViewItem(&item);
-    }
-    Retained::into_super(view)
-}
-
-fn tabs_without_border(mtm: MainThreadMarker) -> Retained<NSView> {
-    let view = NSTabView::initWithFrame(NSTabView::alloc(mtm), rect(0., 0., 240., 36.));
-    view.setTabPosition(NSTabPosition::Top);
-    view.setTabViewBorderType(NSTabViewBorderType::None);
-    for name in ["Canvas", "List"] {
-        let item = unsafe {
-            NSTabViewItem::initWithIdentifier(
-                NSTabViewItem::alloc(),
-                Some(&NSString::from_str(name)),
-            )
-        };
-        item.setLabel(&NSString::from_str(name));
-        view.addTabViewItem(&item);
-    }
-    view.setFrameSize(NSSize::new(view.minimumSize().width, 36.));
-    Retained::into_super(view)
-}
-
-fn icons() -> Vec<Retained<NSImage>> {
-    let frame = {
-        let data = NSData::with_bytes(include_bytes!("../assets/frame@3x.png"));
-        let image = NSImage::initWithData(NSImage::alloc(), &data).unwrap();
-        image.setSize(NSSize::new(18., 18.));
-        image.setTemplate(true);
-        image
-    };
-    let list = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str("list.bullet"),
-        Some(&NSString::from_str("List")),
-    )
-    .unwrap();
-    let help = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str("questionmark.circle"),
-        Some(&NSString::from_str("Help")),
-    )
-    .unwrap();
-    vec![frame, list, help]
-}
-
 fn icon_tabs(mtm: MainThreadMarker, item_width: f64) -> Retained<NSView> {
     let icons = [("number", "Canvas"), ("list.bullet", "List")];
     let images = crate::native::icon_images(&icons).unwrap();
@@ -273,6 +143,27 @@ fn icon_tabs(mtm: MainThreadMarker, item_width: f64) -> Retained<NSView> {
         &images,
         item_width,
     ))
+}
+
+/// Icon tabs whose NSTabView draws no background of its own.
+fn bare_tabs(mtm: MainThreadMarker) -> Retained<NSView> {
+    let icons = [("number", "Canvas"), ("list.bullet", "List")];
+    let images = crate::native::icon_images(&icons).unwrap();
+    let tabs = crate::native::icon_tab_view(mtm, icons.len(), &images, 40.);
+    tabs.setDrawsBackground(false);
+    Retained::into_super(tabs)
+}
+
+fn in_container(mtm: MainThreadMarker, inner: &NSView) -> Retained<NSView> {
+    if !glass() {
+        return inner.retain();
+    }
+    let container = NSGlassEffectContainerView::initWithFrame(
+        NSGlassEffectContainerView::alloc(mtm),
+        inner.frame(),
+    );
+    container.setContentView(Some(inner));
+    Retained::into_super(container)
 }
 
 pub(crate) fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {

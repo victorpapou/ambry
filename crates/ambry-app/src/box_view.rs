@@ -10,9 +10,9 @@ use ambry_macos::layout;
 use gpui::{
     Animation, AnimationExt as _, App, Bounds, BoxShadow, Context, CursorStyle, DragMoveEvent,
     ExternalPaths, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Window, canvas, div,
-    ease_out_quint, fill, hsla, img, linear_color_stop, linear_gradient, point, prelude::*, px,
-    rgb, size, svg,
+    ObjectFit, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Window, WindowAppearance,
+    canvas, div, ease_out_quint, fill, hsla, img, linear_color_stop, linear_gradient, point,
+    prelude::*, px, rgb, size, svg,
 };
 
 #[cfg(target_os = "macos")]
@@ -34,13 +34,65 @@ const EDGE_FADE: f32 = 40.;
 const TITLE_SIZE: f32 = 15.;
 const LABEL_SIZE: f32 = 13.;
 
-const INK: u32 = 0x1d1d1f;
-const QUIET: u32 = 0x8e8e93;
-const FAINT: u32 = 0xb4b4ba;
-const DOT: u32 = 0xe3e3e8;
-const HAIRLINE: u32 = 0xe5e5ea;
-const PRESSED: u32 = 0xececf0;
 const ACCENT: u32 = 0x2f7cf6;
+
+/// The window's colors in one appearance.
+struct Palette {
+    canvas: u32,
+    ink: u32,
+    quiet: u32,
+    faint: u32,
+    dot: u32,
+    hairline: u32,
+    pressed: u32,
+    /// Top of a file card's gradient; the bottom is the canvas color.
+    card_top: u32,
+    /// Behind a selected icon, like Finder's.
+    selection: Hsla,
+}
+
+const LIGHT: Palette = Palette {
+    canvas: 0xffffff,
+    ink: 0x1d1d1f,
+    quiet: 0x8e8e93,
+    faint: 0xb4b4ba,
+    dot: 0xe3e3e8,
+    hairline: 0xe5e5ea,
+    pressed: 0xececf0,
+    card_top: 0xf2f2f5,
+    selection: Hsla {
+        h: 0.,
+        s: 0.,
+        l: 0.,
+        a: 0.08,
+    },
+};
+
+const DARK: Palette = Palette {
+    canvas: 0x1e1e1e,
+    ink: 0xf5f5f7,
+    quiet: 0x98989d,
+    faint: 0x6e6e73,
+    dot: 0x3a3a3c,
+    hairline: 0x3a3a3c,
+    pressed: 0x2c2c2e,
+    card_top: 0x2c2c2e,
+    selection: Hsla {
+        h: 0.,
+        s: 0.,
+        l: 1.,
+        a: 0.12,
+    },
+};
+
+thread_local! {
+    static DARK_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The palette for the window's current appearance, set at the start of every render.
+fn palette() -> &'static Palette {
+    if DARK_MODE.get() { &DARK } else { &LIGHT }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -106,6 +158,8 @@ impl BoxView {
     pub fn new(doc: BoxDoc, store: Store, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus);
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
+            .detach();
         let appear_delay = doc
             .items
             .iter()
@@ -650,7 +704,7 @@ impl BoxView {
                     .gap(px(12.))
                     .px(px(10.))
                     .rounded(px(8.))
-                    .when(selected, |this| this.bg(rgb(PRESSED)))
+                    .when(selected, |this| this.bg(rgb(palette().pressed)))
                     .when(!item.exists(), |this| this.opacity(0.4))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -658,13 +712,18 @@ impl BoxView {
                             this.on_item_mouse_down(id, event, window, cx)
                         }),
                     )
-                    .child(div().w(px(52.)).text_color(rgb(FAINT)).child(item.badge()))
-                    .child(div().text_color(rgb(INK)).child(item.name()))
+                    .child(
+                        div()
+                            .w(px(52.))
+                            .text_color(rgb(palette().faint))
+                            .child(item.badge()),
+                    )
+                    .child(div().text_color(rgb(palette().ink)).child(item.name()))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_color(rgb(FAINT))
+                            .text_color(rgb(palette().faint))
                             .truncate()
                             .child(item.path.display().to_string()),
                     )
@@ -684,7 +743,7 @@ impl BoxView {
             .id("account")
             .size(size)
             .rounded_full()
-            .bg(gpui::white())
+            .bg(rgb(palette().canvas))
             .occlude()
             .shadow(vec![
                 shadow(0., 4., 16., 0.06),
@@ -696,7 +755,7 @@ impl BoxView {
             .items_center()
             .justify_center()
             .text_size(px(TITLE_SIZE))
-            .text_color(rgb(INK))
+            .text_color(rgb(palette().ink))
             .map(|this| match &self.avatar {
                 Some(path) => this.child(
                     img(path.clone())
@@ -750,11 +809,11 @@ impl BoxView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .when(active, |this| this.bg(rgb(PRESSED)))
+                .when(active, |this| this.bg(rgb(palette().pressed)))
                 .child(svg().path(icon).size(px(18.)).text_color(if active {
-                    rgb(INK)
+                    rgb(palette().ink)
                 } else {
-                    rgb(QUIET)
+                    rgb(palette().quiet)
                 }))
         };
         div()
@@ -791,7 +850,7 @@ impl BoxView {
                         svg()
                             .path("icons/plus.svg")
                             .size(px(18.))
-                            .text_color(rgb(INK)),
+                            .text_color(rgb(palette().ink)),
                     ),
             )
     }
@@ -800,6 +859,10 @@ impl BoxView {
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport = window.viewport_size();
+        DARK_MODE.set(matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        ));
         if !cx.has_active_drag() {
             self.drop_preview = None;
         }
@@ -814,8 +877,8 @@ impl Render for BoxView {
             .track_focus(&self.focus)
             .size_full()
             .relative()
-            .bg(gpui::white())
-            .text_color(rgb(INK))
+            .bg(rgb(palette().canvas))
+            .text_color(rgb(palette().ink))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(
@@ -844,7 +907,7 @@ impl Render for BoxView {
 }
 
 fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
-    let color: Rgba = rgb(DOT);
+    let color: Rgba = rgb(palette().dot);
     let start_x = f32::from(pan.x).rem_euclid(DOT_SPACING);
     let start_y = f32::from(pan.y).rem_euclid(DOT_SPACING);
     let width = f32::from(bounds.size.width);
@@ -865,8 +928,9 @@ fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
 
 /// A soft white fade along every edge of the canvas, like Freeform's.
 fn edge_fades() -> [impl IntoElement; 4] {
-    let white = linear_color_stop(gpui::white(), 0.);
-    let clear = linear_color_stop(hsla(0., 0., 1., 0.), 1.);
+    let canvas = rgb(palette().canvas);
+    let white = linear_color_stop(canvas, 0.);
+    let clear = linear_color_stop(Rgba { a: 0., ..canvas }, 1.);
     let edge = || div().absolute();
     [
         edge()
@@ -930,7 +994,7 @@ fn finder_face(item: &Item, icon: Option<PathBuf>, selected: bool, lifted: bool)
     div()
         .p(px(4.))
         .rounded(px(6.))
-        .when(selected, |this| this.bg(hsla(0., 0., 0., 0.08)))
+        .when(selected, |this| this.bg(palette().selection))
         .when(lifted, |this| this.opacity(0.8))
         .when(!item.exists(), |this| this.opacity(0.4))
         .child(
@@ -967,13 +1031,13 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
     let border: Hsla = if selected {
         rgb(ACCENT).into()
     } else {
-        rgb(HAIRLINE).into()
+        rgb(palette().hairline).into()
     };
     let face = match item.kind {
         ItemKind::Folder => div()
             .size(px(CARD_HEIGHT))
             .rounded(px(10.))
-            .when(selected, |this| this.bg(rgb(PRESSED)))
+            .when(selected, |this| this.bg(rgb(palette().pressed)))
             .flex()
             .items_center()
             .justify_center()
@@ -991,8 +1055,8 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
             .overflow_hidden()
             .bg(linear_gradient(
                 180.,
-                linear_color_stop(rgb(0xf2f2f5), 0.),
-                linear_color_stop(gpui::white(), 1.),
+                linear_color_stop(rgb(palette().card_top), 0.),
+                linear_color_stop(rgb(palette().canvas), 1.),
             ))
             .border_1()
             .when(selected, |this| this.border_2())
@@ -1017,7 +1081,7 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
                         .right(px(7.))
                         .bottom(px(5.))
                         .text_size(px(LABEL_SIZE))
-                        .text_color(rgb(FAINT))
+                        .text_color(rgb(palette().faint))
                         .child(item.badge()),
                 )
             }),
@@ -1067,7 +1131,7 @@ fn item_label(name: String, selected: bool, exists: bool) -> impl IntoElement {
         .text_color(if selected {
             gpui::white()
         } else {
-            rgb(QUIET).into()
+            rgb(palette().quiet).into()
         })
         .truncate()
         .child(name)
@@ -1081,7 +1145,7 @@ fn empty_hint() -> impl IntoElement {
         .items_center()
         .justify_center()
         .text_size(px(TITLE_SIZE))
-        .text_color(rgb(FAINT))
+        .text_color(rgb(palette().faint))
         .child("Drop files or folders here")
 }
 
@@ -1089,7 +1153,7 @@ fn empty_hint() -> impl IntoElement {
 fn floating() -> gpui::Div {
     div()
         .rounded_full()
-        .bg(gpui::white())
+        .bg(rgb(palette().canvas))
         .shadow(vec![
             shadow(0., 4., 16., 0.06),
             shadow(0., 1., 4., 0.17),
