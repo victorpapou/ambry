@@ -225,7 +225,8 @@ impl ColumnBrowser {
         }
         browser.setTitled(false);
         unsafe {
-            let _: () = msg_send![&*browser, setCellClass: RoundCell::class()];
+            let _: () =
+                msg_send![&*browser, setCellClass: <RoundCell as objc2::ClassType>::class()];
             let _: () = msg_send![&*browser, setRowHeight: ROW_HEIGHT];
         }
         browser.setAllowsMultipleSelection(true);
