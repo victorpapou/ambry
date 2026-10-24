@@ -1,7 +1,7 @@
 //! The box window: a dotted canvas of files drawn like Finder's icon view, a list view and the
 //! bottom bar. On macOS the list, the avatar and the bottom bar controls are AppKit views.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -43,8 +43,11 @@ const LIST_ROW: f32 = 28.;
 const LIST_ROW_PAD: f32 = 10.;
 #[cfg(target_os = "macos")]
 const LIST_SIDE: f32 = 10.;
+/// Width of a column, and the most entries one lists.
 #[cfg(target_os = "macos")]
-const LIST_HEADER: f32 = 28.;
+const COLUMN_WIDTH: f32 = 240.;
+#[cfg(target_os = "macos")]
+const COLUMN_LIMIT: usize = 200;
 #[cfg(target_os = "macos")]
 const LIST_ICON: f32 = 18.;
 /// How long a list row's hover highlight takes to fade in or out, in milliseconds.
@@ -126,7 +129,24 @@ fn palette() -> &'static Palette {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Canvas,
-    List,
+    Columns,
+}
+
+#[derive(Clone, Copy)]
+struct Marquee {
+    start: Point<Pixels>,
+    now: Point<Pixels>,
+}
+
+/// A row of a column in the column view.
+#[cfg(target_os = "macos")]
+struct ColumnEntry {
+    /// The item's id in the first column; the folders' contents have none.
+    id: Option<u64>,
+    path: PathBuf,
+    name: String,
+    dir: bool,
+    icon: Option<PathBuf>,
 }
 
 struct Drag {
@@ -155,6 +175,17 @@ pub struct BoxView {
     /// Counts wheel scrolls, so a spring back to the edge knows it was overtaken.
     scroll_gen: u64,
     selected: Option<u64>,
+    /// Items picked by dragging a rectangle over them.
+    picked: HashSet<u64>,
+    /// The rectangle being dragged, from where the press landed to the pointer.
+    marquee: Option<Marquee>,
+    /// What is picked in each column of the column view, left to right.
+    trail: Vec<PathBuf>,
+    /// The contents of each folder picked in the column view.
+    #[cfg(target_os = "macos")]
+    listings: HashMap<PathBuf, Vec<PathBuf>>,
+    #[cfg(target_os = "macos")]
+    column_scroll: gpui::ScrollHandle,
     drag: Option<Drag>,
     drop_preview: Option<DropPreview>,
     /// Seconds to wait before a card plays its appear animation, so a batch lands one by one.
@@ -246,6 +277,13 @@ impl BoxView {
             zoom: 1.,
             scroll_gen: 0,
             selected: None,
+            picked: HashSet::new(),
+            marquee: None,
+            trail: Vec::new(),
+            #[cfg(target_os = "macos")]
+            listings: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            column_scroll: gpui::ScrollHandle::new(),
             drag: None,
             drop_preview: None,
             appear_delay,
@@ -350,9 +388,14 @@ impl BoxView {
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
-                    ControlEvent::Mode(index) => {
-                        this.set_mode(if index == 0 { Mode::Canvas } else { Mode::List }, cx)
-                    }
+                    ControlEvent::Mode(index) => this.set_mode(
+                        if index == 0 {
+                            Mode::Canvas
+                        } else {
+                            Mode::Columns
+                        },
+                        cx,
+                    ),
                     ControlEvent::Add => this.pick_paths(cx),
                     ControlEvent::Color(index) => {
                         if let Some(color) = BoxIcon::COLORS.get(index) {
@@ -579,6 +622,8 @@ impl BoxView {
         self.doc = doc;
         self.store = store;
         self.selected = None;
+        self.picked.clear();
+        self.trail.clear();
         self.drag = None;
         self.pan = point(px(0.), px(0.));
         self.zoom = 1.;
@@ -852,6 +897,7 @@ impl BoxView {
         cx.stop_propagation();
         window.focus(&self.focus);
         self.selected = Some(id);
+        self.picked.clear();
         #[cfg(target_os = "macos")]
         self.preview(false);
         if event.click_count >= 2 {
@@ -869,7 +915,77 @@ impl BoxView {
         cx.notify();
     }
 
+    fn is_picked(&self, id: u64) -> bool {
+        self.selected == Some(id) || self.picked.contains(&id)
+    }
+
+    fn start_marquee(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.picked.clear();
+        self.marquee = Some(Marquee { start: at, now: at });
+        cx.notify();
+    }
+
+    /// Picks the items under the rectangle being dragged.
+    fn update_marquee(&mut self) {
+        let Some(marquee) = self.marquee else { return };
+        let (left, right) = (
+            f32::from(marquee.start.x.min(marquee.now.x)),
+            f32::from(marquee.start.x.max(marquee.now.x)),
+        );
+        let (top, bottom) = (
+            f32::from(marquee.start.y.min(marquee.now.y)),
+            f32::from(marquee.start.y.max(marquee.now.y)),
+        );
+        let hit =
+            |x0: f32, y0: f32, x1: f32, y1: f32| left < x1 && right > x0 && top < y1 && bottom > y0;
+        let picked: Vec<u64> = match self.mode {
+            Mode::Canvas => self
+                .doc
+                .items
+                .iter()
+                .filter(|item| {
+                    let origin = self.item_origin(item);
+                    let middle = f32::from(origin.x) + ITEM_WIDTH / 2.;
+                    let top = f32::from(origin.y);
+                    hit(middle - 40., top, middle + 40., top + ITEM_HEIGHT)
+                })
+                .map(|item| item.id)
+                .collect(),
+            #[cfg(target_os = "macos")]
+            Mode::Columns => {
+                let first = layout::BAR as f32 + 6. + f32::from(self.column_scroll.offset().y);
+                self.doc
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        let y = first + *index as f32 * LIST_ROW;
+                        hit(0., y, COLUMN_WIDTH, y + LIST_ROW)
+                    })
+                    .map(|(_, item)| item.id)
+                    .collect()
+            }
+            #[cfg(not(target_os = "macos"))]
+            Mode::Columns => Vec::new(),
+        };
+        self.selected = picked.last().copied();
+        self.picked = picked.into_iter().collect();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marquee.is_some() {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.marquee = None;
+            } else {
+                if let Some(marquee) = &mut self.marquee {
+                    marquee.now = event.position;
+                }
+                self.update_marquee();
+            }
+            cx.notify();
+            return;
+        }
         let Some(drag) = &self.drag else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             self.end_drag(cx);
@@ -885,6 +1001,9 @@ impl BoxView {
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some() {
+            cx.notify();
+        }
         if let Some(drag) = self.drag.take() {
             if drag.moved {
                 self.save();
@@ -901,19 +1020,27 @@ impl BoxView {
                 "=" | "+" => return self.zoom_at(ZOOM_STEP, centre, cx),
                 "-" => return self.zoom_at(1. / ZOOM_STEP, centre, cx),
                 "0" => return self.zoom_at(1. / self.zoom, centre, cx),
+                "1" => return self.set_mode(Mode::Canvas, cx),
+                "2" => return self.set_mode(Mode::Columns, cx),
                 _ => {}
             }
         }
         match event.keystroke.key.as_str() {
             "backspace" | "delete" => {
-                if let Some(id) = self.selected.take() {
-                    self.doc.remove(id);
+                let mut ids: Vec<u64> = self.picked.drain().collect();
+                ids.extend(self.selected.take());
+                if !ids.is_empty() {
+                    for id in ids {
+                        self.doc.remove(id);
+                    }
+                    self.trail.clear();
                     self.save();
                     cx.notify();
                 }
             }
             "escape" => {
                 self.selected = None;
+                self.picked.clear();
                 cx.notify();
             }
             "enter" => {
@@ -995,10 +1122,9 @@ impl BoxView {
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
-                    this.selected = None;
-                    cx.notify();
+                    this.start_marquee(event.position, cx);
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
@@ -1029,7 +1155,7 @@ impl BoxView {
 
     fn render_canvas_item(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
         let id = item.id;
-        let selected = self.selected == Some(id);
+        let selected = self.is_picked(id);
         let lifted = self
             .drag
             .as_ref()
@@ -1160,147 +1286,278 @@ impl BoxView {
         )
     }
 
-    /// The list: Finder's columns, drawn by GPUI, with rounded rows that fill with the accent
-    /// color when selected.
+    /// Finder's column view: the box's items in the first column, and a column for every
+    /// folder opened from there, ending in a preview of the file picked last.
     #[cfg(target_os = "macos")]
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = |text: &'static str| div().text_color(rgb(palette().quiet)).child(text);
+    fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut columns = vec![self.render_column(0, cx)];
+        for (depth, path) in self.trail.iter().enumerate() {
+            columns.push(if path.is_dir() {
+                self.render_column(depth + 1, cx)
+            } else {
+                self.render_preview(path)
+            });
+        }
         div()
-            .id("list")
+            .id("columns")
             .absolute()
             .top(px(layout::BAR as f32))
             .left_0()
             .right_0()
             .bottom_0()
             .flex()
-            .flex_col()
+            .flex_row()
+            .overflow_x_scroll()
             .text_size(px(LABEL_SIZE))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus);
-                    this.selected = None;
-                    cx.notify();
-                }),
-            )
-            .child(
-                list_columns(
-                    div()
-                        .flex_none()
-                        .h(px(LIST_HEADER))
-                        .mx(px(LIST_SIDE))
-                        .px(px(LIST_ROW_PAD))
-                        .text_size(px(11.))
-                        .font_weight(gpui::FontWeight::MEDIUM),
-                    header("Name"),
-                    header("Date Modified"),
-                    header("Size"),
-                    header("Kind"),
-                )
-                .border_b_1()
-                .border_color(rgb(palette().hairline)),
-            )
-            .child(
-                div()
-                    .id("list-rows")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px(px(LIST_SIDE))
-                    .pt(px(6.))
-                    // Room for the last rows to scroll out from under the add button.
-                    .pb(px((layout::ADD + layout::ADD_MARGIN * 2.) as f32))
-                    .flex()
-                    .flex_col()
-                    .when(self.doc.items.is_empty(), |this| this.child(empty_hint()))
-                    .children(
-                        self.doc
-                            .items
-                            .iter()
-                            .enumerate()
-                            .map(|(index, item)| {
-                                self.render_list_row(index, item, cx).into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-            )
+            .children(columns)
+    }
+
+    /// What column `depth` lists: the box's items, or the folder picked in the column before.
+    #[cfg(target_os = "macos")]
+    fn column_entries(&self, depth: usize) -> Vec<ColumnEntry> {
+        if depth == 0 {
+            return self
+                .doc
+                .items
+                .iter()
+                .map(|item| ColumnEntry {
+                    id: Some(item.id),
+                    path: item.path.clone(),
+                    name: item.name(),
+                    dir: item.kind == ItemKind::Folder,
+                    icon: self
+                        .icon(item)
+                        .or_else(|| item.is_image().then(|| item.path.clone())),
+                })
+                .collect();
+        }
+        let Some(folder) = self.trail.get(depth - 1) else {
+            return Vec::new();
+        };
+        self.listings
+            .get(folder)
+            .into_iter()
+            .flatten()
+            .map(|path| ColumnEntry {
+                id: None,
+                path: path.clone(),
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                dir: path.is_dir(),
+                icon: self.icons.get(path).cloned().flatten(),
+            })
+            .collect()
     }
 
     #[cfg(target_os = "macos")]
-    fn render_list_row(
-        &self,
-        index: usize,
-        item: &Item,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let id = item.id;
-        let selected = self.selected == Some(id);
-        let (ink, quiet): (Hsla, Hsla) = if selected {
-            (rgb(0xffffff).into(), hsla(0., 0., 1., 0.8))
-        } else {
-            (rgb(palette().ink).into(), rgb(palette().quiet).into())
-        };
-        let icon = self
-            .icon(item)
-            .or_else(|| item.is_image().then(|| item.path.clone()));
-        let blank = [String::new(), String::new(), String::new()];
-        let [date, size, kind] = self.details.get(&item.path).unwrap_or(&blank).clone();
-        let row = div()
-            .id(("row", id as usize))
-            .flex_none()
-            .h(px(LIST_ROW))
-            .px(px(LIST_ROW_PAD))
-            .rounded(px(7.))
-            .when(selected, |this| this.bg(rgb(ACCENT)))
-            .when(!selected && index % 2 == 1, |this| {
-                this.bg(rgb(palette().stripe))
+    fn render_column(&self, depth: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entries = self.column_entries(depth);
+        let chosen = self.trail.get(depth).cloned();
+        // The last column with a pick is the one the keyboard is in: it gets the accent color.
+        let active = depth + 1 == self.trail.len();
+        let empty = entries.is_empty() && depth == 0 && self.doc.items.is_empty();
+        let rows: Vec<gpui::AnyElement> = entries
+            .into_iter()
+            .map(|entry| {
+                let picked = entry.id.is_some_and(|id| self.is_picked(id));
+                let here = chosen.as_ref() == Some(&entry.path);
+                let on = picked || (here && active);
+                let dim = here && !active;
+                let (ink, quiet): (Hsla, Hsla) = if on {
+                    (rgb(0xffffff).into(), hsla(0., 0., 1., 0.8))
+                } else {
+                    (rgb(palette().ink).into(), rgb(palette().quiet).into())
+                };
+                let path = entry.path.clone();
+                let id = entry.id;
+                let row = div()
+                    .id(SharedString::from(format!("col-{depth}-{}", entry.name)))
+                    .flex_none()
+                    .h(px(LIST_ROW))
+                    .px(px(LIST_ROW_PAD))
+                    .rounded(px(7.))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .when(on, |this| this.bg(rgb(ACCENT)))
+                    .when(dim, |this| this.bg(rgb(palette().pressed)))
+                    .when(!on && !dim, |this| match id {
+                        Some(id) => this.children(self.row_hover(id)),
+                        None => this.hover(|style| style.bg(rgb(palette().stripe))),
+                    })
+                    .when(
+                        id.is_some_and(|id| self.doc.item(id).is_some_and(|item| !item.exists())),
+                        |this| this.opacity(0.4),
+                    )
+                    .on_hover(cx.listener(move |this, inside: &bool, _, cx| {
+                        if let Some(id) = id {
+                            this.hover_row(id, *inside, cx);
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(id) = id {
+                                this.on_item_mouse_down(id, event, window, cx);
+                            } else {
+                                window.focus(&this.focus);
+                                this.selected = None;
+                                this.picked.clear();
+                                if event.click_count >= 2 {
+                                    cx.open_with_system(&path);
+                                }
+                            }
+                            this.pick_in_column(depth, path.clone());
+                            cx.notify();
+                        }),
+                    )
+                    .child(match entry.icon {
+                        Some(icon) => img(icon)
+                            .flex_none()
+                            .size(px(LIST_ICON))
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        None => div().flex_none().size(px(LIST_ICON)).into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(ink)
+                            .child(entry.name),
+                    )
+                    .when(entry.dir, |this| {
+                        this.child(div().flex_none().text_color(quiet).child("\u{203a}"))
+                    });
+                row.into_any_element()
             })
-            .relative()
-            .when(!selected, |this| this.children(self.row_hover(id)))
-            .when(!item.exists(), |this| this.opacity(0.4))
-            .on_hover(
-                cx.listener(move |this, inside: &bool, _, cx| this.hover_row(id, *inside, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event, window, cx| {
-                    this.on_item_mouse_down(id, event, window, cx)
-                }),
-            );
-        list_columns(
-            row,
+            .collect();
+        let column = div()
+            .id(("column", depth))
+            .flex_none()
+            .w(px(COLUMN_WIDTH))
+            .h_full()
+            .border_r_1()
+            .border_color(rgb(palette().hairline))
+            .px(px(LIST_SIDE))
+            .pt(px(6.))
+            // Room for the last rows to scroll out from under the add button.
+            .pb(px((layout::ADD + layout::ADD_MARGIN * 2.) as f32))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .when(empty, |this| this.child(empty_hint()))
+            .children(rows);
+        if depth == 0 {
+            column
+                .track_scroll(&self.column_scroll)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        window.focus(&this.focus);
+                        this.trail.clear();
+                        this.start_marquee(event.position, cx);
+                    }),
+                )
+                .into_any_element()
+        } else {
+            column.into_any_element()
+        }
+    }
+
+    /// The last column: the file's icon large, with its name and details.
+    #[cfg(target_os = "macos")]
+    fn render_preview(&self, path: &Path) -> gpui::AnyElement {
+        let [date, size, kind] = file_details(path);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let line = |label: &'static str, value: String| {
             div()
                 .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(match icon {
-                    Some(path) => img(path)
-                        .flex_none()
-                        .size(px(LIST_ICON))
-                        .object_fit(ObjectFit::Contain)
-                        .into_any_element(),
-                    None => div().flex_none().size(px(LIST_ICON)).into_any_element(),
+                .justify_between()
+                .gap(px(12.))
+                .child(div().text_color(rgb(palette().quiet)).child(label))
+                .child(div().text_color(rgb(palette().ink)).child(value))
+        };
+        div()
+            .id("preview")
+            .flex_none()
+            .w(px(COLUMN_WIDTH + 40.))
+            .h_full()
+            .p(px(20.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(14.))
+            .child(match self.icons.get(path).cloned().flatten() {
+                Some(icon) => img(icon)
+                    .size(px(ICON_SIZE * 1.5))
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                None => div().size(px(ICON_SIZE * 1.5)).into_any_element(),
+            })
+            .child(
+                div()
+                    .text_color(rgb(palette().ink))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .child(line("Kind", kind))
+                    .child(line("Size", size))
+                    .child(line("Modified", date)),
+            )
+            .into_any_element()
+    }
+
+    /// Picks `path` in column `depth`: the columns after it are replaced, by the folder's
+    /// contents when it is one.
+    #[cfg(target_os = "macos")]
+    fn pick_in_column(&mut self, depth: usize, path: PathBuf) {
+        self.trail.truncate(depth);
+        if path.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
                 })
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(ink)
-                        .child(item.name()),
-                ),
-            div().truncate().text_color(quiet).child(date),
-            div().text_color(quiet).child(size),
-            div().truncate().text_color(quiet).child(kind),
-        )
-        .with_animation(
-            ("row-appear", id as usize),
-            Animation::new(Duration::from_millis(260 + 20 * index.min(12) as u64))
-                .with_easing(ease_out_quint()),
-            |this, t| this.opacity(t),
-        )
+                .collect();
+            entries.sort_by_key(|path| path.file_name().map(|name| name.to_ascii_lowercase()));
+            entries.truncate(COLUMN_LIMIT);
+            for entry in &entries {
+                self.icons
+                    .entry(entry.clone())
+                    .or_insert_with_key(|path| finder_icon_file(path));
+            }
+            self.listings.insert(path.clone(), entries);
+        } else {
+            self.icons
+                .entry(path.clone())
+                .or_insert_with_key(|path| finder_icon_file(path));
+        }
+        self.trail.push(path);
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("list")
             .absolute()
@@ -1453,8 +1710,9 @@ impl BoxView {
                         ),
                     )
                     .child(
-                        mode_button("mode-list", "icons/list.svg", Mode::List)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::List, cx))),
+                        mode_button("mode-list", "icons/list.svg", Mode::Columns).on_click(
+                            cx.listener(|this, _, _, cx| this.set_mode(Mode::Columns, cx)),
+                        ),
                     ),
             )
             .child(
@@ -1520,7 +1778,25 @@ impl Render for BoxView {
             }))
             .map(|this| match self.mode {
                 Mode::Canvas => this.child(self.render_canvas(cx)),
-                Mode::List => this.child(self.render_list(cx)),
+                Mode::Columns => this.child(self.render_columns(cx)),
+            })
+            .when_some(self.marquee, |this, marquee| {
+                let (left, top) = (
+                    marquee.start.x.min(marquee.now.x),
+                    marquee.start.y.min(marquee.now.y),
+                );
+                this.child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(marquee.start.x.max(marquee.now.x) - left)
+                        .h(marquee.start.y.max(marquee.now.y) - top)
+                        .rounded(px(2.))
+                        .border_1()
+                        .border_color(hsla(216. / 360., 0.92, 0.57, 0.8))
+                        .bg(hsla(216. / 360., 0.92, 0.57, 0.12)),
+                )
             });
         #[cfg(not(target_os = "macos"))]
         let root = root.child(self.render_top_bar(cx));
@@ -1715,24 +1991,6 @@ fn file_details(path: &Path) -> [String; 3] {
     [date, size, kind]
 }
 
-/// Lays out a list row's cells in Finder's columns: the name takes the room left.
-#[cfg(target_os = "macos")]
-fn list_columns(
-    row: impl IntoElement + ParentElement + Styled,
-    name: impl IntoElement + Styled,
-    date: impl IntoElement + Styled,
-    size: impl IntoElement + Styled,
-    kind: impl IntoElement + Styled,
-) -> impl IntoElement + ParentElement + Styled {
-    row.flex()
-        .items_center()
-        .gap(px(16.))
-        .child(name.flex_1().min_w_0())
-        .child(date.flex_none().w(px(170.)))
-        .child(size.flex_none().w(px(72.)))
-        .child(kind.flex_none().w(px(150.)))
-}
-
 fn card_face(item: &Item, selected: bool, lifted: bool, scale: f32) -> gpui::Div {
     let border: Hsla = if selected {
         rgb(ACCENT).into()
@@ -1894,7 +2152,7 @@ fn avatar_path() -> Option<PathBuf> {
 fn default_mode() -> Mode {
     #[cfg(target_os = "macos")]
     if ambry_macos::settings::opens_in_list() {
-        return Mode::List;
+        return Mode::Columns;
     }
     Mode::Canvas
 }

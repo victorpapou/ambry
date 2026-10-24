@@ -737,7 +737,10 @@ impl WindowToolbar {
         // Canvas and list: the tab strip of a real NSTabView, which is the control that lifts
         // the glass bubble while pressed. The strip alone goes in the toolbar; the tab view
         // stays out of the window and keeps driving it.
-        let images = icon_images(&[("squareshape.split.3x3", "Canvas"), ("list.bullet", "List")])?;
+        let images = icon_images(&[
+            ("squareshape.split.3x3", "Canvas"),
+            ("rectangle.split.3x1", "Columns"),
+        ])?;
         let tabs = icon_tab_view(mtm, images.len(), &images, 0.);
         let strip = segments(&tabs)?;
         strip.removeFromSuperview();
