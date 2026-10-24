@@ -9,10 +9,11 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSBezelStyle, NSButton, NSColor, NSControlBorderShape,
-    NSControlSize, NSFont, NSGlassEffectView, NSImage, NSImageScaling, NSImageView,
-    NSSegmentedControl, NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate,
-    NSTabViewItem, NSTextAlignment, NSTextField, NSView,
+    NSAnimatablePropertyContainer, NSBezelStyle, NSButton, NSClickGestureRecognizer, NSColor,
+    NSControl, NSControlBorderShape, NSControlSize, NSFont, NSGestureRecognizer,
+    NSGestureRecognizerState, NSGlassEffectView, NSImage, NSImageScaling, NSImageView,
+    NSPressGestureRecognizer, NSResponder, NSSegmentedControl, NSTabPosition, NSTabView,
+    NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -78,6 +79,54 @@ impl Target {
         });
         unsafe { msg_send![super(this), init] }
     }
+}
+
+define_class!(
+    // An icon that lets clicks through to the glass under it, so the glass lifts its bubble.
+    #[unsafe(super(NSImageView, NSControl, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryPassiveImageView"]
+    struct PassiveImageView;
+
+    impl PassiveImageView {
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
+            None
+        }
+    }
+);
+
+/// An SF Symbol centred in a `size` frame that takes no clicks.
+fn passive_icon(
+    mtm: MainThreadMarker,
+    image: &NSImage,
+    size: NSSize,
+    tooltip: &str,
+) -> Retained<NSImageView> {
+    let view: Retained<PassiveImageView> = unsafe {
+        msg_send![PassiveImageView::alloc(mtm), initWithFrame: NSRect::new(NSPoint::new(0., 0.), size)]
+    };
+    let view: Retained<NSImageView> = Retained::into_super(view);
+    view.setImage(Some(image));
+    view.setImageScaling(NSImageScaling::ScaleNone);
+    view.setToolTip(Some(&NSString::from_str(tooltip)));
+    view
+}
+
+/// Makes the glass lift and lens under the pointer while it is pressed, as system glass
+/// controls do. AppKit has no public switch for this yet; the private one is skipped when
+/// missing.
+fn make_interactive(glass: &NSGlassEffectView) {
+    if glass.respondsToSelector(sel!(setEffectIsInteractive:)) {
+        unsafe {
+            let _: () = msg_send![glass, setEffectIsInteractive: objc2::runtime::Bool::YES];
+        }
+    }
+}
+
+/// The state of `recognizer`; the getter is missing from the bindings.
+fn gesture_state(recognizer: &NSGestureRecognizer) -> NSGestureRecognizerState {
+    NSGestureRecognizerState(unsafe { msg_send![recognizer, state] })
 }
 
 struct Hosted {
@@ -504,10 +553,12 @@ pub(crate) fn icon_images(icons: &[(&str, &str)]) -> Option<Vec<Retained<NSImage
         .collect()
 }
 
-/// A round Liquid Glass button with an SF Symbol.
+/// A round Liquid Glass button with an SF Symbol that lifts a bubble while pressed.
 pub struct GlassButton {
     native: NativeView,
-    button: Retained<NSButton>,
+    root: Retained<NSView>,
+    glass: Option<Retained<NSGlassEffectView>>,
+    button: Option<Retained<NSButton>>,
 }
 
 impl GlassButton {
@@ -524,21 +575,43 @@ impl GlassButton {
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
         let target = Target::new(mtm, move |_| on_click());
         let image = symbol(symbol_name, tooltip)?;
+        let bounds = NSRect::new(NSPoint::new(0., 0.), NSSize::new(size, size));
+        if has_liquid_glass() {
+            let icon = passive_icon(mtm, &image, bounds.size, tooltip);
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
+            glass.setCornerRadius(size / 2.);
+            glass.setContentView(Some(&icon));
+            make_interactive(&glass);
+            let click = unsafe {
+                NSClickGestureRecognizer::initWithTarget_action(
+                    NSClickGestureRecognizer::alloc(mtm),
+                    Some(&target),
+                    Some(sel!(fire:)),
+                )
+            };
+            click.setDelaysPrimaryMouseButtonEvents(false);
+            glass.addGestureRecognizer(&click);
+            let root: Retained<NSView> = Retained::into_super(glass.clone());
+            return Some(Self {
+                native: NativeView::host(parent, root.clone(), target),
+                root,
+                glass: Some(glass),
+                button: None,
+            });
+        }
         let button = unsafe {
             NSButton::buttonWithImage_target_action(&image, Some(&target), Some(sel!(fire:)), mtm)
         };
         button.setControlSize(NSControlSize::Large);
-        button.setBezelStyle(if has_liquid_glass() {
-            NSBezelStyle::Glass
-        } else {
-            NSBezelStyle::Circular
-        });
+        button.setBezelStyle(NSBezelStyle::Circular);
         button.setToolTip(Some(&NSString::from_str(tooltip)));
-        button.setFrameSize(NSSize::new(size, size));
-        let view: Retained<NSView> = Retained::into_super(Retained::into_super(button.clone()));
+        button.setFrameSize(bounds.size);
+        let root: Retained<NSView> = Retained::into_super(Retained::into_super(button.clone()));
         Some(Self {
-            native: NativeView::host(parent, view, target),
-            button,
+            native: NativeView::host(parent, root.clone(), target),
+            root,
+            glass: None,
+            button: Some(button),
         })
     }
 
@@ -548,32 +621,63 @@ impl GlassButton {
 
     /// Tints the glass with `(white, alpha)`.
     pub fn set_tint(&self, tint: Option<(f64, f64)>) {
-        self.button.setBezelColor(tint_color(tint).as_deref());
+        let color = tint_color(tint);
+        if let Some(glass) = &self.glass {
+            glass.setTintColor(color.as_deref());
+        }
+        if let Some(button) = &self.button {
+            button.setBezelColor(color.as_deref());
+        }
     }
 
     /// The button and its insides, by name, for [`crate::probe::run`].
     pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
-        let mut targets = vec![("button-root".to_string(), object(self.button.clone()))];
-        if let Some(cell) = self.button.cell() {
-            targets.push(("button-cell".into(), object(cell)));
-        }
-        if let Some(hosting) = self.button.subviews().firstObject() {
-            targets.push(("button-hosting".into(), object(hosting)));
-        }
-        targets
+        vec![("button-root".to_string(), object(self.root.clone()))]
     }
 }
 
-/// Icon tabs on one Liquid Glass capsule, the same glass as [`GlassAvatar`], with a grey pill
-/// behind the selected tab that slides when the selection changes.
+/// Icon tabs on one Liquid Glass capsule, the same glass as [`GlassButton`], with a grey pill
+/// behind the selected tab. The capsule lifts a bubble while pressed, and the pill follows
+/// the pointer until it is let go.
 pub struct GlassTabs {
     native: NativeView,
     glass: Option<Retained<NSGlassEffectView>>,
     pill: Retained<NSView>,
-    buttons: Vec<Retained<NSButton>>,
+    icons: Vec<Retained<NSImageView>>,
+    state: Rc<TabsState>,
+}
+
+struct TabsState {
+    pill: Retained<NSView>,
+    count: usize,
     item_width: f64,
+    height: f64,
     selected: Cell<usize>,
-    pill_tint: Cell<(f64, f64)>,
+    /// Where the pill is: under the pointer while pressed, else on the selected tab.
+    shown: Cell<usize>,
+}
+
+impl TabsState {
+    fn place_pill(&self, index: usize, animated: bool) {
+        if self.shown.replace(index) == index && animated {
+            return;
+        }
+        let frame = NSRect::new(
+            NSPoint::new(PILL_INSET + index as f64 * self.item_width, PILL_INSET),
+            NSSize::new(self.item_width, self.height - PILL_INSET * 2.),
+        );
+        if animated {
+            self.pill.animator().setFrame(frame);
+        } else {
+            self.pill.setFrame(frame);
+        }
+    }
+
+    /// The tab under `x`, in the capsule's coordinates.
+    fn index_at(&self, x: f64) -> usize {
+        let index = ((x - PILL_INSET) / self.item_width).floor().max(0.) as usize;
+        index.min(self.count.saturating_sub(1))
+    }
 }
 
 /// Room between the capsule's edge and the selection pill.
@@ -594,11 +698,6 @@ impl GlassTabs {
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
-        let target = Target::new(mtm, move |sender| {
-            if let Some(button) = sender.downcast_ref::<NSButton>() {
-                on_select(button.tag().max(0) as usize);
-            }
-        });
         let width = icons.len() as f64 * item_width + PILL_INSET * 2.;
         let bounds = NSRect::new(NSPoint::new(0., 0.), NSSize::new(width, height));
         let content = NSView::initWithFrame(NSView::alloc(mtm), bounds);
@@ -610,49 +709,78 @@ impl GlassTabs {
         }
         content.addSubview(&pill);
 
-        let mut buttons = Vec::new();
+        let mut views = Vec::new();
         for (index, (name, description)) in icons.iter().enumerate() {
             let image = symbol(name, description)?;
-            let button = unsafe {
-                NSButton::buttonWithImage_target_action(
-                    &image,
-                    Some(&target),
-                    Some(sel!(fire:)),
-                    mtm,
-                )
-            };
-            button.setBordered(false);
-            button.setToolTip(Some(&NSString::from_str(description)));
-            button.setTag(index as isize);
-            button.setFrame(NSRect::new(
-                NSPoint::new(PILL_INSET + index as f64 * item_width, 0.),
-                NSSize::new(item_width, height),
-            ));
-            content.addSubview(&button);
-            buttons.push(button);
+            let icon = passive_icon(mtm, &image, NSSize::new(item_width, height), description);
+            icon.setFrameOrigin(NSPoint::new(PILL_INSET + index as f64 * item_width, 0.));
+            content.addSubview(&icon);
+            views.push(icon);
         }
+
+        let state = Rc::new(TabsState {
+            pill: pill.clone(),
+            count: icons.len(),
+            item_width,
+            height,
+            selected: Cell::new(0),
+            shown: Cell::new(0),
+        });
+        let target = Target::new(mtm, {
+            let state = state.clone();
+            move |sender| {
+                let Some(press) = sender.downcast_ref::<NSGestureRecognizer>() else {
+                    return;
+                };
+                let Some(view) = press.view() else { return };
+                let index = state.index_at(press.locationInView(Some(&view)).x);
+                match gesture_state(press) {
+                    NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed => {
+                        state.place_pill(index, true);
+                    }
+                    NSGestureRecognizerState::Ended => {
+                        state.place_pill(index, true);
+                        if state.selected.replace(index) != index {
+                            on_select(index);
+                        }
+                    }
+                    _ => state.place_pill(state.selected.get(), true),
+                }
+            }
+        });
 
         let glass = has_liquid_glass().then(|| {
             let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
             glass.setCornerRadius(height / 2.);
             glass.setContentView(Some(&content));
+            make_interactive(&glass);
             glass
         });
         let view: Retained<NSView> = match &glass {
             Some(glass) => Retained::into_super(glass.clone()),
             None => content,
         };
+        let press = unsafe {
+            NSPressGestureRecognizer::initWithTarget_action(
+                NSPressGestureRecognizer::alloc(mtm),
+                Some(&target),
+                Some(sel!(fire:)),
+            )
+        };
+        press.setMinimumPressDuration(0.);
+        press.setAllowableMovement(10_000.);
+        press.setDelaysPrimaryMouseButtonEvents(false);
+        view.addGestureRecognizer(&press);
+
         let tabs = Self {
             native: NativeView::host(parent, view, target),
             glass,
             pill,
-            buttons,
-            item_width,
-            selected: Cell::new(0),
-            pill_tint: Cell::new((0., 0.08)),
+            icons: views,
+            state,
         };
-        tabs.place_pill(false);
-        tabs.paint();
+        tabs.state.place_pill(0, false);
+        tabs.set_pill_tint((0., 0.08));
         Some(tabs)
     }
 
@@ -662,15 +790,17 @@ impl GlassTabs {
 
     /// Moves the pill to tab `index`.
     pub fn select(&self, index: usize) {
-        if self.selected.replace(index) != index {
-            self.place_pill(true);
+        if self.state.selected.replace(index) != index {
+            self.state.place_pill(index, true);
         }
     }
 
     /// The pill's color as `(white, alpha)`, set per appearance by the caller.
-    pub fn set_pill_tint(&self, tint: (f64, f64)) {
-        self.pill_tint.set(tint);
-        self.paint();
+    pub fn set_pill_tint(&self, (white, alpha): (f64, f64)) {
+        if let Some(layer) = self.pill.layer() {
+            let color = NSColor::colorWithWhite_alpha(white, alpha).CGColor();
+            layer.setBackgroundColor(Some(&color));
+        }
     }
 
     /// Tints the capsule's glass with `(white, alpha)`.
@@ -680,41 +810,14 @@ impl GlassTabs {
         }
     }
 
-    fn place_pill(&self, animated: bool) {
-        let Some(button) = self.buttons.first() else {
-            return;
-        };
-        let height = button.frame().size.height - PILL_INSET * 2.;
-        let frame = NSRect::new(
-            NSPoint::new(
-                PILL_INSET + self.selected.get() as f64 * self.item_width,
-                PILL_INSET,
-            ),
-            NSSize::new(self.item_width, height),
-        );
-        if animated {
-            self.pill.animator().setFrame(frame);
-        } else {
-            self.pill.setFrame(frame);
-        }
-    }
-
-    fn paint(&self) {
-        let (white, alpha) = self.pill_tint.get();
-        if let Some(layer) = self.pill.layer() {
-            let color = NSColor::colorWithWhite_alpha(white, alpha).CGColor();
-            layer.setBackgroundColor(Some(&color));
-        }
-    }
-
-    /// The glass, the pill and the buttons, by name, for [`crate::probe::run`].
+    /// The glass, the pill and the icons, by name, for [`crate::probe::run`].
     pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
         let mut targets = vec![("pill".to_string(), object(self.pill.clone()))];
         if let Some(glass) = &self.glass {
             targets.push(("tabs-root".to_string(), object(glass.clone())));
         }
-        for (index, button) in self.buttons.iter().enumerate() {
-            targets.push((format!("b{index}"), object(button.clone())));
+        for (index, icon) in self.icons.iter().enumerate() {
+            targets.push((format!("b{index}"), object(icon.clone())));
         }
         targets
     }
