@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -27,7 +28,7 @@ use objc2_foundation::{
     NSArray, NSCopying, NSMutableArray, NSNotification, NSNumber, NSPoint, NSRect, NSRectEdge,
     NSSize, NSString, NSURL,
 };
-use objc2_quartz_core::{CALayer, CAMediaTimingFunction, CATransaction};
+use objc2_quartz_core::{CALayer, CAMediaTimingFunction, CATransaction, CATransform3DIdentity};
 
 use crate::box_list::BoxList;
 use crate::icon_picker::IconPicker;
@@ -52,8 +53,12 @@ const SWEEP: f64 = 1.6;
 const SWEEP_LEAN: f64 = 30.;
 const CHEVRON_SIZE: f64 = 12.;
 /// Room the chevron takes after the name when it shows.
-const CHEVRON_GAP: f64 = 5.;
+const CHEVRON_GAP: f64 = 3.;
+/// How far under the account button its menu opens.
+const MENU_GAP: f64 = 10.;
 const CHEVRON_DURATION: f64 = 0.2;
+/// How soon after the box list closes a press on the name is the one that closed it.
+const REOPEN_GUARD: Duration = Duration::from_millis(250);
 /// Blur radius the chevron comes out of, and the clear room around it the blur draws into.
 const CHEVRON_BLUR: f64 = 3.;
 const CHEVRON_PAD: f64 = 6.;
@@ -171,27 +176,83 @@ fn ids() -> Retained<NSArray<NSToolbarItemIdentifier>> {
 }
 
 define_class!(
-    // Hears a popover close.
+    // Hears a popover start to open and start to close.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "AmbryPopoverWatcher"]
-    #[ivars = Box<dyn Fn()>]
+    #[ivars = Box<dyn Fn(bool)>]
     struct PopoverWatcher;
 
     unsafe impl NSObjectProtocol for PopoverWatcher {}
 
     unsafe impl NSPopoverDelegate for PopoverWatcher {
-        #[unsafe(method(popoverDidClose:))]
-        fn did_close(&self, _notification: &NSNotification) {
-            (self.ivars())();
+        #[unsafe(method(popoverWillShow:))]
+        fn will_show(&self, _notification: &NSNotification) {
+            (self.ivars())(true);
+        }
+
+        #[unsafe(method(popoverWillClose:))]
+        fn will_close(&self, _notification: &NSNotification) {
+            (self.ivars())(false);
         }
     }
 );
 
 impl PopoverWatcher {
-    fn new(mtm: MainThreadMarker, on_close: impl Fn() + 'static) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Box::new(on_close) as Box<dyn Fn()>);
+    /// `on_change` hears whether the popover is open, the moment that changes.
+    fn new(mtm: MainThreadMarker, on_change: impl Fn(bool) + 'static) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Box::new(on_change) as Box<dyn Fn(bool)>);
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+define_class!(
+    // The chevron's image view. AppKit pins a view's layer on its corner again whenever it
+    // lays the view out, so the turn is put back after every layout from the state it is
+    // bound to, instead of being set once.
+    #[unsafe(super(NSImageView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryChevron"]
+    #[ivars = Cell<bool>]
+    struct ChevronView;
+
+    impl ChevronView {
+        #[unsafe(method(layout))]
+        fn layout(&self) {
+            unsafe {
+                let _: () = msg_send![super(self), layout];
+            }
+            self.pin();
+        }
+    }
+);
+
+impl ChevronView {
+    /// Whether the chevron points up, and whether that just changed.
+    fn set_up(&self, up: bool) -> bool {
+        self.ivars().replace(up) != up
+    }
+
+    /// Spins about the middle, pointing where the state says.
+    fn pin(&self) {
+        let Some(layer) = self.layer() else {
+            return;
+        };
+        let frame = self.frame();
+        let angle = if self.ivars().get() {
+            std::f64::consts::PI
+        } else {
+            0.
+        };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        layer.setAnchorPoint(NSPoint::new(0.5, 0.5));
+        layer.setPosition(NSPoint::new(
+            frame.origin.x + frame.size.width / 2.,
+            frame.origin.y + frame.size.height / 2.,
+        ));
+        layer.setTransform(unsafe { CATransform3DIdentity }.rotate(angle, 0., 0., 1.));
+        CATransaction::commit();
     }
 }
 
@@ -202,10 +263,12 @@ struct State {
     current: Cell<Option<usize>>,
     tile: Retained<NSView>,
     glyph: Retained<NSImageView>,
-    name: Retained<NSButton>,
+    name: Retained<NSTextField>,
     picker: Rc<IconPicker>,
     list: BoxList,
     chevron: Chevron,
+    /// When the box list last started to close.
+    list_closed: Cell<Option<Instant>>,
 }
 
 impl State {
@@ -227,6 +290,15 @@ impl State {
             self.list.close();
             return;
         }
+        // The press that closes a transient popover reaches the name too: it closed the list
+        // a moment ago, and must not open it again.
+        if self
+            .list_closed
+            .get()
+            .is_some_and(|closed| closed.elapsed() < REOPEN_GUARD)
+        {
+            return;
+        }
         let mtm = MainThreadMarker::from(&*self.name);
         self.list.show(
             mtm,
@@ -235,7 +307,6 @@ impl State {
             self.current.get(),
             self.on_event.clone(),
         );
-        self.chevron.update(true);
     }
 }
 
@@ -302,21 +373,22 @@ fn fit_sweep(label: &NSTextField) {
 /// The chevron after the box's name: it comes out of a blur while the pointer is over the
 /// name or the box list is open, pushing the status aside.
 struct Chevron {
-    image: Retained<NSImageView>,
+    image: Retained<ChevronView>,
     width: Retained<NSLayoutConstraint>,
     /// Width of the empty view after the status, which gives the chevron its room.
     spare: Retained<NSLayoutConstraint>,
     open_width: f64,
     inside: Cell<bool>,
     shown: Cell<bool>,
-    /// Turned to point up while the box list is open.
-    turned: Cell<bool>,
+    /// Whether the box list is open, as its popover last reported: the chevron points up
+    /// while it is.
+    open: Cell<bool>,
 }
 
 impl Chevron {
-    fn update(&self, list_shown: bool) {
-        self.turn(list_shown);
-        let show = self.inside.get() || list_shown;
+    fn update(&self) {
+        self.turn(self.open.get());
+        let show = self.inside.get() || self.open.get();
         if self.shown.replace(show) == show {
             return;
         }
@@ -358,19 +430,13 @@ impl Chevron {
 
     /// Turns the chevron up while the list is open and back down after.
     fn turn(&self, up: bool) {
-        if self.turned.replace(up) == up {
+        if !self.image.set_up(up) {
             return;
         }
         let Some(layer) = self.image.layer() else {
             return;
         };
-        // Spin about the middle: AppKit pins a view's layer at its corner.
-        let frame = self.image.frame();
-        layer.setAnchorPoint(NSPoint::new(0.5, 0.5));
-        layer.setPosition(NSPoint::new(
-            frame.origin.x + frame.size.width / 2.,
-            frame.origin.y + frame.size.height / 2.,
-        ));
+        self.image.pin();
         let (from, to) = if up {
             (0., std::f64::consts::PI)
         } else {
@@ -467,11 +533,10 @@ impl WindowToolbar {
         tile.addSubview(&glyph);
 
         let title_font = NSFont::systemFontOfSize(TITLE_SIZE);
-        let name =
-            unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
-        name.setBordered(false);
+        // A label, not a button: a button pads its title by several points on each side.
+        let name = NSTextField::labelWithString(&NSString::new(), mtm);
         name.setFont(Some(&title_font));
-        name.setContentTintColor(Some(&NSColor::labelColor()));
+        name.setTextColor(Some(&NSColor::labelColor()));
         name.setToolTip(Some(&NSString::from_str("Switch box")));
 
         // The chevron is smaller than the name and a step heavier, so its strokes come out as
@@ -489,7 +554,10 @@ impl WindowToolbar {
             .map_or(NSSize::new(10., 10.), |image| image.size());
         // The chevron sits on a clear square with room for its blur, turning about its middle.
         let side = chevron_size.width.max(chevron_size.height) + CHEVRON_PAD * 2.;
-        let chevron = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
+        let chevron: Retained<ChevronView> = unsafe {
+            let this = ChevronView::alloc(mtm).set_ivars(Cell::new(false));
+            msg_send![super(this), initWithFrame: NSRect::ZERO]
+        };
         chevron.setImage(
             chevron_image
                 .as_deref()
@@ -561,7 +629,7 @@ impl WindowToolbar {
             mtm,
         );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        stack.setSpacing(10.);
+        stack.setSpacing(8.);
         stack.setCustomSpacing_afterView(0., &name);
         stack.setCustomSpacing_afterView(0., &status);
         // Shortcuts keeps its icon 16 points from the traffic lights.
@@ -588,8 +656,9 @@ impl WindowToolbar {
                 open_width,
                 inside: Cell::new(false),
                 shown: Cell::new(false),
-                turned: Cell::new(false),
+                open: Cell::new(false),
             },
+            list_closed: Cell::new(None),
         });
 
         let hover = Hover::new(mtm, {
@@ -597,7 +666,7 @@ impl WindowToolbar {
             move |inside| {
                 if let Some(state) = state.upgrade() {
                     state.chevron.inside.set(inside);
-                    state.chevron.update(state.list.popover.isShown());
+                    state.chevron.update();
                 }
             }
         });
@@ -615,9 +684,13 @@ impl WindowToolbar {
         name.addTrackingArea(&tracking);
         let list_watcher = PopoverWatcher::new(mtm, {
             let state = Rc::downgrade(&state);
-            move || {
+            move |open| {
                 if let Some(state) = state.upgrade() {
-                    state.chevron.update(false);
+                    if !open {
+                        state.list_closed.set(Some(Instant::now()));
+                    }
+                    state.chevron.open.set(open);
+                    state.chevron.update();
                 }
             }
         });
@@ -642,10 +715,14 @@ impl WindowToolbar {
             let state = state.clone();
             move |_| state.toggle_boxes()
         });
-        unsafe {
-            name.setTarget(Some(&name_target));
-            name.setAction(Some(sel!(fire:)));
-        }
+        let name_click = unsafe {
+            NSClickGestureRecognizer::initWithTarget_action(
+                NSClickGestureRecognizer::alloc(mtm),
+                Some(&name_target),
+                Some(sel!(fire:)),
+            )
+        };
+        name.addGestureRecognizer(&name_click);
 
         let box_item = item(mtm, BOX, "Box");
         box_item.setView(Some(&stack));
@@ -654,7 +731,7 @@ impl WindowToolbar {
         // Canvas and list: the tab strip of a real NSTabView, which is the control that lifts
         // the glass bubble while pressed. The strip alone goes in the toolbar; the tab view
         // stays out of the window and keeps driving it.
-        let images = icon_images(&[("number", "Canvas"), ("list.bullet", "List")])?;
+        let images = icon_images(&[("squareshape.split.3x3", "Canvas"), ("list.bullet", "List")])?;
         let tabs = icon_tab_view(mtm, images.len(), &images, 0.);
         let strip = segments(&tabs)?;
         strip.removeFromSuperview();
@@ -689,14 +766,18 @@ impl WindowToolbar {
             let targets = menu_targets.clone();
             move |sender| {
                 if let Some(button) = sender.downcast_ref::<NSButton>() {
-                    account_menu(mtm, &targets).popUpMenuPositioningItem_atLocation_inView(
+                    // Under the button, a little way down, with the menu's right edge on
+                    // the button's right edge.
+                    let menu = account_menu(mtm, &targets);
+                    let bounds = button.bounds();
+                    menu.popUpMenuPositioningItem_atLocation_inView(
                         None,
                         NSPoint::new(
-                            0.,
+                            bounds.size.width - menu.size().width,
                             if button.isFlipped() {
-                                button.bounds().size.height + 6.
+                                bounds.size.height + MENU_GAP
                             } else {
-                                -6.
+                                -MENU_GAP
                             },
                         ),
                         Some(button),
@@ -759,7 +840,9 @@ impl WindowToolbar {
         );
         paint_tile(&state.tile, &label.color, TILE, 6.);
         state.picker.mark(&label.color, &label.symbol);
-        self.state.name.setTitle(&NSString::from_str(&label.name));
+        self.state
+            .name
+            .setStringValue(&NSString::from_str(&label.name));
         self.status.setStringValue(&NSString::from_str(status));
         fit_sweep(&self.status);
     }

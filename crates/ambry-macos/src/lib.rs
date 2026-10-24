@@ -33,6 +33,8 @@ mod table;
 mod tilt;
 #[cfg(target_os = "macos")]
 mod toolbar;
+#[cfg(target_os = "macos")]
+mod zoom;
 
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
@@ -49,6 +51,8 @@ pub use soft_edge::SoftEdge;
 pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]
 pub use toolbar::{BoxLabel, ToolbarEvent, WindowToolbar};
+#[cfg(target_os = "macos")]
+pub use zoom::PinchZoom;
 
 /// Titlebar geometry in points, shared by the native and the GPUI-drawn controls.
 pub mod layout {
@@ -59,8 +63,9 @@ pub mod layout {
     pub const GAP_BEFORE_AVATAR: f64 = 16.;
     /// Height of the band the controls sit in; the list starts under it.
     pub const BAR: f64 = 54.;
-    /// The blur behind the toolbar, fading out toward the content.
-    pub const TOOLBAR_BLUR: f64 = 60.;
+    /// The shade behind the toolbar: its solid half covers the toolbar, the rest fades out
+    /// toward the content.
+    pub const TOOLBAR_BLUR: f64 = 108.;
     /// The add button, and its distance from the window's bottom and right edges.
     pub const ADD: f64 = 36.;
     pub const ADD_MARGIN: f64 = 20.;
