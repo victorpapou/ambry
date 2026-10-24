@@ -118,6 +118,13 @@ impl BoxDoc {
     }
 }
 
+/// `~/Library/Application Support/Ambry` on macOS.
+pub fn data_dir() -> Result<PathBuf> {
+    Ok(dirs::data_dir()
+        .context("no data directory on this system")?
+        .join("Ambry"))
+}
+
 /// Reads and writes a box as pretty JSON.
 pub struct Store {
     path: PathBuf,
@@ -130,10 +137,7 @@ impl Store {
 
     /// `~/Library/Application Support/Ambry/boxes/<file_name>.json` on macOS.
     pub fn in_data_dir(file_name: &str) -> Result<Self> {
-        let dir = dirs::data_dir()
-            .context("no data directory on this system")?
-            .join("Ambry")
-            .join("boxes");
+        let dir = data_dir()?.join("boxes");
         Ok(Self::new(dir.join(format!("{file_name}.json"))))
     }
 

@@ -7,8 +7,14 @@ use gpui::{AssetSource, SharedString};
 pub struct Assets;
 
 const ICONS: &[(&str, &[u8])] = &[
-    ("icons/folder.svg", include_bytes!("../assets/icons/folder.svg")),
-    ("icons/frame.svg", include_bytes!("../assets/icons/frame.svg")),
+    (
+        "icons/folder.svg",
+        include_bytes!("../assets/icons/folder.svg"),
+    ),
+    (
+        "icons/frame.svg",
+        include_bytes!("../assets/icons/frame.svg"),
+    ),
     ("icons/list.svg", include_bytes!("../assets/icons/list.svg")),
     ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
 ];

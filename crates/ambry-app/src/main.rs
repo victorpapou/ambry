@@ -3,8 +3,8 @@ mod box_view;
 
 use ambry_core::{BoxDoc, Store};
 use gpui::{
-    App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
-    point, px, size,
+    App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point,
+    px, size,
 };
 
 use crate::box_view::BoxView;
