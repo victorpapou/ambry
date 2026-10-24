@@ -113,18 +113,8 @@ impl Toolbar {
         add.setToolTip(Some(&NSString::from_str("Add files or folders")));
 
         let width = segments_size.width + GAP + HEIGHT;
-        let x = INSET + AVATAR + GAP_AFTER_AVATAR;
-        let y = if parent.isFlipped() {
-            parent.bounds().size.height - INSET - HEIGHT
-        } else {
-            INSET
-        };
-        let root = NSView::initWithFrame(NSView::alloc(mtm), rect(x, y, width, HEIGHT));
-        root.setAutoresizingMask(if parent.isFlipped() {
-            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMinYMargin
-        } else {
-            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMaxYMargin
-        });
+        let root = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., width, HEIGHT));
+        pin_bottom_left(parent, &root, INSET + AVATAR + GAP_AFTER_AVATAR, INSET);
         segments.setFrame(rect(
             0.,
             ((HEIGHT - segments_size.height) / 2.).max(0.),
@@ -134,8 +124,6 @@ impl Toolbar {
         add.setFrame(rect(segments_size.width + GAP, 0., HEIGHT, HEIGHT));
         root.addSubview(&segments);
         root.addSubview(&add);
-
-        parent.addSubview(&root);
         Some(Self {
             root,
             segments,
@@ -166,6 +154,10 @@ impl Toolbar {
                 Some(NSColor::tertiarySystemFillColor()),
             ),
         ];
+        // Rows live in one panel pinned like the toolbar, so they follow window resizes.
+        let row = HEIGHT + 14.;
+        let panel = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., 320., row * 8.));
+        pin_bottom_left(parent, &panel, INSET, INSET + row);
         for (index, (in_glass, style, bezel)) in variants.into_iter().enumerate() {
             let images = NSArray::from_retained_slice(&[
                 template_png(FRAME_ICON, 18.)?,
@@ -188,18 +180,13 @@ impl Toolbar {
             segments.setSelectedSegment(0);
             let size = segments.fittingSize();
 
-            let row_y = INSET + (HEIGHT + 14.) * (index as f64 + 1.);
-            let y = if parent.isFlipped() {
-                parent.bounds().size.height - row_y - HEIGHT
-            } else {
-                row_y
-            };
+            let y = row * index as f64;
             let label =
                 NSTextField::labelWithString(&NSString::from_str(&format!("{}", index + 1)), mtm);
-            label.setFrame(rect(INSET, y + (HEIGHT - 17.) / 2., 24., 17.));
-            parent.addSubview(&label);
+            label.setFrame(rect(0., y + (HEIGHT - 17.) / 2., 24., 17.));
+            panel.addSubview(&label);
 
-            let x = INSET + AVATAR + GAP_AFTER_AVATAR;
+            let x = AVATAR + GAP_AFTER_AVATAR;
             if in_glass {
                 let pad = 3.;
                 let frame = rect(x, y, size.width + 2. * pad, HEIGHT);
@@ -217,7 +204,7 @@ impl Toolbar {
                 ));
                 wrapper.addSubview(&segments);
                 shape.setContentView(Some(&wrapper));
-                parent.addSubview(&shape);
+                panel.addSubview(&shape);
             } else {
                 segments.setFrame(rect(
                     x,
@@ -225,7 +212,7 @@ impl Toolbar {
                     size.width,
                     size.height.min(HEIGHT),
                 ));
-                parent.addSubview(&segments);
+                panel.addSubview(&segments);
             }
         }
         Some(())
@@ -245,6 +232,25 @@ impl Drop for Toolbar {
 
 fn has_liquid_glass() -> bool {
     AnyClass::get(c"NSGlassEffectView").is_some()
+}
+
+/// Adds `view` to `parent` with its bottom-left corner at (`left`, `bottom`) and keeps it
+/// there when the window resizes, whether or not `parent` uses flipped coordinates.
+fn pin_bottom_left(parent: &NSView, view: &NSView, left: f64, bottom: f64) {
+    let size = view.frame().size;
+    if parent.isFlipped() {
+        let top = parent.bounds().size.height - bottom - size.height;
+        view.setFrame(rect(left, top, size.width, size.height));
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+    } else {
+        view.setFrame(rect(left, bottom, size.width, size.height));
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMaxYMargin,
+        );
+    }
+    parent.addSubview(view);
 }
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
