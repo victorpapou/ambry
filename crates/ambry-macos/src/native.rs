@@ -210,17 +210,8 @@ impl TabSwitch {
             },
         );
         view.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-        // The strip sits on the same glass as the buttons beside it.
         view.setDrawsBackground(false);
-        let hosted: Retained<NSView> = if has_liquid_glass() {
-            let frame = view.frame();
-            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
-            glass.setCornerRadius(frame.size.height / 2.);
-            glass.setContentView(Some(&view));
-            Retained::into_super(glass)
-        } else {
-            Retained::into_super(view.clone())
-        };
+        let hosted: Retained<NSView> = Retained::into_super(view.clone());
         Some(Self {
             native: NativeView::host(parent, hosted, target),
             tabs: view,
