@@ -83,6 +83,8 @@ pub fn open_switch_lab() {
             Retained::into_super(Retained::into_super(control))
         }),
         ("M labels, no border", tabs_without_border(mtm)),
+        ("P tab view, icons", icon_tabs(mtm, 0.)),
+        ("Q tab view, icons, wide", icon_tabs(mtm, 40.)),
     ];
 
     let height = ROW * rows.len() as f64 + 20.;
@@ -260,6 +262,17 @@ fn icons() -> Vec<Retained<NSImage>> {
     )
     .unwrap();
     vec![frame, list, help]
+}
+
+fn icon_tabs(mtm: MainThreadMarker, item_width: f64) -> Retained<NSView> {
+    let icons = [("number", "Canvas"), ("list.bullet", "List")];
+    let images = crate::native::icon_images(&icons).unwrap();
+    Retained::into_super(crate::native::icon_tab_view(
+        mtm,
+        icons.len(),
+        &images,
+        item_width,
+    ))
 }
 
 pub(crate) fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {

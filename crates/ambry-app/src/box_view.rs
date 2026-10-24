@@ -18,6 +18,9 @@ use gpui::{
 use crate::native_view::native;
 
 const TITLEBAR_HEIGHT: f32 = 52.;
+/// Width of each canvas/list tab in the native switch, in points.
+#[cfg(target_os = "macos")]
+const SWITCH_ITEM_WIDTH: f64 = 40.;
 const DOT_SPACING: f32 = 20.;
 const DOT_RADIUS: f32 = 1.5;
 const CARD_WIDTH: f32 = 64.;
@@ -134,6 +137,7 @@ impl BoxView {
                 switch: ambry_macos::TabSwitch::new(
                     appkit.ns_view,
                     &[("number", "Canvas"), ("list.bullet", "List")],
+                    SWITCH_ITEM_WIDTH,
                     move |index| {
                         mode_events.try_send(ToolbarEvent::Mode(index)).ok();
                     },
