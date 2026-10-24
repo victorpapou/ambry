@@ -1,5 +1,7 @@
 mod assets;
 mod box_view;
+#[cfg(target_os = "macos")]
+mod native_view;
 
 use ambry_core::{BoxDoc, Store};
 use gpui::{

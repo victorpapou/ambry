@@ -1,30 +1,19 @@
-//! Native AppKit pieces that GPUI does not draw itself.
+//! Native AppKit controls for GPUI windows.
 //!
-//! Right now that is the floating toolbar in the bottom-left corner of a box window:
-//! a canvas/list switch on a Liquid Glass capsule and a glass "add" button.
+//! Each control is a real AppKit view added on top of GPUI's content view. GPUI keeps it in
+//! its layout through [`NativeView::set_frame`], called from a GPUI element on every frame.
 
-#[cfg(target_os = "macos")]
-mod glass_switch;
 #[cfg(target_os = "macos")]
 mod lab;
 #[cfg(target_os = "macos")]
-mod toolbar;
+mod native;
 
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
-
 #[cfg(target_os = "macos")]
-pub use toolbar::Toolbar;
+pub use native::{GlassButton, NativeView, TabSwitch};
 
-/// What the user did in the native toolbar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolbarEvent {
-    /// The canvas (0) or list (1) segment was selected.
-    Mode(usize),
-    Add,
-}
-
-/// Toolbar geometry in points, shared with the GPUI side so both halves line up.
+/// Toolbar geometry in points, shared by the native and the GPUI-drawn toolbar.
 pub mod layout {
     /// Distance from the window's left and bottom edges.
     pub const INSET: f64 = 20.;

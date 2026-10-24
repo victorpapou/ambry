@@ -63,15 +63,24 @@ pub fn open_switch_lab() {
         ),
         ("J tab view, images", tabs(mtm, true)),
         ("K tab view, labels", tabs(mtm, false)),
-        ("L glass switch", {
-            let view = crate::glass_switch::GlassSwitch::new(
-                mtm,
-                &[("number", "Canvas"), ("list.bullet", "List")],
-                36.,
-                |_| {},
-            )
+        ("N tab control, capsule", {
+            let control = crate::native::tab_segmented_control(&[
+                ("number", "Canvas"),
+                ("list.bullet", "List"),
+            ])
             .unwrap();
-            Retained::into_super(view)
+            Retained::into_super(Retained::into_super(control))
+        }),
+        ("O tab control, square", {
+            let control = crate::native::tab_segmented_control(&[
+                ("number", "Canvas"),
+                ("list.bullet", "List"),
+            ])
+            .unwrap();
+            if glass() {
+                control.setBorderShape(objc2_app_kit::NSControlBorderShape::Automatic);
+            }
+            Retained::into_super(Retained::into_super(control))
         }),
         ("M labels, no border", tabs_without_border(mtm)),
     ];

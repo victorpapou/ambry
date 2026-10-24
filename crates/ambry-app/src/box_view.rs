@@ -14,6 +14,9 @@ use gpui::{
     rgb, size, svg,
 };
 
+#[cfg(target_os = "macos")]
+use crate::native_view::native;
+
 const TITLEBAR_HEIGHT: f32 = 52.;
 const DOT_SPACING: f32 = 20.;
 const DOT_RADIUS: f32 = 1.5;
@@ -68,7 +71,20 @@ pub struct BoxView {
     avatar: Option<PathBuf>,
     focus: FocusHandle,
     #[cfg(target_os = "macos")]
-    toolbar: Option<ambry_macos::Toolbar>,
+    toolbar: Option<NativeToolbar>,
+}
+
+/// The AppKit controls of the bottom bar. GPUI lays them out through `native()` elements.
+#[cfg(target_os = "macos")]
+struct NativeToolbar {
+    switch: ambry_macos::TabSwitch,
+    add: ambry_macos::GlassButton,
+}
+
+#[cfg(target_os = "macos")]
+enum ToolbarEvent {
+    Mode(usize),
+    Add,
 }
 
 impl BoxView {
@@ -103,7 +119,7 @@ impl BoxView {
     }
 
     #[cfg(target_os = "macos")]
-    fn attach_toolbar(window: &mut Window, cx: &mut Context<Self>) -> Option<ambry_macos::Toolbar> {
+    fn attach_toolbar(window: &mut Window, cx: &mut Context<Self>) -> Option<NativeToolbar> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
         let handle = HasWindowHandle::window_handle(window).ok()?;
@@ -111,19 +127,35 @@ impl BoxView {
             return None;
         };
         let (events, received) = async_channel::unbounded();
+        let mode_events = events.clone();
         // SAFETY: GPUI hands out its own live content view and we are on the main thread.
         let toolbar = unsafe {
-            ambry_macos::Toolbar::attach(appkit.ns_view, move |event| {
-                events.try_send(event).ok();
-            })
-        }?;
+            NativeToolbar {
+                switch: ambry_macos::TabSwitch::new(
+                    appkit.ns_view,
+                    &[("number", "Canvas"), ("list.bullet", "List")],
+                    move |index| {
+                        mode_events.try_send(ToolbarEvent::Mode(index)).ok();
+                    },
+                )?,
+                add: ambry_macos::GlassButton::new(
+                    appkit.ns_view,
+                    "plus",
+                    "Add files or folders",
+                    layout::HEIGHT,
+                    move || {
+                        events.try_send(ToolbarEvent::Add).ok();
+                    },
+                )?,
+            }
+        };
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
-                    ambry_macos::ToolbarEvent::Mode(index) => {
+                    ToolbarEvent::Mode(index) => {
                         this.set_mode(if index == 0 { Mode::Canvas } else { Mode::List }, cx)
                     }
-                    ambry_macos::ToolbarEvent::Add => this.pick_paths(cx),
+                    ToolbarEvent::Add => this.pick_paths(cx),
                 });
                 if handled.is_err() {
                     break;
@@ -138,7 +170,9 @@ impl BoxView {
         self.mode = mode;
         #[cfg(target_os = "macos")]
         if let Some(toolbar) = &self.toolbar {
-            toolbar.set_mode(if mode == Mode::Canvas { 0 } else { 1 });
+            toolbar
+                .switch
+                .select(if mode == Mode::Canvas { 0 } else { 1 });
         }
         cx.notify();
     }
@@ -567,9 +601,6 @@ impl BoxView {
         let size = px(layout::AVATAR as f32);
         div()
             .id("account")
-            .absolute()
-            .left(px(layout::INSET as f32))
-            .bottom(px(layout::INSET as f32))
             .size(size)
             .rounded_full()
             .bg(gpui::white())
@@ -596,6 +627,34 @@ impl BoxView {
             })
     }
 
+    /// The account avatar, the canvas/list switch and the add button.
+    fn render_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bar = div()
+            .absolute()
+            .left(px(layout::INSET as f32))
+            .bottom(px(layout::INSET as f32))
+            .flex()
+            .items_center()
+            .gap(px(layout::GAP_AFTER_AVATAR as f32))
+            .child(self.render_avatar());
+        #[cfg(target_os = "macos")]
+        let bar = bar.when_some(self.toolbar.as_ref(), |bar, toolbar| {
+            bar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::GAP as f32))
+                    .child(native(toolbar.switch.native()))
+                    .child(native(toolbar.add.native())),
+            )
+        });
+        #[cfg(not(target_os = "macos"))]
+        let bar = bar.child(self.render_fallback_toolbar(cx));
+        #[cfg(target_os = "macos")]
+        let _ = cx;
+        bar
+    }
+
     /// The canvas/list switch and add button drawn by GPUI where AppKit is not available.
     #[cfg(not(target_os = "macos"))]
     fn render_fallback_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -618,11 +677,6 @@ impl BoxView {
                 }))
         };
         div()
-            .absolute()
-            .left(px(
-                (layout::INSET + layout::AVATAR + layout::GAP_AFTER_AVATAR) as f32,
-            ))
-            .bottom(px(layout::INSET as f32))
             .flex()
             .gap(px(layout::GAP as f32))
             .child(
@@ -696,12 +750,10 @@ impl Render for BoxView {
                 Mode::List => this.child(self.render_list(cx)),
             })
             .child(self.render_titlebar())
-            .child(self.render_avatar());
+            .child(self.render_bottom_bar(cx));
 
         #[cfg(target_os = "macos")]
         let root = root.font_family(".SystemUIFont");
-        #[cfg(not(target_os = "macos"))]
-        let root = root.child(self.render_fallback_toolbar(cx));
         root
     }
 }
