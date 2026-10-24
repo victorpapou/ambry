@@ -9,10 +9,9 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use objc2::rc::{Allocated, Retained};
-use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class,
-    msg_send, sel,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSBitmapImageRep, NSButton,
@@ -48,6 +47,7 @@ const AVATAR_SIZE: f64 = 28.;
 const TILE: f64 = 26.;
 /// Font size of the box's name and status.
 const TITLE_SIZE: f64 = 15.;
+const CHEVRON_SIZE: f64 = 12.;
 /// Room the chevron takes after the name when it shows.
 const CHEVRON_GAP: f64 = 5.;
 const CHEVRON_DURATION: f64 = 0.2;
@@ -406,20 +406,19 @@ impl WindowToolbar {
         glyph.setContentTintColor(Some(&NSColor::whiteColor()));
         tile.addSubview(&glyph);
 
-        let title_font = NSFont::systemFontOfSize_weight(TITLE_SIZE, unsafe {
-            objc2_app_kit::NSFontWeightSemibold
-        });
+        let title_font = NSFont::systemFontOfSize(TITLE_SIZE);
         let name =
             unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
         name.setBordered(false);
         name.setFont(Some(&title_font));
         name.setToolTip(Some(&NSString::from_str("Switch box")));
 
-        // The chevron is drawn at the name's size and weight, so its strokes match the text.
+        // The chevron is smaller than the name and a step heavier, so its strokes come out as
+        // thick as the text's.
         let chevron_image = symbol("chevron.down", "Boxes").and_then(|image| {
             let config = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-                TITLE_SIZE,
-                unsafe { objc2_app_kit::NSFontWeightSemibold },
+                CHEVRON_SIZE,
+                unsafe { objc2_app_kit::NSFontWeightMedium },
                 NSImageSymbolScale::Small,
             );
             image.imageWithSymbolConfiguration(&config)
@@ -763,41 +762,79 @@ pub(crate) fn place_symbol(view: &NSImageView, image: Option<&NSImage>, size: f6
 
 /// `image` drawn on a clear `side` square so its ink sits in the middle, as a template image
 /// that takes its view's tint.
+///
+/// The image carries one bitmap for each screen density. On each, the glyph's ink lands on
+/// whole pixels: a glyph 15 pixels wide can't sit in the middle of a 26 pixel tile, so it is
+/// drawn a touch larger or smaller until its width and height leave even margins.
 pub(crate) fn centered_symbol(image: &NSImage, side: f64) -> Retained<NSImage> {
     let size = image.size();
     let ink = ink_bounds(image).unwrap_or(NSRect::new(NSPoint::ZERO, size));
-    // Whole pixels on a 2x display: a symbol drawn between them snaps by a pixel.
-    let round = |value: f64| (value * 2.).round() / 2.;
-    let rect = NSRect::new(
-        NSPoint::new(
-            round(side / 2. - ink.origin.x - ink.size.width / 2.),
-            round(side / 2. - ink.origin.y - ink.size.height / 2.),
-        ),
-        size,
-    );
-    let image = image.retain();
-    let draw = block2::RcBlock::new(move |_: NSRect| -> Bool {
-        image.drawInRect_fromRect_operation_fraction(
-            rect,
-            NSRect::ZERO,
-            NSCompositingOperation::SourceOver,
-            1.,
+    let centered = NSImage::initWithSize(NSImage::alloc(), NSSize::new(side, side));
+    for scale in [1., 2.] {
+        let pixels = (side * scale).round();
+        let fit = fit_ink(ink.size.width * scale, ink.size.height * scale, pixels);
+        let (width, height) = (ink.size.width * scale * fit, ink.size.height * scale * fit);
+        let left = ((pixels - width) / 2.).round();
+        let bottom = ((pixels - height) / 2.).round();
+        let rect = NSRect::new(
+            NSPoint::new(
+                left - ink.origin.x * scale * fit,
+                bottom - ink.origin.y * scale * fit,
+            ),
+            NSSize::new(size.width * scale * fit, size.height * scale * fit),
         );
-        Bool::YES
-    });
-    let centered =
-        NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), false, &draw);
+        if let Some(rep) = draw_bitmap(image, pixels as isize, pixels as isize, rect) {
+            rep.setSize(NSSize::new(side, side));
+            centered.addRepresentation(&rep);
+        }
+    }
     centered.setTemplate(true);
     centered
 }
 
-/// The part of `image` that is drawn on, in its points from the bottom left, found by
-/// drawing it four times over into a bitmap.
-fn ink_bounds(image: &NSImage) -> Option<NSRect> {
-    const SCALE: f64 = 4.;
-    let size = image.size();
-    let width = (size.width * SCALE).ceil() as isize;
-    let height = (size.height * SCALE).ceil() as isize;
+/// How much to grow or shrink ink `width` by `height` pixels so both leave even margins in a
+/// square of `pixels`, changing its size as little as it can.
+fn fit_ink(width: f64, height: f64, pixels: f64) -> f64 {
+    // How far `length` is from a whole number of pixels that leaves even margins.
+    let miss = |length: f64| {
+        let even = |n: f64| (pixels - n) % 2. == 0.;
+        let below = length.floor();
+        [below - 1., below, below + 1., below + 2.]
+            .into_iter()
+            .filter(|n| even(*n))
+            .map(|n| (n - length).abs())
+            .fold(f64::MAX, f64::min)
+    };
+    let mut candidates = vec![1.];
+    for length in [width, height] {
+        let below = length.floor();
+        for n in [below - 1., below, below + 1., below + 2.] {
+            if n > 0. && (pixels - n) % 2. == 0. {
+                candidates.push(n / length);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|fit| (0.9..=1.1).contains(fit))
+        .map(|fit| {
+            let cost = miss(width * fit) + miss(height * fit) + 4. * (fit - 1.).abs() * width;
+            (fit, cost)
+        })
+        .fold(
+            (1., f64::MAX),
+            |best, next| if next.1 < best.1 { next } else { best },
+        )
+        .0
+}
+
+/// `image` drawn into `rect` of a clear bitmap `width` by `height` pixels.
+fn draw_bitmap(
+    image: &NSImage,
+    width: isize,
+    height: isize,
+    rect: NSRect,
+) -> Option<Retained<NSBitmapImageRep>> {
     if width <= 0 || height <= 0 {
         return None;
     }
@@ -820,14 +857,29 @@ fn ink_bounds(image: &NSImage) -> Option<NSRect> {
     NSGraphicsContext::saveGraphicsState_class();
     NSGraphicsContext::setCurrentContext(Some(&context));
     image.drawInRect_fromRect_operation_fraction(
-        NSRect::new(NSPoint::ZERO, NSSize::new(width as f64, height as f64)),
+        rect,
         NSRect::ZERO,
         NSCompositingOperation::SourceOver,
         1.,
     );
     context.flushGraphics();
     NSGraphicsContext::restoreGraphicsState_class();
+    Some(rep)
+}
 
+/// The part of `image` that is drawn on, in its points from the bottom left. The image is
+/// drawn eight times over and a pixel counts when it is at least half covered, which puts
+/// the edges where the eye sees them.
+fn ink_bounds(image: &NSImage) -> Option<NSRect> {
+    const SCALE: f64 = 8.;
+    let size = image.size();
+    let width = (size.width * SCALE).ceil() as isize;
+    let height = (size.height * SCALE).ceil() as isize;
+    let rect = NSRect::new(
+        NSPoint::ZERO,
+        NSSize::new(size.width * SCALE, size.height * SCALE),
+    );
+    let rep = draw_bitmap(image, width, height, rect)?;
     let data = rep.bitmapData();
     if data.is_null() {
         return None;
@@ -837,7 +889,7 @@ fn ink_bounds(image: &NSImage) -> Option<NSRect> {
     for y in 0..height {
         for x in 0..width {
             let alpha = unsafe { *data.offset(y * row_bytes + x * 4 + 3) };
-            if alpha > 24 {
+            if alpha >= 128 {
                 left = left.min(x);
                 right = right.max(x);
                 top = top.min(y);

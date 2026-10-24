@@ -63,6 +63,9 @@ struct Palette {
     card_top: u32,
     /// Behind a selected icon, like Finder's.
     selection: Hsla,
+    /// Behind every other row of the list, like Finder's alternating rows.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    stripe: u32,
 }
 
 const LIGHT: Palette = Palette {
@@ -80,6 +83,7 @@ const LIGHT: Palette = Palette {
         l: 0.,
         a: 0.08,
     },
+    stripe: 0xf4f5f5,
 };
 
 const DARK: Palette = Palette {
@@ -97,6 +101,7 @@ const DARK: Palette = Palette {
         l: 1.,
         a: 0.12,
     },
+    stripe: 0x2a2a2a,
 };
 
 thread_local! {
@@ -164,6 +169,8 @@ struct NativeControls {
     scroll: ambry_macos::CanvasScrollView,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
+    /// Where Quick Look sends the item it moved to.
+    events: async_channel::Sender<ControlEvent>,
 }
 
 #[cfg(target_os = "macos")]
@@ -178,6 +185,8 @@ enum ControlEvent {
     /// A scroll bar moved the visible part of the canvas to this top-left, counted from the
     /// top-left of [`BoxView::scroll_area`].
     Scroll(f64, f64),
+    /// Quick Look moved to the item at this index.
+    Preview(usize),
 }
 
 impl BoxView {
@@ -235,6 +244,7 @@ impl BoxView {
         // SAFETY: GPUI hands out its own live content view and we are on the main thread.
         let controls = unsafe {
             let scrolled = events.clone();
+            let previewed = events.clone();
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
@@ -266,6 +276,7 @@ impl BoxView {
                 shown_boxes: (Vec::new(), None),
                 scroll,
                 shown_scroll: None,
+                events: previewed,
             }
         };
         cx.spawn(async move |this, cx| {
@@ -303,6 +314,12 @@ impl BoxView {
                         this.open_box(store, cx);
                     }
                     ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
+                    ControlEvent::Preview(index) => {
+                        if let Some(item) = this.doc.items.get(index) {
+                            this.selected = Some(item.id);
+                            cx.notify();
+                        }
+                    }
                 });
                 if handled.is_err() {
                     break;
@@ -633,6 +650,8 @@ impl BoxView {
         cx.stop_propagation();
         window.focus(&self.focus);
         self.selected = Some(id);
+        #[cfg(target_os = "macos")]
+        self.preview(false);
         if event.click_count >= 2 {
             self.drag = None;
             self.open_item(id, cx);
@@ -690,8 +709,42 @@ impl BoxView {
                     self.open_item(id, cx);
                 }
             }
+            #[cfg(target_os = "macos")]
+            "space" => self.preview(true),
             _ => {}
         }
+    }
+
+    /// Opens or closes Quick Look on the selected item with `toggle`, or else shows the
+    /// selected item in it when it is open, as Finder does with the space bar.
+    #[cfg(target_os = "macos")]
+    fn preview(&self, toggle: bool) {
+        let Some(index) = self
+            .selected
+            .and_then(|id| self.doc.items.iter().position(|item| item.id == id))
+        else {
+            return;
+        };
+        let paths: Vec<PathBuf> = self
+            .doc
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect();
+        if !toggle {
+            ambry_macos::quick_look::follow(&paths, index);
+            return;
+        }
+        let Some(events) = self
+            .controls
+            .as_ref()
+            .map(|controls| controls.events.clone())
+        else {
+            return;
+        };
+        ambry_macos::quick_look::toggle(&paths, index, move |index| {
+            events.try_send(ControlEvent::Preview(index)).ok();
+        });
     }
 
     fn status(&self) -> SharedString {
@@ -880,7 +933,6 @@ impl BoxView {
                     .pb(px(24.))
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
                     .when(self.doc.items.is_empty(), |this| this.child(empty_hint()))
                     .children(
                         self.doc
@@ -921,6 +973,9 @@ impl BoxView {
             .px(px(LIST_ROW_PAD))
             .rounded(px(7.))
             .when(selected, |this| this.bg(rgb(ACCENT)))
+            .when(!selected && index % 2 == 1, |this| {
+                this.bg(rgb(palette().stripe))
+            })
             .when(!selected, |this| {
                 this.hover(|this| this.bg(rgb(palette().pressed)))
             })

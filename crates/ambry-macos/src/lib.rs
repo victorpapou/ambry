@@ -18,6 +18,8 @@ mod native;
 #[cfg(target_os = "macos")]
 pub mod probe;
 #[cfg(target_os = "macos")]
+pub mod quick_look;
+#[cfg(target_os = "macos")]
 mod scroller;
 #[cfg(target_os = "macos")]
 mod table;
