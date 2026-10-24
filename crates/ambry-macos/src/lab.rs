@@ -3,7 +3,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
-use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message, msg_send};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSControlBorderShape, NSControlSize, NSGlassEffectView, NSImage,
     NSSegmentStyle, NSSegmentSwitchTracking, NSSegmentedControl, NSTabPosition, NSTabView,
@@ -102,7 +102,54 @@ pub fn open_switch_lab() {
     }
     window.center();
     window.makeKeyAndOrderFront(None);
+    dump(&rows);
     std::mem::forget(window);
+}
+
+/// Writes each variant's view tree and the methods of AppKit's private classes in it to
+/// `target/lab-dump.txt`, to see how AppKit builds the controls.
+fn dump(rows: &[(&str, Retained<NSView>)]) {
+    let mut out = String::new();
+    let mut classes: std::collections::BTreeSet<String> =
+        ["NSTabView", "NSTabViewItem"].map(String::from).into();
+    for (name, view) in rows {
+        out += &format!("== {name}\n");
+        let tree: Option<Retained<NSString>> = unsafe { msg_send![&**view, _subtreeDescription] };
+        if let Some(tree) = tree {
+            out += &tree.to_string();
+            out += "\n";
+        }
+        collect_classes(view, &mut classes);
+    }
+    for class in classes {
+        let Some(cls) = AnyClass::get(&std::ffi::CString::new(class.clone()).unwrap()) else {
+            continue;
+        };
+        out += &format!("== class {class}");
+        if let Some(superclass) = cls.superclass() {
+            out += &format!(" : {}", superclass.name().to_string_lossy());
+        }
+        out += "\n";
+        for method in cls.instance_methods().iter() {
+            out += &format!("  {}\n", method.name().name().to_string_lossy());
+        }
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if let Some(root) = exe.ancestors().find(|dir| dir.join("Cargo.toml").exists()) {
+        let _ = std::fs::write(root.join("target/lab-dump.txt"), out);
+    }
+}
+
+fn collect_classes(view: &NSView, classes: &mut std::collections::BTreeSet<String>) {
+    let name = view.class().name().to_string_lossy().into_owned();
+    if name.starts_with('_') || name.contains("Tab") || name.contains("Segment") {
+        classes.insert(name);
+    }
+    for child in view.subviews().iter() {
+        collect_classes(&child, classes);
+    }
 }
 
 fn glass() -> bool {
