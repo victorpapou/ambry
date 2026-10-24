@@ -211,7 +211,7 @@ impl TabSwitch {
         );
         view.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         view.setDrawsBackground(false);
-        let hosted: Retained<NSView> = Retained::into_super(view.clone());
+        let hosted = on_glass(mtm, &view);
         Some(Self {
             native: NativeView::host(parent, hosted, target),
             tabs: view,
@@ -228,6 +228,27 @@ impl TabSwitch {
             self.tabs.selectTabViewItemAtIndex(index as isize);
         }
     }
+}
+
+/// Puts the tab strip on Liquid Glass cut to the strip itself, so the glass and the strip
+/// read as one capsule, without the margins NSTabView keeps around it.
+fn on_glass(mtm: MainThreadMarker, tabs: &Retained<NSTabView>) -> Retained<NSView> {
+    let plain = || Retained::into_super(tabs.clone());
+    if !has_liquid_glass() {
+        return plain();
+    }
+    let Some(control) = segments(tabs) else {
+        return plain();
+    };
+    let strip = control.frame();
+    let bounds = NSRect::new(NSPoint::new(0., 0.), strip.size);
+    tabs.setFrameOrigin(NSPoint::new(-strip.origin.x, -strip.origin.y));
+    let holder = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+    holder.addSubview(tabs);
+    let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
+    glass.setCornerRadius(strip.size.height / 2.);
+    glass.setContentView(Some(&holder));
+    Retained::into_super(glass)
 }
 
 fn selected_index(tabs: &NSTabView) -> Option<usize> {
