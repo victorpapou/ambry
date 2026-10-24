@@ -212,7 +212,8 @@ impl ColumnBrowser {
         browser.setAutohidesScroller(true);
         browser.setSeparatesColumns(true);
         browser.setDefaultColumnWidth(COLUMN_WIDTH);
-        browser.setColumnResizingType(objc2_app_kit::NSBrowserColumnResizingType::User);
+        browser
+            .setColumnResizingType(objc2_app_kit::NSBrowserColumnResizingType::UserColumnResizing);
         browser.setReusesColumns(false);
         let view: Retained<NSView> = Retained::into_super(Retained::into_super(browser.clone()));
         Some(Self {
