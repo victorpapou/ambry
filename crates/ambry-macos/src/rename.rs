@@ -2,13 +2,15 @@
 //! icon on top, a name field and two buttons, like the sheets Reminders shows for a list.
 
 use std::cell::RefCell;
+use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message, msg_send, sel};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSControlSize, NSFont, NSTextAlignment, NSTextField,
-    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSControlSize, NSEvent, NSEventMask, NSFont,
+    NSTextAlignment, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::NSMutableArray;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -36,6 +38,8 @@ const BUTTONS_GAP: f64 = 16.;
 const BUTTON_SPACING: f64 = 8.;
 
 thread_local! {
+    /// Watches for clicks on the window under the sheet while it is open.
+    static MONITOR: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
     /// The last sheet shown, and the targets of its buttons and the icon's hover watcher,
     /// which AppKit does not retain.
     static OPEN: RefCell<Option<(Retained<NSWindow>, Vec<Retained<NSObject>>)>> =
@@ -172,6 +176,9 @@ pub(crate) fn ask_name(
         let parent = parent.clone();
         let sheet = sheet.clone();
         move || {
+            if let Some(monitor) = MONITOR.with_borrow_mut(Option::take) {
+                unsafe { NSEvent::removeMonitor(&monitor) };
+            }
             parent.endSheet(&sheet);
             sheet.orderOut(None);
         }
@@ -212,6 +219,37 @@ pub(crate) fn ask_name(
     parts.push(Retained::into_super(rename_target));
     OPEN.with_borrow_mut(|open| *open = Some((sheet.clone(), parts)));
     parent.beginSheet_completionHandler(&sheet, None);
+    // A click on the window under the sheet cancels it, as a click outside a popover does.
+    // The press goes to Cancel on the next turn of the run loop, after this event is done.
+    let handler = block2::RcBlock::new({
+        let parent = parent.clone();
+        let cancel = cancel.clone();
+        move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            let event = unsafe { event.as_ref() };
+            let on_parent = event
+                .window(mtm)
+                .is_some_and(|window| std::ptr::eq(&*window, &*parent));
+            if !on_parent {
+                return event as *const NSEvent as *mut NSEvent;
+            }
+            unsafe {
+                let _: () = msg_send![
+                    &*cancel,
+                    performSelector: sel!(performClick:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    afterDelay: 0.0f64
+                ];
+            }
+            std::ptr::null_mut()
+        }
+    });
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+            NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown,
+            &handler,
+        )
+    };
+    MONITOR.with_borrow_mut(|slot| *slot = monitor);
     sheet.makeFirstResponder(Some(&field));
     if let Some(editor) = field.currentEditor() {
         unsafe { editor.selectAll(None) };
