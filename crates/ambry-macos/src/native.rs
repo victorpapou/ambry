@@ -9,10 +9,10 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSBezelStyle, NSButton, NSColor, NSControlBorderShape, NSControlSize, NSFont,
-    NSGlassEffectView, NSImage, NSImageScaling, NSImageView, NSSegmentedControl, NSTabPosition,
-    NSTabView, NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField,
-    NSView,
+    NSAnimatablePropertyContainer, NSBezelStyle, NSButton, NSColor, NSControlBorderShape,
+    NSControlSize, NSFont, NSGlassEffectView, NSImage, NSImageScaling, NSImageView,
+    NSSegmentedControl, NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate,
+    NSTabViewItem, NSTextAlignment, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -564,27 +564,32 @@ impl GlassButton {
     }
 }
 
-/// Tabs as round Liquid Glass buttons, the same material as [`GlassButton`], grouped in a
-/// glass container so neighbours melt into one capsule. The selected tab gets a grey tint.
+/// Icon tabs on one Liquid Glass capsule, the same glass as [`GlassAvatar`], with a grey pill
+/// behind the selected tab that slides when the selection changes.
 pub struct GlassTabs {
     native: NativeView,
-    container: Option<Retained<objc2_app_kit::NSGlassEffectContainerView>>,
+    glass: Option<Retained<NSGlassEffectView>>,
+    pill: Retained<NSView>,
     buttons: Vec<Retained<NSButton>>,
+    item_width: f64,
     selected: Cell<usize>,
-    selected_tint: Cell<Option<(f64, f64)>>,
+    pill_tint: Cell<(f64, f64)>,
 }
 
+/// Room between the capsule's edge and the selection pill.
+const PILL_INSET: f64 = 2.;
+
 impl GlassTabs {
-    /// One round glass button `size` points across per `(symbol, description)`, `gap` points
-    /// apart. `on_select` gets the tab the user picks.
+    /// One tab `item_width` points wide per `(symbol, description)`, on a capsule `height`
+    /// points tall. `on_select` gets the tab the user picks.
     ///
     /// # Safety
     /// `ns_view` must point to a live `NSView`, and this must run on the main thread.
     pub unsafe fn new(
         ns_view: NonNull<c_void>,
         icons: &[(&str, &str)],
-        size: f64,
-        gap: f64,
+        height: f64,
+        item_width: f64,
         on_select: impl Fn(usize) + 'static,
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
@@ -594,12 +599,17 @@ impl GlassTabs {
                 on_select(button.tag().max(0) as usize);
             }
         });
-        let count = icons.len() as f64;
-        let bounds = NSRect::new(
-            NSPoint::new(0., 0.),
-            NSSize::new(count * size + (count - 1.) * gap, size),
-        );
-        let holder = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+        let width = icons.len() as f64 * item_width + PILL_INSET * 2.;
+        let bounds = NSRect::new(NSPoint::new(0., 0.), NSSize::new(width, height));
+        let content = NSView::initWithFrame(NSView::alloc(mtm), bounds);
+
+        let pill = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        pill.setWantsLayer(true);
+        if let Some(layer) = pill.layer() {
+            layer.setCornerRadius((height - PILL_INSET * 2.) / 2.);
+        }
+        content.addSubview(&pill);
+
         let mut buttons = Vec::new();
         for (index, (name, description)) in icons.iter().enumerate() {
             let image = symbol(name, description)?;
@@ -611,43 +621,38 @@ impl GlassTabs {
                     mtm,
                 )
             };
-            button.setControlSize(NSControlSize::Large);
-            button.setBezelStyle(if has_liquid_glass() {
-                NSBezelStyle::Glass
-            } else {
-                NSBezelStyle::Circular
-            });
+            button.setBordered(false);
             button.setToolTip(Some(&NSString::from_str(description)));
             button.setTag(index as isize);
             button.setFrame(NSRect::new(
-                NSPoint::new(index as f64 * (size + gap), 0.),
-                NSSize::new(size, size),
+                NSPoint::new(PILL_INSET + index as f64 * item_width, 0.),
+                NSSize::new(item_width, height),
             ));
-            holder.addSubview(&button);
+            content.addSubview(&button);
             buttons.push(button);
         }
-        let container = has_liquid_glass().then(|| {
-            let container = objc2_app_kit::NSGlassEffectContainerView::initWithFrame(
-                objc2_app_kit::NSGlassEffectContainerView::alloc(mtm),
-                bounds,
-            );
-            // Glass shapes closer than this melt together.
-            container.setSpacing(gap + 2.);
-            container.setContentView(Some(&holder));
-            container
+
+        let glass = has_liquid_glass().then(|| {
+            let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
+            glass.setCornerRadius(height / 2.);
+            glass.setContentView(Some(&content));
+            glass
         });
-        let view: Retained<NSView> = match &container {
-            Some(container) => Retained::into_super(container.clone()),
-            None => holder,
+        let view: Retained<NSView> = match &glass {
+            Some(glass) => Retained::into_super(glass.clone()),
+            None => content,
         };
         let tabs = Self {
             native: NativeView::host(parent, view, target),
-            container,
+            glass,
+            pill,
             buttons,
-            selected: Cell::new(usize::MAX),
-            selected_tint: Cell::new(None),
+            item_width,
+            selected: Cell::new(0),
+            pill_tint: Cell::new((0., 0.08)),
         };
-        tabs.select(0);
+        tabs.place_pill(false);
+        tabs.paint();
         Some(tabs)
     }
 
@@ -655,34 +660,58 @@ impl GlassTabs {
         &self.native
     }
 
-    /// Marks tab `index` as the selected one.
+    /// Moves the pill to tab `index`.
     pub fn select(&self, index: usize) {
-        if self.selected.replace(index) == index {
-            return;
+        if self.selected.replace(index) != index {
+            self.place_pill(true);
         }
+    }
+
+    /// The pill's color as `(white, alpha)`, set per appearance by the caller.
+    pub fn set_pill_tint(&self, tint: (f64, f64)) {
+        self.pill_tint.set(tint);
         self.paint();
     }
 
-    /// Tint for the selected tab as `(white, alpha)`; `None` uses the system fill color.
-    pub fn set_selected_tint(&self, tint: Option<(f64, f64)>) {
-        self.selected_tint.set(tint);
-        self.paint();
+    /// Tints the capsule's glass with `(white, alpha)`.
+    pub fn set_glass_tint(&self, tint: Option<(f64, f64)>) {
+        if let Some(glass) = &self.glass {
+            glass.setTintColor(tint_color(tint).as_deref());
+        }
+    }
+
+    fn place_pill(&self, animated: bool) {
+        let Some(button) = self.buttons.first() else {
+            return;
+        };
+        let height = button.frame().size.height - PILL_INSET * 2.;
+        let frame = NSRect::new(
+            NSPoint::new(
+                PILL_INSET + self.selected.get() as f64 * self.item_width,
+                PILL_INSET,
+            ),
+            NSSize::new(self.item_width, height),
+        );
+        if animated {
+            self.pill.animator().setFrame(frame);
+        } else {
+            self.pill.setFrame(frame);
+        }
     }
 
     fn paint(&self) {
-        let selected = self.selected.get();
-        let tint = tint_color(self.selected_tint.get()).unwrap_or_else(NSColor::systemFillColor);
-        for (index, button) in self.buttons.iter().enumerate() {
-            button.setBezelColor((index == selected).then_some(&*tint));
+        let (white, alpha) = self.pill_tint.get();
+        if let Some(layer) = self.pill.layer() {
+            let color = NSColor::colorWithWhite_alpha(white, alpha).CGColor();
+            layer.setBackgroundColor(Some(&color));
         }
     }
 
-    /// The container and buttons, by name, for [`crate::probe::run`].
+    /// The glass, the pill and the buttons, by name, for [`crate::probe::run`].
     pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
-        let mut targets = Vec::new();
-        if let Some(container) = &self.container {
-            targets.push(("container".to_string(), object(container.clone())));
-            targets.push(("tabs-root".to_string(), object(container.clone())));
+        let mut targets = vec![("pill".to_string(), object(self.pill.clone()))];
+        if let Some(glass) = &self.glass {
+            targets.push(("tabs-root".to_string(), object(glass.clone())));
         }
         for (index, button) in self.buttons.iter().enumerate() {
             targets.push((format!("b{index}"), object(button.clone())));

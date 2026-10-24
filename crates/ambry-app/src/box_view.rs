@@ -18,9 +18,9 @@ use gpui::{
 #[cfg(target_os = "macos")]
 use crate::native_view::native;
 
-/// Space between the round canvas and list tabs, in points.
+/// Width of each canvas/list tab, in points.
 #[cfg(target_os = "macos")]
-const TAB_GAP: f64 = 2.;
+const TAB_WIDTH: f64 = 40.;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
@@ -229,7 +229,7 @@ impl BoxView {
                 ns_view,
                 &[("number", "Canvas"), ("list.bullet", "List")],
                 layout::HEIGHT,
-                TAB_GAP,
+                TAB_WIDTH,
                 move |index| {
                     mode.try_send(ControlEvent::Mode(index)).ok();
                 },
@@ -1009,7 +1009,11 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
         }
         None => default,
     };
-    controls.switch.set_selected_tint(tint("selected", None));
+    let pill_default = if dark { (1., 0.14) } else { (0., 0.08) };
+    controls
+        .switch
+        .set_pill_tint(tint("pill", Some(pill_default)).unwrap_or(pill_default));
+    controls.switch.set_glass_tint(tint("tabs", None));
     controls.add.set_tint(tint("add", None));
     controls.avatar.set_tint(tint("avatar", None));
 
