@@ -22,7 +22,7 @@ use crate::native_view::native;
 
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
-const DOT_SPACING: f32 = 20.;
+const DOT_SPACING: f32 = 25.;
 const DOT_RADIUS: f32 = 0.75;
 const CARD_WIDTH: f32 = 64.;
 const CARD_HEIGHT: f32 = 80.;
@@ -59,7 +59,7 @@ const LIGHT: Palette = Palette {
     ink: 0x1d1d1f,
     quiet: 0x8e8e93,
     faint: 0xb4b4ba,
-    dot: 0xe3e3e8,
+    dot: 0xc7c7cc,
     hairline: 0xe5e5ea,
     pressed: 0xececf0,
     card_top: 0xf2f2f5,
@@ -76,7 +76,7 @@ const DARK: Palette = Palette {
     ink: 0xf5f5f7,
     quiet: 0x98989d,
     faint: 0x6e6e73,
-    dot: 0x3a3a3c,
+    dot: 0x5c5c60,
     hairline: 0x3a3a3c,
     pressed: 0x2c2c2e,
     card_top: 0x2c2c2e,

@@ -8,23 +8,26 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::rc::{Allocated, Retained};
+use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class,
+    msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSAnimationContext, NSButton, NSClickGestureRecognizer, NSColor,
-    NSControlSize, NSEvent, NSFont, NSImage, NSImageScaling, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSImageView, NSLayoutConstraint, NSPopoverDelegate, NSSegmentedControl,
-    NSStackView, NSTabView, NSTextField, NSToolbar, NSToolbarDelegate,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemIdentifier,
-    NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
+    NSAnimationContext, NSBitmapImageRep, NSButton, NSClickGestureRecognizer, NSColor,
+    NSCompositingOperation, NSControlSize, NSDeviceRGBColorSpace, NSEvent, NSFont,
+    NSGraphicsContext, NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageSymbolScale,
+    NSImageView, NSLayoutConstraint, NSPopoverDelegate, NSSegmentedControl, NSStackView, NSTabView,
+    NSTextField, NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
     NSUserInterfaceLayoutOrientation, NSView, NSWindowToolbarStyle,
 };
 use objc2_foundation::{
-    NSArray, NSCopying, NSNotification, NSNumber, NSPoint, NSRect, NSRectEdge, NSSize, NSString,
+    NSArray, NSCopying, NSMutableArray, NSNotification, NSNumber, NSPoint, NSRect, NSRectEdge,
+    NSSize, NSString,
 };
+use objc2_quartz_core::CAMediaTimingFunction;
 
 use crate::box_list::BoxList;
 use crate::icon_picker::IconPicker;
@@ -46,9 +49,10 @@ const TILE: f64 = 26.;
 const TITLE_SIZE: f64 = 15.;
 /// Room the chevron takes after the name when it shows.
 const CHEVRON_GAP: f64 = 5.;
-const CHEVRON_DURATION: f64 = 0.25;
-/// Blur radius the chevron comes out of.
-const CHEVRON_BLUR: f64 = 6.;
+const CHEVRON_DURATION: f64 = 0.2;
+/// Blur radius the chevron comes out of, and the clear room around it the blur draws into.
+const CHEVRON_BLUR: f64 = 3.;
+const CHEVRON_PAD: f64 = 6.;
 
 /// What the user did in the toolbar.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,10 +248,13 @@ struct Chevron {
     open_width: f64,
     inside: Cell<bool>,
     shown: Cell<bool>,
+    /// Turned to point up while the box list is open.
+    turned: Cell<bool>,
 }
 
 impl Chevron {
     fn update(&self, list_shown: bool) {
+        self.turn(list_shown);
         let show = self.inside.get() || list_shown;
         if self.shown.replace(show) == show {
             return;
@@ -256,65 +263,87 @@ impl Chevron {
         let context = NSAnimationContext::currentContext();
         context.setDuration(CHEVRON_DURATION);
         context.setAllowsImplicitAnimation(true);
+        // The stack's layout can't take a spring; this curve settles the way one does.
+        context.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
+            0.2, 0.9, 0.25, 1.,
+        )));
         self.width
-            .animator()
             .setConstant(if show { self.open_width } else { 0. });
-        self.image
-            .animator()
-            .setAlphaValue(if show { 1. } else { 0. });
         self.stack.layoutSubtreeIfNeeded();
         NSAnimationContext::endGrouping();
-        let (from, to) = if show {
-            (CHEVRON_BLUR, 0.)
+
+        let (alpha, blur) = if show {
+            ((0., 1.), (CHEVRON_BLUR, 0.))
         } else {
-            (0., CHEVRON_BLUR)
+            ((1., 0.), (0., CHEVRON_BLUR))
         };
-        animate_blur(&self.image, from, to);
+        self.image.setAlphaValue(alpha.1);
+        let Some(layer) = self.image.layer() else {
+            return;
+        };
+        spring(&layer, "opacity", alpha.0, alpha.1, CHEVRON_DURATION);
+        if add_blur(&self.image) {
+            spring(
+                &layer,
+                "filters.blur.inputRadius",
+                blur.0,
+                blur.1,
+                CHEVRON_DURATION,
+            );
+        }
+    }
+
+    /// Turns the chevron up while the list is open and back down after.
+    fn turn(&self, up: bool) {
+        if self.turned.replace(up) == up {
+            return;
+        }
+        let Some(layer) = self.image.layer() else {
+            return;
+        };
+        // Spin about the middle: AppKit pins a view's layer at its corner.
+        let frame = self.image.frame();
+        layer.setAnchorPoint(NSPoint::new(0.5, 0.5));
+        layer.setPosition(NSPoint::new(
+            frame.origin.x + frame.size.width / 2.,
+            frame.origin.y + frame.size.height / 2.,
+        ));
+        let (from, to) = if up {
+            (0., std::f64::consts::PI)
+        } else {
+            (std::f64::consts::PI, 0.)
+        };
+        spring(&layer, "transform.rotation.z", from, to, CHEVRON_DURATION);
     }
 }
 
-/// Animates a Gaussian blur on `view` from `from` to `to` points of radius.
-fn animate_blur(view: &NSView, from: f64, to: f64) {
+/// Gives `view` a Gaussian blur named "blur" for animating; false when Core Image is not
+/// there.
+fn add_blur(view: &NSView) -> bool {
     let Some(layer) = view.layer() else {
-        return;
+        return false;
     };
-    let key = NSString::from_str("filters.blur.inputRadius");
-    let has_blur = layer.filters().is_some_and(|filters| filters.count() > 0);
-    if !has_blur {
-        let Some(class) = AnyClass::get(c"CIFilter") else {
-            return;
-        };
-        let filter: Option<Retained<AnyObject>> =
-            unsafe { msg_send![class, filterWithName: &*NSString::from_str("CIGaussianBlur")] };
-        let Some(filter) = filter else {
-            return;
-        };
-        unsafe {
-            let _: () = msg_send![&*filter, setDefaults];
-            let _: () = msg_send![&*filter, setName: &*NSString::from_str("blur")];
-        }
-        view.setLayerUsesCoreImageFilters(true);
-        let filters = NSArray::from_retained_slice(&[filter]);
-        unsafe {
-            let _: () = msg_send![view, setContentFilters: &*filters];
-        }
+    if layer.filters().is_some_and(|filters| filters.count() > 0) {
+        return true;
     }
-    let Some(layer) = view.layer() else {
-        return;
+    let Some(class) = AnyClass::get(c"CIFilter") else {
+        return false;
     };
-    let to_value = NSNumber::new_f64(to);
+    let filter: Option<Retained<AnyObject>> =
+        unsafe { msg_send![class, filterWithName: &*NSString::from_str("CIGaussianBlur")] };
+    let Some(filter) = filter else {
+        return false;
+    };
     unsafe {
-        let _: () = msg_send![&*layer, setValue: &*to_value, forKeyPath: &*key];
-        let Some(class) = AnyClass::get(c"CABasicAnimation") else {
-            return;
-        };
-        let animation: Retained<AnyObject> = msg_send![class, animationWithKeyPath: &*key];
-        let _: () = msg_send![&*animation, setFromValue: &*NSNumber::new_f64(from)];
-        let _: () = msg_send![&*animation, setToValue: &*to_value];
-        let _: () = msg_send![&*animation, setDuration: CHEVRON_DURATION];
-        let _: () =
-            msg_send![&*layer, addAnimation: &*animation, forKey: &*NSString::from_str("blur")];
+        let _: () = msg_send![&*filter, setDefaults];
+        let _: () = msg_send![&*filter, setName: &*NSString::from_str("blur")];
     }
+    view.setLayerUsesCoreImageFilters(true);
+    let filters = NSArray::from_retained_slice(&[filter]);
+    unsafe {
+        let _: () = msg_send![view, setContentFilters: &*filters];
+    }
+    true
 }
 
 /// The toolbar of the window that holds `ns_view`.
@@ -394,8 +423,15 @@ impl WindowToolbar {
         let chevron_size = chevron_image
             .as_ref()
             .map_or(NSSize::new(10., 10.), |image| image.size());
+        // The chevron sits on a clear square with room for its blur, turning about its middle.
+        let side = chevron_size.width.max(chevron_size.height) + CHEVRON_PAD * 2.;
         let chevron = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
-        chevron.setImage(chevron_image.as_deref());
+        chevron.setImage(
+            chevron_image
+                .as_deref()
+                .map(|image| centered_symbol(image, side))
+                .as_deref(),
+        );
         chevron.setImageScaling(NSImageScaling::ScaleNone);
         chevron.setContentTintColor(Some(&NSColor::labelColor()));
         chevron.setWantsLayer(true);
@@ -406,8 +442,11 @@ impl WindowToolbar {
         holder.setTranslatesAutoresizingMaskIntoConstraints(false);
         holder.addSubview(&chevron);
         chevron
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&holder.leadingAnchor(), CHEVRON_GAP)
+            .centerXAnchor()
+            .constraintEqualToAnchor_constant(
+                &holder.leadingAnchor(),
+                CHEVRON_GAP + chevron_size.width / 2.,
+            )
             .setActive(true);
         chevron
             .centerYAnchor()
@@ -415,11 +454,11 @@ impl WindowToolbar {
             .setActive(true);
         chevron
             .widthAnchor()
-            .constraintEqualToConstant(chevron_size.width)
+            .constraintEqualToConstant(side)
             .setActive(true);
         chevron
             .heightAnchor()
-            .constraintEqualToConstant(chevron_size.height)
+            .constraintEqualToConstant(side)
             .setActive(true);
         holder
             .heightAnchor()
@@ -475,6 +514,7 @@ impl WindowToolbar {
                 open_width,
                 inside: Cell::new(false),
                 shown: Cell::new(false),
+                turned: Cell::new(false),
             },
         });
 
@@ -630,9 +670,7 @@ impl WindowToolbar {
             glyph_image(&label.symbol, 14.).as_deref(),
             TILE,
         );
-        if let Some(layer) = state.tile.layer() {
-            layer.setBackgroundColor(Some(&box_color(&label.color).CGColor()));
-        }
+        paint_tile(&state.tile, &label.color, TILE, 7.);
         state.picker.mark(&label.color, &label.symbol);
         self.state.name.setTitle(&NSString::from_str(&label.name));
         self.status.setStringValue(&NSString::from_str(status));
@@ -702,23 +740,181 @@ pub(crate) fn glyph_image(name: &str, size: f64) -> Option<Retained<NSImage>> {
     image.imageWithSymbolConfiguration(&config)
 }
 
-/// Puts `image` in `view` so the symbol itself, not its padded box, sits in the middle of a
-/// `size` square: SF Symbols carry room for descenders that would push them off center.
+/// Puts `image`, a symbol, in `view` as a `size` square with the drawn glyph in its middle.
+/// SF Symbols carry room for descenders and baselines that leave the glyph off center when
+/// the image itself is centered, so the glyph is centered by its inked pixels instead.
 pub(crate) fn place_symbol(view: &NSImageView, image: Option<&NSImage>, size: f64) {
-    view.setImage(image);
-    let Some(image) = image else {
+    view.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(size, size)));
+    view.setImage(image.map(|image| centered_symbol(image, size)).as_deref());
+}
+
+/// `image` drawn on a clear `side` square so its ink sits in the middle, as a template image
+/// that takes its view's tint.
+pub(crate) fn centered_symbol(image: &NSImage, side: f64) -> Retained<NSImage> {
+    let size = image.size();
+    let ink = ink_bounds(image).unwrap_or(NSRect::new(NSPoint::ZERO, size));
+    let round = |value: f64| (value * 4.).round() / 4.;
+    let rect = NSRect::new(
+        NSPoint::new(
+            round(side / 2. - ink.origin.x - ink.size.width / 2.),
+            round(side / 2. - ink.origin.y - ink.size.height / 2.),
+        ),
+        size,
+    );
+    let image = image.retain();
+    let draw = block2::RcBlock::new(move |_: NSRect| -> Bool {
+        image.drawInRect_fromRect_operation_fraction(
+            rect,
+            NSRect::ZERO,
+            NSCompositingOperation::SourceOver,
+            1.,
+        );
+        Bool::YES
+    });
+    let centered =
+        NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(side, side), false, &draw);
+    centered.setTemplate(true);
+    centered
+}
+
+/// The part of `image` that is drawn on, in its points from the bottom left, found by
+/// drawing it four times over into a bitmap.
+fn ink_bounds(image: &NSImage) -> Option<NSRect> {
+    const SCALE: f64 = 4.;
+    let size = image.size();
+    let width = (size.width * SCALE).ceil() as isize;
+    let height = (size.height * SCALE).ceil() as isize;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            width,
+            height,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+    }?;
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    image.drawInRect_fromRect_operation_fraction(
+        NSRect::new(NSPoint::ZERO, NSSize::new(width as f64, height as f64)),
+        NSRect::ZERO,
+        NSCompositingOperation::SourceOver,
+        1.,
+    );
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
+
+    let data = rep.bitmapData();
+    if data.is_null() {
+        return None;
+    }
+    let row_bytes = rep.bytesPerRow();
+    let (mut left, mut right, mut top, mut bottom) = (isize::MAX, -1, isize::MAX, -1);
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = unsafe { *data.offset(y * row_bytes + x * 4 + 3) };
+            if alpha > 24 {
+                left = left.min(x);
+                right = right.max(x);
+                top = top.min(y);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    if right < 0 {
+        return None;
+    }
+    // Bitmap rows run from the top; the image counts from the bottom.
+    Some(NSRect::new(
+        NSPoint::new(left as f64 / SCALE, (height - 1 - bottom) as f64 / SCALE),
+        NSSize::new(
+            (right - left + 1) as f64 / SCALE,
+            (bottom - top + 1) as f64 / SCALE,
+        ),
+    ))
+}
+
+/// Fills a box's tile with its color as a soft top-to-bottom gradient, like a shortcut's
+/// icon in Shortcuts.
+pub(crate) fn paint_tile(tile: &NSView, color: &str, size: f64, radius: f64) {
+    let Some(layer) = tile.layer() else {
         return;
     };
-    let bounds = image.size();
-    let glyph = image.alignmentRect();
-    let round = |value: f64| (value * 2.).round() / 2.;
-    view.setFrame(NSRect::new(
-        NSPoint::new(
-            round(size / 2. - glyph.origin.x - glyph.size.width / 2.),
-            round(size / 2. - glyph.origin.y - glyph.size.height / 2.),
-        ),
-        bounds,
-    ));
+    layer.setCornerRadius(radius);
+    let base = box_color(color);
+    let top = base
+        .blendedColorWithFraction_ofColor(0.2, &NSColor::whiteColor())
+        .unwrap_or_else(|| base.clone());
+    let bottom = base
+        .blendedColorWithFraction_ofColor(0.08, &NSColor::blackColor())
+        .unwrap_or_else(|| base.clone());
+    let Some(class) = AnyClass::get(c"CAGradientLayer") else {
+        layer.setBackgroundColor(Some(&base.CGColor()));
+        return;
+    };
+    let name = NSString::from_str("ambry.fill");
+    let existing = unsafe { layer.sublayers() }.and_then(|sublayers| {
+        sublayers
+            .iter()
+            .find(|sublayer| sublayer.name().is_some_and(|n| *n == *name))
+    });
+    let gradient: Retained<AnyObject> = match existing {
+        Some(sublayer) => Retained::into_super(Retained::into_super(sublayer)),
+        None => unsafe {
+            let gradient: Retained<AnyObject> = msg_send![class, layer];
+            let _: () = msg_send![&*gradient, setName: &*name];
+            let _: () = msg_send![&*layer, insertSublayer: &*gradient, atIndex: 0u32];
+            gradient
+        },
+    };
+    let (top, bottom) = (top.CGColor(), bottom.CGColor());
+    let colors = NSMutableArray::<AnyObject>::new();
+    for color in [&bottom, &top] {
+        // CGColor is toll-free bridged to an Objective-C object.
+        let object: &AnyObject = unsafe { &*((&**color) as *const _ as *const AnyObject) };
+        colors.addObject(object);
+    }
+    unsafe {
+        let _: () = msg_send![
+            &*gradient,
+            setFrame: NSRect::new(NSPoint::ZERO, NSSize::new(size, size))
+        ];
+        let _: () = msg_send![&*gradient, setCornerRadius: radius];
+        let _: () = msg_send![&*gradient, setColors: &*colors];
+    }
+    layer.setBackgroundColor(None);
+}
+
+/// Runs a spring on `layer`'s `key_path` from `from` to `to`, as SwiftUI's default spring
+/// over `duration` seconds, and leaves the layer at `to`.
+pub(crate) fn spring(layer: &AnyObject, key_path: &str, from: f64, to: f64, duration: f64) {
+    let key = NSString::from_str(key_path);
+    let to_value = NSNumber::new_f64(to);
+    unsafe {
+        let _: () = msg_send![layer, setValue: &*to_value, forKeyPath: &*key];
+        let Some(class) = AnyClass::get(c"CASpringAnimation") else {
+            return;
+        };
+        let animation: Allocated<AnyObject> = msg_send![class, alloc];
+        let animation: Retained<AnyObject> =
+            msg_send![animation, initWithPerceptualDuration: duration, bounce: 0.0f64];
+        let _: () = msg_send![&*animation, setKeyPath: &*key];
+        let _: () = msg_send![&*animation, setFromValue: &*NSNumber::new_f64(from)];
+        let _: () = msg_send![&*animation, setToValue: &*to_value];
+        let settle: f64 = msg_send![&*animation, settlingDuration];
+        let _: () = msg_send![&*animation, setDuration: settle];
+        let _: () = msg_send![layer, addAnimation: &*animation, forKey: &*key];
+    }
 }
 
 /// The account picture cut to a circle, or the user's initial as a button, for the toolbar

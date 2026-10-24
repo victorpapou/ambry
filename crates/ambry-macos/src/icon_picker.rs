@@ -1,6 +1,6 @@
 //! The popover under the box's icon, laid out like the one under a shortcut's icon in
-//! Shortcuts: the icon on top, a line, the color dots, a line, then a symbol search over
-//! the glyphs in named sections.
+//! Shortcuts without the icon row, which the toolbar already shows: the color dots, a line,
+//! then a symbol search over the glyphs in named sections.
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -19,9 +19,6 @@ use crate::scroller::FlippedView;
 use crate::toolbar::{ToolbarEvent, box_color, glyph_image, place_symbol, sized_symbol};
 
 const WIDTH: f64 = 310.;
-/// The box's icon on top, with the highlight Shortcuts puts around the chosen icon.
-const PREVIEW: f64 = 28.;
-const PREVIEW_HIGHLIGHT: f64 = 34.;
 /// Color dots: Shortcuts' are 17 points, 29 apart, ten to a row.
 const DOT: f64 = 17.;
 const DOT_PITCH: f64 = 29.;
@@ -40,8 +37,6 @@ const GLYPH_TAG: isize = 1000;
 
 pub(crate) struct IconPicker {
     pub(crate) popover: Retained<NSPopover>,
-    preview_tile: Retained<NSView>,
-    preview_glyph: Retained<NSImageView>,
     checks: Vec<(String, Retained<NSImageView>)>,
     groups: Vec<(String, Vec<String>)>,
     document: Retained<FlippedView>,
@@ -90,52 +85,15 @@ impl IconPicker {
 
             let dot_rows = colors.len().div_ceil(DOT_COLUMNS);
             let dots_height = (dot_rows - 1) as f64 * DOT_PITCH + DOT;
-            let top_height = 14. + PREVIEW_HIGHLIGHT + 14.;
             let dots_section = 16. + dots_height + 16.;
             let search_section = 12. + SEARCH_HEIGHT + 8.;
-            let height = top_height + 1. + dots_section + 1. + search_section + GLYPHS_HEIGHT;
+            let height = dots_section + 1. + search_section + GLYPHS_HEIGHT;
             let view = NSView::initWithFrame(
                 NSView::alloc(mtm),
                 NSRect::new(NSPoint::ZERO, NSSize::new(WIDTH, height)),
             );
             // AppKit counts y from the bottom; `y` walks down from the top.
             let mut y = height;
-
-            y -= 14. + PREVIEW_HIGHLIGHT;
-            let highlight = NSView::initWithFrame(
-                NSView::alloc(mtm),
-                NSRect::new(
-                    NSPoint::new((WIDTH - PREVIEW_HIGHLIGHT) / 2., y),
-                    NSSize::new(PREVIEW_HIGHLIGHT, PREVIEW_HIGHLIGHT),
-                ),
-            );
-            highlight.setWantsLayer(true);
-            if let Some(layer) = highlight.layer() {
-                let accent = NSColor::controlAccentColor();
-                layer.setCornerRadius(9.);
-                layer.setBackgroundColor(Some(&accent.colorWithAlphaComponent(0.3).CGColor()));
-                layer.setBorderColor(Some(&accent.colorWithAlphaComponent(0.8).CGColor()));
-                layer.setBorderWidth(1.);
-            }
-            let inset = (PREVIEW_HIGHLIGHT - PREVIEW) / 2.;
-            let preview_tile = NSView::initWithFrame(
-                NSView::alloc(mtm),
-                NSRect::new(NSPoint::new(inset, inset), NSSize::new(PREVIEW, PREVIEW)),
-            );
-            preview_tile.setWantsLayer(true);
-            if let Some(layer) = preview_tile.layer() {
-                layer.setCornerRadius(7.);
-            }
-            let preview_glyph = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
-            preview_glyph.setImageScaling(NSImageScaling::ScaleNone);
-            preview_glyph.setContentTintColor(Some(&NSColor::whiteColor()));
-            preview_tile.addSubview(&preview_glyph);
-            highlight.addSubview(&preview_tile);
-            view.addSubview(&highlight);
-            y -= 14.;
-
-            y -= 1.;
-            view.addSubview(&separator(mtm, y));
 
             y -= 16.;
             let dots_left = (WIDTH - (DOT_COLUMNS - 1) as f64 * DOT_PITCH - DOT) / 2.;
@@ -218,8 +176,6 @@ impl IconPicker {
 
             let picker = Self {
                 popover,
-                preview_tile,
-                preview_glyph,
                 checks,
                 groups: groups
                     .iter()
@@ -325,17 +281,9 @@ impl IconPicker {
         self.mark_glyph();
     }
 
-    /// Shows the box's icon on top, checks its color and highlights its glyph.
+    /// Checks the box's color and highlights its glyph.
     pub(crate) fn mark(&self, color: &str, glyph: &str) {
         *self.current.borrow_mut() = (color.to_string(), glyph.to_string());
-        if let Some(layer) = self.preview_tile.layer() {
-            layer.setBackgroundColor(Some(&box_color(color).CGColor()));
-        }
-        place_symbol(
-            &self.preview_glyph,
-            glyph_image(glyph, 15.).as_deref(),
-            PREVIEW,
-        );
         for (name, check) in &self.checks {
             check.setHidden(name != color);
         }

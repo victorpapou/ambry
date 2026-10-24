@@ -16,7 +16,7 @@ use objc2_foundation::{NSPoint, NSRect, NSRectEdge, NSSize, NSString};
 
 use crate::native::Target;
 use crate::toolbar::{
-    BoxLabel, Hover, ToolbarEvent, box_color, glyph_image, place_symbol, sized_symbol,
+    BoxLabel, Hover, ToolbarEvent, glyph_image, paint_tile, place_symbol, sized_symbol,
 };
 
 const WIDTH: f64 = 260.;
@@ -313,10 +313,7 @@ fn icon_tile(
         NSRect::new(NSPoint::ZERO, NSSize::new(size, size)),
     );
     tile.setWantsLayer(true);
-    if let Some(layer) = tile.layer() {
-        layer.setCornerRadius(radius);
-        layer.setBackgroundColor(Some(&box_color(&label.color).CGColor()));
-    }
+    paint_tile(&tile, &label.color, size, radius);
     let image = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
     image.setImageScaling(NSImageScaling::ScaleNone);
     image.setContentTintColor(Some(&NSColor::whiteColor()));
