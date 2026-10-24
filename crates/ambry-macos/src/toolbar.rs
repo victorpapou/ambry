@@ -285,15 +285,16 @@ fn fit_sweep(label: &NSTextField) {
     if size.width <= 0. || size.height <= 0. {
         return;
     }
-    // The band leans like a "\": it is tilted by the lean in points, so its slant does not
-    // change with the text's length.
-    let drop = size.width * SWEEP_LEAN.to_radians().tan() / size.height / 2.;
+    // The band leans like a "/" by the lean from upright. A gradient's bands stand square to
+    // its axis in the layer's unit square, which the text's shape then stretches, so the
+    // axis drops by the lean's tangent scaled by the height over the width.
+    let drop = SWEEP_LEAN.to_radians().tan() * size.height / size.width / 2.;
     CATransaction::begin();
     CATransaction::setDisableActions(true);
     mask.setFrame(NSRect::new(NSPoint::ZERO, size));
     unsafe {
-        let _: () = msg_send![&*mask, setStartPoint: NSPoint::new(0., 0.5 - drop)];
-        let _: () = msg_send![&*mask, setEndPoint: NSPoint::new(1., 0.5 + drop)];
+        let _: () = msg_send![&*mask, setStartPoint: NSPoint::new(0., 0.5 + drop)];
+        let _: () = msg_send![&*mask, setEndPoint: NSPoint::new(1., 0.5 - drop)];
     }
     CATransaction::commit();
 }
