@@ -20,7 +20,11 @@ pub mod probe;
 #[cfg(target_os = "macos")]
 pub mod quick_look;
 #[cfg(target_os = "macos")]
+mod rename;
+#[cfg(target_os = "macos")]
 mod scroller;
+#[cfg(target_os = "macos")]
+pub mod settings;
 #[cfg(target_os = "macos")]
 mod table;
 #[cfg(target_os = "macos")]

@@ -8,7 +8,7 @@ use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, sel};
 use objc2_app_kit::{
-    NSAlert, NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSFont, NSImageScaling,
+    NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSFont, NSImageScaling,
     NSImageView, NSPopover, NSPopoverBehavior, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
     NSView, NSViewController,
 };
@@ -27,8 +27,6 @@ const ROW_TILE: f64 = 18.;
 const ROW_INSET: f64 = 8.;
 const SIDE: f64 = 16.;
 const NAME_LEFT: f64 = SIDE + ROW_TILE + 9.;
-/// `NSAlertFirstButtonReturn`.
-const FIRST_BUTTON: isize = 1000;
 
 pub(crate) struct BoxList {
     pub(crate) popover: Retained<NSPopover>,
@@ -126,11 +124,15 @@ impl BoxList {
             let rename_target = Target::new(mtm, {
                 let popover = self.popover.clone();
                 let on_event = on_event.clone();
-                let old = label.name.clone();
+                let label = label.clone();
+                let window = anchor.window();
                 move |_| {
                     unsafe { popover.performClose(None) };
-                    if let Some(name) = ask_name(mtm, &old) {
-                        on_event(ToolbarEvent::RenameBox(index, name));
+                    let on_event = on_event.clone();
+                    if let Some(window) = &window {
+                        crate::rename::ask_name(mtm, window, &label, move |name| {
+                            on_event(ToolbarEvent::RenameBox(index, name))
+                        });
                     }
                 }
             });
@@ -301,7 +303,7 @@ impl Row {
 }
 
 /// A box's icon: its glyph in white on a rounded square of its color.
-fn icon_tile(
+pub(crate) fn icon_tile(
     mtm: MainThreadMarker,
     label: &BoxLabel,
     size: f64,
@@ -348,24 +350,4 @@ fn separator(mtm: MainThreadMarker, y: f64) -> Retained<NSBox> {
     );
     line.setBoxType(NSBoxType::Separator);
     line
-}
-
-/// Asks for a new name for the box called `old` in a dialog; `None` when cancelled.
-fn ask_name(mtm: MainThreadMarker, old: &str) -> Option<String> {
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str("Rename Box"));
-    alert.setInformativeText(&NSString::from_str(&format!(
-        "Enter a new name for “{old}”."
-    )));
-    alert.addButtonWithTitle(&NSString::from_str("Rename"));
-    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-    let field = NSTextField::textFieldWithString(&NSString::from_str(old), mtm);
-    field.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(240., 24.)));
-    alert.setAccessoryView(Some(&field));
-    alert.window().setInitialFirstResponder(Some(&field));
-    if alert.runModal() != FIRST_BUTTON {
-        return None;
-    }
-    let name = field.stringValue().to_string().trim().to_string();
-    (!name.is_empty() && name != old).then_some(name)
 }

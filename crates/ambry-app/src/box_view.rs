@@ -187,6 +187,7 @@ enum ControlEvent {
     Scroll(f64, f64),
     /// Quick Look moved to the item at this index.
     Preview(usize),
+    Settings(ambry_macos::settings::SettingsEvent),
 }
 
 impl BoxView {
@@ -201,16 +202,15 @@ impl BoxView {
             .enumerate()
             .map(|(index, item)| (item.id, index.min(12) as f32 * 0.035))
             .collect();
-        let avatar = ambry_core::data_dir()
-            .ok()
-            .map(|dir| dir.join("avatar.png"))
-            .filter(|path| path.exists());
+        let avatar = avatar_path().filter(|path| path.exists());
         let boxes = ambry_core::list_boxes(store.dir());
+        #[cfg(target_os = "macos")]
+        let boxes_dir = store.dir().to_path_buf();
         Self {
             doc,
             store,
             boxes,
-            mode: Mode::Canvas,
+            mode: default_mode(),
             pan: point(px(0.), px(0.)),
             selected: None,
             drag: None,
@@ -218,7 +218,7 @@ impl BoxView {
             appear_delay,
             viewport: window.viewport_size(),
             #[cfg(target_os = "macos")]
-            controls: Self::attach_controls(avatar.as_deref(), window, cx),
+            controls: Self::attach_controls(boxes_dir, window, cx),
             avatar,
             focus,
             icons: HashMap::new(),
@@ -229,7 +229,7 @@ impl BoxView {
 
     #[cfg(target_os = "macos")]
     fn attach_controls(
-        avatar: Option<&Path>,
+        boxes_dir: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<NativeControls> {
@@ -245,6 +245,14 @@ impl BoxView {
         let controls = unsafe {
             let scrolled = events.clone();
             let previewed = events.clone();
+            let configured = events.clone();
+            ambry_macos::settings::configure(
+                avatar_path().unwrap_or_default(),
+                boxes_dir,
+                move |event| {
+                    configured.try_send(ControlEvent::Settings(event)).ok();
+                },
+            );
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
@@ -252,7 +260,7 @@ impl BoxView {
                 ns_view,
                 &BoxIcon::COLORS,
                 BoxIcon::SYMBOL_GROUPS,
-                avatar,
+                avatar_path().as_deref(),
                 &user_initial(),
                 move |event| {
                     let event = match event {
@@ -314,6 +322,7 @@ impl BoxView {
                         this.open_box(store, cx);
                     }
                     ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
+                    ControlEvent::Settings(event) => this.on_settings(event, cx),
                     ControlEvent::Preview(index) => {
                         if let Some(item) = this.doc.items.get(index) {
                             this.selected = Some(item.id);
@@ -334,7 +343,11 @@ impl BoxView {
     /// item count under the window title.
     #[cfg(target_os = "macos")]
     fn sync_controls(&mut self) {
-        let status = self.status().to_string();
+        let status = if self.drop_preview.is_some() || ambry_macos::settings::shows_item_count() {
+            self.status().to_string()
+        } else {
+            String::new()
+        };
         let area = self.scroll_area();
         let (x, y) = (-f32::from(self.pan.x), -f32::from(self.pan.y));
         let (width, height) = (
@@ -411,6 +424,23 @@ impl BoxView {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn on_settings(&mut self, event: ambry_macos::settings::SettingsEvent, cx: &mut Context<Self>) {
+        use ambry_macos::settings::SettingsEvent;
+        match event {
+            SettingsEvent::Account => {
+                self.avatar = avatar_path().filter(|path| path.exists());
+                if let Some(controls) = &self.controls {
+                    controls
+                        .toolbar
+                        .set_account(avatar_path().as_deref(), &user_initial());
+                }
+            }
+            SettingsEvent::ItemCount => {}
+        }
+        cx.notify();
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.mode = mode;
         #[cfg(target_os = "macos")]
@@ -477,7 +507,7 @@ impl BoxView {
         self.drag = None;
         self.pan = point(px(0.), px(0.));
         self.boxes = ambry_core::list_boxes(self.store.dir());
-        cx.notify();
+        self.set_mode(default_mode(), cx);
     }
 
     /// "New Box", or "New Box 2" and up when that name is taken.
@@ -1565,10 +1595,28 @@ fn floating() -> gpui::Div {
 }
 
 fn user_initial() -> SharedString {
-    std::env::var("USER")
-        .ok()
-        .and_then(|user| user.chars().next())
+    #[cfg(target_os = "macos")]
+    let name = Some(ambry_macos::settings::user_name());
+    #[cfg(not(target_os = "macos"))]
+    let name = std::env::var("USER").ok();
+    name.and_then(|user| user.chars().next())
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_else(|| "A".into())
         .into()
+}
+
+/// Where the account picture is kept.
+fn avatar_path() -> Option<PathBuf> {
+    ambry_core::data_dir()
+        .ok()
+        .map(|dir| dir.join("avatar.png"))
+}
+
+/// The view boxes open in: the list when Settings says so.
+fn default_mode() -> Mode {
+    #[cfg(target_os = "macos")]
+    if ambry_macos::settings::opens_in_list() {
+        return Mode::List;
+    }
+    Mode::Canvas
 }

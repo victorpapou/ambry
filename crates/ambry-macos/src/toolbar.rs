@@ -17,15 +17,15 @@ use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSBitmapImageRep, NSButton,
     NSClickGestureRecognizer, NSColor, NSCompositingOperation, NSControlSize,
     NSDeviceRGBColorSpace, NSEvent, NSFont, NSGraphicsContext, NSImage, NSImageScaling,
-    NSImageSymbolConfiguration, NSImageSymbolScale, NSImageView, NSLayoutConstraint,
-    NSPopoverDelegate, NSSegmentedControl, NSStackView, NSTabView, NSTextField, NSToolbar,
-    NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSImageSymbolConfiguration, NSImageSymbolScale, NSImageView, NSLayoutConstraint, NSMenu,
+    NSMenuItem, NSPopoverDelegate, NSSegmentedControl, NSStackView, NSTabView, NSTextField,
+    NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
     NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindowToolbarStyle,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindowToolbarStyle, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSCopying, NSMutableArray, NSNotification, NSNumber, NSPoint, NSRect, NSRectEdge,
-    NSSize, NSString,
+    NSSize, NSString, NSURL,
 };
 use objc2_quartz_core::CAMediaTimingFunction;
 
@@ -34,6 +34,7 @@ use crate::icon_picker::IconPicker;
 use crate::native::{
     Target, decorate_strip, icon_images, icon_tab_view, segments, selected_index, symbol,
 };
+use crate::settings::{self, Pane};
 
 const BOX: &str = "box";
 const ADD: &str = "add";
@@ -355,6 +356,7 @@ pub struct WindowToolbar {
     state: Rc<State>,
     modes: Retained<NSTabView>,
     status: Retained<NSTextField>,
+    account: Retained<NSButton>,
     _delegate: Retained<Delegate>,
     _targets: Vec<Retained<Target>>,
     /// The tracking area's owner and the box list's delegate, which AppKit does not retain.
@@ -633,8 +635,34 @@ impl WindowToolbar {
         let modes_item = item(mtm, MODES, "View");
         modes_item.setView(Some(&strip));
 
+        let account = account_button(mtm);
+        show_account(&account, avatar, initial);
+        let menu_targets = account_targets(mtm);
+        let account_target = Target::new(mtm, {
+            let targets = menu_targets.clone();
+            move |sender| {
+                if let Some(button) = sender.downcast_ref::<NSButton>() {
+                    account_menu(mtm, &targets).popUpMenuPositioningItem_atLocation_inView(
+                        None,
+                        NSPoint::new(
+                            0.,
+                            if button.isFlipped() {
+                                AVATAR_SIZE + 6.
+                            } else {
+                                -6.
+                            },
+                        ),
+                        Some(button),
+                    );
+                }
+            }
+        });
+        unsafe {
+            account.setTarget(Some(&account_target));
+            account.setAction(Some(sel!(fire:)));
+        }
         let avatar_item = item(mtm, AVATAR, "Account");
-        avatar_item.setView(Some(&account(mtm, avatar, initial)));
+        avatar_item.setView(Some(&account));
 
         let delegate: Retained<Delegate> = {
             let this = Delegate::alloc(mtm).set_ivars(DelegateIvars {
@@ -663,7 +691,18 @@ impl WindowToolbar {
             _delegate: delegate,
             _hover: hover,
             _list_watcher: list_watcher,
-            _targets: vec![tile_target, name_target, add_target, modes_target],
+            account,
+            _targets: [
+                vec![
+                    tile_target,
+                    name_target,
+                    add_target,
+                    modes_target,
+                    account_target,
+                ],
+                menu_targets,
+            ]
+            .concat(),
         })
     }
 
@@ -686,6 +725,11 @@ impl WindowToolbar {
         state.picker.mark(&label.color, &label.symbol);
         self.state.name.setTitle(&NSString::from_str(&label.name));
         self.status.setStringValue(&NSString::from_str(status));
+    }
+
+    /// Shows the account's `picture`, or its `initial` when there is none.
+    pub fn set_account(&self, picture: Option<&Path>, initial: &str) {
+        show_account(&self.account, picture, initial);
     }
 
     /// The boxes the name's menu offers, and which of them is open.
@@ -985,38 +1029,162 @@ pub(crate) fn spring(layer: &AnyObject, key_path: &str, from: f64, to: f64, dura
 
 /// The account picture cut to a circle, or the user's initial as a button, for the toolbar
 /// to put on glass.
-fn account(mtm: MainThreadMarker, picture: Option<&Path>, initial: &str) -> Retained<NSView> {
-    let image = picture.and_then(|path| {
-        NSImage::initWithContentsOfFile(
-            NSImage::alloc(),
-            &NSString::from_str(&path.to_string_lossy()),
-        )
-    });
+fn account_button(mtm: MainThreadMarker) -> Retained<NSButton> {
+    let button =
+        unsafe { NSButton::buttonWithTitle_target_action(&NSString::new(), None, None, mtm) };
+    button.setBordered(false);
+    button.setImageScaling(objc2_app_kit::NSImageScaling::ScaleProportionallyUpOrDown);
+    button.setFont(Some(&NSFont::systemFontOfSize_weight(13., unsafe {
+        objc2_app_kit::NSFontWeightMedium
+    })));
+    button.setTranslatesAutoresizingMaskIntoConstraints(false);
+    button
+        .widthAnchor()
+        .constraintEqualToConstant(AVATAR_SIZE)
+        .setActive(true);
+    button
+        .heightAnchor()
+        .constraintEqualToConstant(AVATAR_SIZE)
+        .setActive(true);
+    button.setToolTip(Some(&NSString::from_str("Account")));
+    button
+}
+
+fn show_account(button: &NSButton, picture: Option<&Path>, initial: &str) {
+    let image = picture
+        .filter(|path| path.exists())
+        .and_then(|path| {
+            NSImage::initWithContentsOfFile(
+                NSImage::alloc(),
+                &NSString::from_str(&path.to_string_lossy()),
+            )
+        })
+        .map(|image| round_image(&image, AVATAR_SIZE));
     match image {
         Some(image) => {
-            let view = NSImageView::imageViewWithImage(&image, mtm);
-            view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-            view.setFrame(NSRect::new(
-                NSPoint::new(0., 0.),
-                NSSize::new(AVATAR_SIZE, AVATAR_SIZE),
-            ));
-            view.setWantsLayer(true);
-            if let Some(layer) = view.layer() {
-                layer.setCornerRadius(AVATAR_SIZE / 2.);
-                layer.setMasksToBounds(true);
-            }
-            Retained::into_super(Retained::into_super(view))
+            button.setTitle(&NSString::new());
+            button.setImage(Some(&image));
+            button.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageOnly);
         }
         None => {
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str(initial),
-                    None,
-                    None,
-                    mtm,
-                )
-            };
-            Retained::into_super(Retained::into_super(button))
+            button.setImage(None);
+            button.setImagePosition(objc2_app_kit::NSCellImagePosition::NoImage);
+            button.setTitle(&NSString::from_str(initial));
         }
     }
+}
+
+/// `image` filling a circle `side` points across, with a bitmap for each screen density.
+fn round_image(image: &NSImage, side: f64) -> Retained<NSImage> {
+    let size = image.size();
+    let round = NSImage::initWithSize(NSImage::alloc(), NSSize::new(side, side));
+    for scale in [1., 2.] {
+        let pixels = side * scale;
+        let fill = (pixels / size.width).max(pixels / size.height);
+        let drawn = NSSize::new(size.width * fill, size.height * fill);
+        let rect = NSRect::new(
+            NSPoint::new((pixels - drawn.width) / 2., (pixels - drawn.height) / 2.),
+            drawn,
+        );
+        let clip = NSRect::new(NSPoint::ZERO, NSSize::new(pixels, pixels));
+        if let Some(rep) = draw_clipped(image, pixels as isize, rect, clip) {
+            rep.setSize(NSSize::new(side, side));
+            round.addRepresentation(&rep);
+        }
+    }
+    round
+}
+
+/// `image` drawn into `rect` of a clear square bitmap `pixels` across, inside the oval in
+/// `clip`.
+fn draw_clipped(
+    image: &NSImage,
+    pixels: isize,
+    rect: NSRect,
+    clip: NSRect,
+) -> Option<Retained<NSBitmapImageRep>> {
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            pixels,
+            pixels,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+    }?;
+    let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&context));
+    objc2_app_kit::NSBezierPath::bezierPathWithOvalInRect(clip).addClip();
+    image.drawInRect_fromRect_operation_fraction(
+        rect,
+        NSRect::ZERO,
+        NSCompositingOperation::SourceOver,
+        1.,
+    );
+    context.flushGraphics();
+    NSGraphicsContext::restoreGraphicsState_class();
+    Some(rep)
+}
+
+/// What the account menu's items do, in the order [`account_menu`] uses them.
+fn account_targets(mtm: MainThreadMarker) -> Vec<Retained<Target>> {
+    let pane = |pane: Pane| Target::new(mtm, move |_| settings::open(pane));
+    let link = |url: &'static str| {
+        Target::new(mtm, move |_| {
+            if let Some(url) = NSURL::URLWithString(&NSString::from_str(url)) {
+                NSWorkspace::sharedWorkspace().openURL(&url);
+            }
+        })
+    };
+    vec![
+        pane(Pane::Account),
+        pane(Pane::General),
+        pane(Pane::Ai),
+        pane(Pane::Connections),
+        link("https://github.com/victorpapou/ambry"),
+        link("https://github.com/victorpapou/ambry/issues/new"),
+    ]
+}
+
+/// The menu under the account picture: who is signed in, then Settings and its panes, then
+/// help.
+fn account_menu(mtm: MainThreadMarker, targets: &[Retained<Target>]) -> Retained<NSMenu> {
+    let menu = NSMenu::new(mtm);
+    let header = NSMenuItem::new(mtm);
+    header.setTitle(&NSString::from_str(&settings::user_name()));
+    header.setEnabled(false);
+    menu.addItem(&header);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let entries: [(&str, &str, &str); 6] = [
+        ("Account…", "person.crop.circle", ""),
+        ("Settings…", "gearshape", ","),
+        ("AI Model…", "sparkles", ""),
+        ("Connections…", "puzzlepiece.extension", ""),
+        ("Ambry on GitHub", "questionmark.circle", ""),
+        ("Report a Problem…", "exclamationmark.bubble", ""),
+    ];
+    for (index, ((title, glyph, key), target)) in entries.iter().zip(targets).enumerate() {
+        if index == 4 {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(sel!(fire:)),
+                &NSString::from_str(key),
+            )
+        };
+        unsafe { item.setTarget(Some(target)) };
+        item.setImage(symbol(glyph, title).as_deref());
+        menu.addItem(&item);
+    }
+    menu
 }

@@ -4,7 +4,7 @@
 //! The panel asks the responder chain for a controller, so the window GPUI made learns to
 //! answer it: the methods are added to its class the first time a preview opens.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::ffi::CStr;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -91,7 +91,7 @@ define_class!(
 
 thread_local! {
     static ITEMS: RefCell<Option<Retained<PreviewItems>>> = const { RefCell::new(None) };
-    static TAUGHT: Cell<bool> = const { Cell::new(false) };
+    static TAUGHT: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
 fn items(mtm: MainThreadMarker) -> Retained<PreviewItems> {
@@ -118,10 +118,14 @@ pub fn toggle(paths: &[PathBuf], current: usize, on_move: impl Fn(usize) + 'stat
         unsafe { QLPreviewPanel::sharedPreviewPanel(mtm) }.map(|panel| panel.orderOut(None));
         return;
     }
-    let Some(window) = NSApplication::sharedApplication(mtm).keyWindow() else {
-        return;
-    };
-    teach(window.class());
+    // The panel looks for its controller along the responder chain of the key window,
+    // which ends at the application, so both learn to answer it.
+    let app = NSApplication::sharedApplication(mtm);
+    if let Some(window) = app.keyWindow().or_else(|| app.mainWindow()) {
+        teach(window.class());
+        window.makeKeyWindow();
+    }
+    teach(app.class());
     let items = items(mtm);
     *items.ivars().on_move.borrow_mut() = Some(Rc::new(on_move));
     set_paths(&items, paths);
@@ -130,6 +134,11 @@ pub fn toggle(paths: &[PathBuf], current: usize, on_move: impl Fn(usize) + 'stat
     };
     unsafe {
         panel.updateController();
+        // A controller AppKit didn't find still gets its items.
+        if panel.dataSource().is_none() {
+            panel.setDataSource(Some(ProtocolObject::from_ref(&*items)));
+            panel.setDelegate(Some(&items));
+        }
         panel.reloadData();
         panel.setCurrentPreviewItemIndex(current as NSInteger);
     }
@@ -168,7 +177,12 @@ fn set_paths(items: &PreviewItems, paths: &[PathBuf]) {
 
 /// Adds the panel controller's three methods to the window's class.
 fn teach(class: &AnyClass) {
-    if TAUGHT.replace(true) {
+    let key = class as *const AnyClass as usize;
+    if TAUGHT.with_borrow_mut(|taught| {
+        let seen = taught.contains(&key);
+        taught.push(key);
+        seen
+    }) {
         return;
     }
     extern "C-unwind" fn accepts(_: &AnyObject, _: Sel, _: *mut AnyObject) -> Bool {
