@@ -7,9 +7,8 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSControlSize, NSGlassEffectContainerView,
-    NSGlassEffectView, NSImage, NSSegmentSwitchTracking, NSSegmentedControl, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor, NSControlSize, NSImage,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSView,
 };
 use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSSize, NSString};
 
@@ -72,39 +71,8 @@ impl Toolbar {
         let mtm = MainThreadMarker::new()?;
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
         let target = Target::new(Box::new(on_event), mtm);
-        let glass = has_liquid_glass();
 
-        let x = INSET + AVATAR + GAP_AFTER_AVATAR;
-        let width = SEGMENTS_WIDTH + GAP + HEIGHT;
-        let y = if parent.isFlipped() {
-            parent.bounds().size.height - INSET - HEIGHT
-        } else {
-            INSET
-        };
-        let frame = rect(x, y, width, HEIGHT);
-
-        // On macOS 26 a glass container lets the two glass shapes blend into each other.
-        let (root, content): (Retained<NSView>, Retained<NSView>) = if glass {
-            let container = NSGlassEffectContainerView::initWithFrame(
-                NSGlassEffectContainerView::alloc(mtm),
-                frame,
-            );
-            container.setSpacing(GAP);
-            let content = NSView::initWithFrame(NSView::alloc(mtm), rect(0., 0., width, HEIGHT));
-            container.setContentView(Some(&content));
-            (Retained::into_super(container), content)
-        } else {
-            let content = NSView::initWithFrame(NSView::alloc(mtm), frame);
-            (content.clone(), content)
-        };
-        let pinned = if parent.isFlipped() {
-            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMinYMargin
-        } else {
-            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMaxYMargin
-        };
-        root.setAutoresizingMask(pinned);
-
-        // Canvas / list switch.
+        // Canvas / list switch: a plain NSSegmentedControl, drawn by AppKit as is.
         let images = NSArray::from_retained_slice(&[
             template_png(FRAME_ICON, 18.)?,
             symbol("list.bullet", "List")?,
@@ -119,21 +87,14 @@ impl Toolbar {
             )
         };
         segments.setControlSize(NSControlSize::Large);
+        // Neutral selection like toolbar switches, instead of the accent-blue default.
+        segments.setSelectedSegmentBezelColor(Some(&NSColor::quaternaryLabelColor()));
         segments.setSelectedSegment(0);
         segments.setToolTip_forSegment(Some(&NSString::from_str("Canvas")), 0);
         segments.setToolTip_forSegment(Some(&NSString::from_str("List")), 1);
-        let segments_shape = capsule(rect(0., 0., SEGMENTS_WIDTH, HEIGHT), glass, mtm);
-        let fitting = segments.fittingSize();
-        segments.setFrame(rect(
-            ((SEGMENTS_WIDTH - fitting.width) / 2.).max(0.),
-            ((HEIGHT - fitting.height) / 2.).max(0.),
-            fitting.width.min(SEGMENTS_WIDTH),
-            fitting.height.min(HEIGHT),
-        ));
-        add_content(&segments_shape, &segments, glass);
-        content.addSubview(&segments_shape);
+        let segments_size = segments.fittingSize();
 
-        // Add button.
+        // Add button: a glass button on macOS 26, a round push button before that.
         let plus = symbol("plus", "Add files")?;
         let add = unsafe {
             NSButton::buttonWithImage_target_action(
@@ -144,19 +105,35 @@ impl Toolbar {
             )
         };
         add.setControlSize(NSControlSize::Large);
-        add.setToolTip(Some(&NSString::from_str("Add files or folders")));
-        let add_frame = rect(SEGMENTS_WIDTH + GAP, 0., HEIGHT, HEIGHT);
-        if glass {
-            add.setBezelStyle(NSBezelStyle::Glass);
-            add.setFrame(add_frame);
-            content.addSubview(&add);
+        add.setBezelStyle(if has_liquid_glass() {
+            NSBezelStyle::Glass
         } else {
-            add.setBordered(false);
-            let add_shape = capsule(add_frame, false, mtm);
-            add.setFrame(rect(0., 0., HEIGHT, HEIGHT));
-            add_content(&add_shape, &add, false);
-            content.addSubview(&add_shape);
-        }
+            NSBezelStyle::Circular
+        });
+        add.setToolTip(Some(&NSString::from_str("Add files or folders")));
+
+        let width = segments_size.width + GAP + HEIGHT;
+        let x = INSET + AVATAR + GAP_AFTER_AVATAR;
+        let y = if parent.isFlipped() {
+            parent.bounds().size.height - INSET - HEIGHT
+        } else {
+            INSET
+        };
+        let root = NSView::initWithFrame(NSView::alloc(mtm), rect(x, y, width, HEIGHT));
+        root.setAutoresizingMask(if parent.isFlipped() {
+            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMinYMargin
+        } else {
+            NSAutoresizingMaskOptions::ViewMaxXMargin | NSAutoresizingMaskOptions::ViewMaxYMargin
+        });
+        segments.setFrame(rect(
+            0.,
+            ((HEIGHT - segments_size.height) / 2.).max(0.),
+            segments_size.width,
+            segments_size.height.min(HEIGHT),
+        ));
+        add.setFrame(rect(segments_size.width + GAP, 0., HEIGHT, HEIGHT));
+        root.addSubview(&segments);
+        root.addSubview(&add);
 
         parent.addSubview(&root);
         Some(Self {
@@ -184,39 +161,6 @@ fn has_liquid_glass() -> bool {
 
 fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
-}
-
-/// A rounded backing shape: Liquid Glass on macOS 26, a vibrancy material before that.
-fn capsule(frame: NSRect, glass: bool, mtm: MainThreadMarker) -> Retained<NSView> {
-    if glass {
-        let view = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
-        view.setCornerRadius(frame.size.height / 2.);
-        Retained::into_super(view)
-    } else {
-        let view = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), frame);
-        view.setMaterial(NSVisualEffectMaterial::Popover);
-        view.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
-        view.setState(NSVisualEffectState::Active);
-        view.setWantsLayer(true);
-        if let Some(layer) = view.layer() {
-            layer.setCornerRadius(frame.size.height / 2.);
-            layer.setMasksToBounds(true);
-        }
-        Retained::into_super(view)
-    }
-}
-
-fn add_content(shape: &NSView, content: &NSView, glass: bool) {
-    if glass {
-        // NSGlassEffectView sizes its content view to fill it, so wrap the control.
-        let mtm = MainThreadMarker::from(shape);
-        let wrapper = NSView::initWithFrame(NSView::alloc(mtm), shape.bounds());
-        wrapper.addSubview(content);
-        let glass: &NSGlassEffectView = unsafe { &*(shape as *const NSView).cast() };
-        glass.setContentView(Some(&wrapper));
-    } else {
-        shape.addSubview(content);
-    }
 }
 
 fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
