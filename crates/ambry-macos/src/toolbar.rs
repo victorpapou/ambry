@@ -16,10 +16,10 @@ use objc2::{
 use objc2_app_kit::{
     NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont, NSImage,
     NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSMenu, NSMenuItem, NSPopover,
-    NSPopoverBehavior, NSStackView, NSTextField, NSToolbar, NSToolbarDelegate,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemGroup,
-    NSToolbarItemGroupSelectionMode, NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier,
-    NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindowToolbarStyle,
+    NSPopoverBehavior, NSSegmentSwitchTracking, NSSegmentedControl, NSStackView, NSTextField,
+    NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSUserInterfaceLayoutOrientation,
+    NSView, NSViewController, NSWindowToolbarStyle,
 };
 use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
 
@@ -206,7 +206,7 @@ fn menu_item(
 /// The toolbar of the window that holds `ns_view`.
 pub struct WindowToolbar {
     state: Rc<State>,
-    modes: Retained<NSToolbarItemGroup>,
+    modes: Retained<NSSegmentedControl>,
     status: Retained<NSTextField>,
     _delegate: Retained<Delegate>,
     _targets: Vec<Retained<Target>>,
@@ -349,8 +349,8 @@ impl WindowToolbar {
         let modes_target = Target::new(mtm, {
             let state = state.clone();
             move |sender| {
-                if let Some(group) = sender.downcast_ref::<NSToolbarItemGroup>() {
-                    if let Ok(index) = usize::try_from(group.selectedIndex()) {
+                if let Some(control) = sender.downcast_ref::<NSSegmentedControl>() {
+                    if let Ok(index) = usize::try_from(control.selectedSegment()) {
                         (state.on_event)(ToolbarEvent::Mode(index));
                     }
                 }
@@ -360,22 +360,23 @@ impl WindowToolbar {
             .iter()
             .filter_map(|(name, description)| symbol(name, description))
             .collect();
+        // A segmented control as the item's view: the toolbar draws it as one glass capsule
+        // with a grey pill under the selected segment, and lifts the bubble while pressed.
         let modes = unsafe {
-            NSToolbarItemGroup::groupWithItemIdentifier_images_selectionMode_labels_target_action(
-                &NSString::from_str(MODES),
+            NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
                 &NSArray::from_retained_slice(&images),
-                NSToolbarItemGroupSelectionMode::SelectOne,
-                Some(&NSArray::from_retained_slice(&[
-                    NSString::from_str("Canvas"),
-                    NSString::from_str("List"),
-                ])),
+                NSSegmentSwitchTracking::SelectOne,
                 Some(&modes_target),
                 Some(sel!(fire:)),
                 mtm,
             )
         };
-        modes.setLabel(&NSString::from_str("View"));
-        modes.setSelectedIndex(0);
+        for (segment, label) in ["Canvas", "List"].iter().enumerate() {
+            modes.setToolTip_forSegment(Some(&NSString::from_str(label)), segment as isize);
+        }
+        modes.setSelectedSegment(0);
+        let modes_item = item(mtm, MODES, "View");
+        modes_item.setView(Some(&modes));
 
         let avatar_item = item(mtm, AVATAR, "Account");
         avatar_item.setView(Some(&account(mtm, avatar, initial)));
@@ -385,7 +386,7 @@ impl WindowToolbar {
                 items: vec![
                     (BOX, box_item),
                     (ADD, add),
-                    (MODES, Retained::into_super(modes.clone())),
+                    (MODES, modes_item),
                     (AVATAR, avatar_item),
                 ],
             });
@@ -417,8 +418,8 @@ impl WindowToolbar {
 
     /// Selects canvas (0) or list (1) without reporting it.
     pub fn select_mode(&self, index: usize) {
-        if self.modes.selectedIndex() != index as isize {
-            self.modes.setSelectedIndex(index as isize);
+        if self.modes.selectedSegment() != index as isize {
+            self.modes.setSelectedSegment(index as isize);
         }
     }
 
