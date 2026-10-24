@@ -6,14 +6,16 @@ use std::rc::Rc;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
-    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class,
+    msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSBezelStyle, NSButton, NSClickGestureRecognizer, NSColor,
-    NSControl, NSControlBorderShape, NSControlSize, NSFont, NSGestureRecognizer,
-    NSGestureRecognizerState, NSGlassEffectView, NSImage, NSImageScaling, NSImageView,
+    NSAnimatablePropertyContainer, NSBezelStyle, NSButton, NSColor, NSControl,
+    NSControlBorderShape, NSControlSize, NSFont, NSGestureRecognizer, NSGestureRecognizerState,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSImage, NSImageScaling, NSImageView,
     NSPressGestureRecognizer, NSResponder, NSSegmentedControl, NSTabPosition, NSTabView,
     NSTabViewBorderType, NSTabViewDelegate, NSTabViewItem, NSTextAlignment, NSTextField, NSView,
+    NSWindowOrderingMode,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -127,6 +129,104 @@ fn make_interactive(glass: &NSGlassEffectView) {
 /// The state of `recognizer`; the getter is missing from the bindings.
 fn gesture_state(recognizer: &NSGestureRecognizer) -> NSGestureRecognizerState {
     NSGestureRecognizerState(unsafe { msg_send![recognizer, state] })
+}
+
+define_class!(
+    // Glass that floats over a control while it is pressed and takes no clicks itself.
+    #[unsafe(super(NSGlassEffectView, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryLensGlass"]
+    struct LensGlass;
+
+    impl LensGlass {
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> {
+            None
+        }
+    }
+);
+
+/// The clear glass bubble that swells over a pressed tab or button, like the lens system
+/// tab strips lift. It lives next to the control in the window so it can grow past it.
+struct Lens {
+    glass: Retained<NSGlassEffectView>,
+    /// The control the bubble belongs to; rects are given in its coordinates.
+    anchor: Retained<NSView>,
+    /// The control's outermost view, which the window hosts; the bubble goes right above it.
+    root: Retained<NSView>,
+    /// How much bigger than the pressed rect the bubble grows.
+    grow: f64,
+}
+
+impl Lens {
+    fn new(mtm: MainThreadMarker, anchor: &NSView, root: &NSView, grow: f64) -> Option<Self> {
+        if !has_liquid_glass() {
+            return None;
+        }
+        let glass: Retained<LensGlass> =
+            unsafe { msg_send![LensGlass::alloc(mtm), initWithFrame: NSRect::ZERO] };
+        let glass: Retained<NSGlassEffectView> = Retained::into_super(glass);
+        glass.setStyle(NSGlassEffectViewStyle::Clear);
+        glass.setAlphaValue(0.);
+        Some(Self {
+            glass,
+            anchor: anchor.retain(),
+            root: root.retain(),
+            grow,
+        })
+    }
+
+    /// `rect` from the anchor's coordinates to the bubble's superview's, grown by `scale`.
+    fn frame(&self, rect: NSRect, scale: f64) -> Option<NSRect> {
+        let parent = unsafe { self.glass.superview() }?;
+        let rect = self.anchor.convertRect_toView(rect, Some(&parent));
+        let width = rect.size.width * scale;
+        let height = rect.size.height * scale;
+        Some(NSRect::new(
+            NSPoint::new(
+                rect.origin.x - (width - rect.size.width) / 2.,
+                rect.origin.y - (height - rect.size.height) / 2.,
+            ),
+            NSSize::new(width, height),
+        ))
+    }
+
+    /// Swells the bubble out of `rect`.
+    fn press(&self, rect: NSRect) {
+        let root = &self.root;
+        let Some(parent) = (unsafe { root.superview() }) else {
+            return;
+        };
+        if unsafe { self.glass.superview() }.as_deref() != Some(&*parent) {
+            parent.addSubview_positioned_relativeTo(
+                &self.glass,
+                NSWindowOrderingMode::Above,
+                Some(root),
+            );
+        }
+        let (Some(start), Some(end)) = (self.frame(rect, 1.), self.frame(rect, self.grow)) else {
+            return;
+        };
+        self.glass.setFrame(start);
+        self.glass.setCornerRadius(end.size.height / 2.);
+        self.glass.animator().setFrame(end);
+        self.glass.animator().setAlphaValue(1.);
+    }
+
+    /// Slides the swollen bubble over `rect`.
+    fn follow(&self, rect: NSRect) {
+        if let Some(frame) = self.frame(rect, self.grow) {
+            self.glass.animator().setFrame(frame);
+        }
+    }
+
+    /// Shrinks the bubble back into `rect` and lets it fade.
+    fn release(&self, rect: NSRect) {
+        if let Some(frame) = self.frame(rect, 1.) {
+            self.glass.animator().setFrame(frame);
+        }
+        self.glass.animator().setAlphaValue(0.);
+    }
 }
 
 struct Hosted {
@@ -573,7 +673,6 @@ impl GlassButton {
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
-        let target = Target::new(mtm, move |_| on_click());
         let image = symbol(symbol_name, tooltip)?;
         let bounds = NSRect::new(NSPoint::new(0., 0.), NSSize::new(size, size));
         if has_liquid_glass() {
@@ -582,16 +681,29 @@ impl GlassButton {
             glass.setCornerRadius(size / 2.);
             glass.setContentView(Some(&icon));
             make_interactive(&glass);
-            let click = unsafe {
-                NSClickGestureRecognizer::initWithTarget_action(
-                    NSClickGestureRecognizer::alloc(mtm),
-                    Some(&target),
-                    Some(sel!(fire:)),
-                )
-            };
-            click.setDelaysPrimaryMouseButtonEvents(false);
-            glass.addGestureRecognizer(&click);
             let root: Retained<NSView> = Retained::into_super(glass.clone());
+            let lens = Lens::new(mtm, &root, &root, BUTTON_LENS_GROW);
+            let target = Target::new(mtm, move |sender| {
+                let Some(press) = sender.downcast_ref::<NSGestureRecognizer>() else {
+                    return;
+                };
+                let Some(view) = press.view() else { return };
+                let lens = lens.as_ref();
+                match gesture_state(press) {
+                    NSGestureRecognizerState::Began => lens.inspect(|lens| lens.press(bounds)),
+                    NSGestureRecognizerState::Changed => None,
+                    NSGestureRecognizerState::Ended => {
+                        lens.inspect(|lens| lens.release(bounds));
+                        let point = press.locationInView(Some(&view));
+                        if view.mouse_inRect(point, view.bounds()) {
+                            on_click();
+                        }
+                        None
+                    }
+                    _ => lens.inspect(|lens| lens.release(bounds)),
+                };
+            });
+            root.addGestureRecognizer(&press_recognizer(mtm, &target));
             return Some(Self {
                 native: NativeView::host(parent, root.clone(), target),
                 root,
@@ -599,6 +711,7 @@ impl GlassButton {
                 button: None,
             });
         }
+        let target = Target::new(mtm, move |_| on_click());
         let button = unsafe {
             NSButton::buttonWithImage_target_action(&image, Some(&target), Some(sel!(fire:)), mtm)
         };
@@ -662,15 +775,28 @@ impl TabsState {
         if self.shown.replace(index) == index && animated {
             return;
         }
-        let frame = NSRect::new(
-            NSPoint::new(PILL_INSET + index as f64 * self.item_width, PILL_INSET),
-            NSSize::new(self.item_width, self.height - PILL_INSET * 2.),
-        );
+        let frame = self.pill_frame(index);
         if animated {
             self.pill.animator().setFrame(frame);
         } else {
             self.pill.setFrame(frame);
         }
+    }
+
+    /// Where the pill sits on tab `index`.
+    fn pill_frame(&self, index: usize) -> NSRect {
+        NSRect::new(
+            NSPoint::new(PILL_INSET + index as f64 * self.item_width, PILL_INSET),
+            NSSize::new(self.item_width, self.height - PILL_INSET * 2.),
+        )
+    }
+
+    /// A pill-sized rect centred on the pointer at `x`, kept inside the capsule.
+    fn lens_frame(&self, x: f64) -> NSRect {
+        let mut frame = self.pill_frame(0);
+        let last = PILL_INSET + (self.count.max(1) - 1) as f64 * self.item_width;
+        frame.origin.x = (x - self.item_width / 2.).clamp(PILL_INSET, last);
+        frame
     }
 
     /// The tab under `x`, in the capsule's coordinates.
@@ -682,6 +808,26 @@ impl TabsState {
 
 /// Room between the capsule's edge and the selection pill.
 const PILL_INSET: f64 = 2.;
+/// How much the bubble over a pressed tab outgrows the pill.
+const TABS_LENS_GROW: f64 = 1.4;
+/// How much the bubble over a pressed button outgrows the button.
+const BUTTON_LENS_GROW: f64 = 1.25;
+
+/// Reports a press from the moment the mouse goes down until it comes up, wherever it moves,
+/// without holding the click back from the views under it.
+fn press_recognizer(mtm: MainThreadMarker, target: &Target) -> Retained<NSGestureRecognizer> {
+    let press = unsafe {
+        NSPressGestureRecognizer::initWithTarget_action(
+            NSPressGestureRecognizer::alloc(mtm),
+            Some(target),
+            Some(sel!(fire:)),
+        )
+    };
+    press.setMinimumPressDuration(0.);
+    press.setAllowableMovement(10_000.);
+    press.setDelaysPrimaryMouseButtonEvents(false);
+    Retained::into_super(press)
+}
 
 impl GlassTabs {
     /// One tab `item_width` points wide per `(symbol, description)`, on a capsule `height`
@@ -726,28 +872,6 @@ impl GlassTabs {
             selected: Cell::new(0),
             shown: Cell::new(0),
         });
-        let target = Target::new(mtm, {
-            let state = state.clone();
-            move |sender| {
-                let Some(press) = sender.downcast_ref::<NSGestureRecognizer>() else {
-                    return;
-                };
-                let Some(view) = press.view() else { return };
-                let index = state.index_at(press.locationInView(Some(&view)).x);
-                match gesture_state(press) {
-                    NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed => {
-                        state.place_pill(index, true);
-                    }
-                    NSGestureRecognizerState::Ended => {
-                        state.place_pill(index, true);
-                        if state.selected.replace(index) != index {
-                            on_select(index);
-                        }
-                    }
-                    _ => state.place_pill(state.selected.get(), true),
-                }
-            }
-        });
 
         let glass = has_liquid_glass().then(|| {
             let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), bounds);
@@ -758,19 +882,44 @@ impl GlassTabs {
         });
         let view: Retained<NSView> = match &glass {
             Some(glass) => Retained::into_super(glass.clone()),
-            None => content,
+            None => content.clone(),
         };
-        let press = unsafe {
-            NSPressGestureRecognizer::initWithTarget_action(
-                NSPressGestureRecognizer::alloc(mtm),
-                Some(&target),
-                Some(sel!(fire:)),
-            )
-        };
-        press.setMinimumPressDuration(0.);
-        press.setAllowableMovement(10_000.);
-        press.setDelaysPrimaryMouseButtonEvents(false);
-        view.addGestureRecognizer(&press);
+        let lens = Lens::new(mtm, &content, &view, TABS_LENS_GROW);
+        let target = Target::new(mtm, {
+            let state = state.clone();
+            move |sender| {
+                let Some(press) = sender.downcast_ref::<NSGestureRecognizer>() else {
+                    return;
+                };
+                let Some(view) = press.view() else { return };
+                let x = press.locationInView(Some(&view)).x;
+                let index = state.index_at(x);
+                let lens = lens.as_ref();
+                match gesture_state(press) {
+                    NSGestureRecognizerState::Began => {
+                        state.place_pill(index, true);
+                        lens.inspect(|lens| lens.press(state.lens_frame(x)));
+                    }
+                    NSGestureRecognizerState::Changed => {
+                        state.place_pill(index, true);
+                        lens.inspect(|lens| lens.follow(state.lens_frame(x)));
+                    }
+                    NSGestureRecognizerState::Ended => {
+                        state.place_pill(index, true);
+                        lens.inspect(|lens| lens.release(state.pill_frame(index)));
+                        if state.selected.replace(index) != index {
+                            on_select(index);
+                        }
+                    }
+                    _ => {
+                        let selected = state.selected.get();
+                        state.place_pill(selected, true);
+                        lens.inspect(|lens| lens.release(state.pill_frame(selected)));
+                    }
+                }
+            }
+        });
+        view.addGestureRecognizer(&press_recognizer(mtm, &target));
 
         let tabs = Self {
             native: NativeView::host(parent, view, target),

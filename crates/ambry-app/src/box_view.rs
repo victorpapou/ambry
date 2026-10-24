@@ -20,7 +20,7 @@ use crate::native_view::native;
 
 /// Width of each canvas/list tab, in points.
 #[cfg(target_os = "macos")]
-const TAB_WIDTH: f64 = 40.;
+const TAB_WIDTH: f64 = 30.;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
