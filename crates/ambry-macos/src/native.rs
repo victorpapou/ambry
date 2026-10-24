@@ -14,7 +14,7 @@ use objc2_app_kit::{
     NSSegmentedControl, NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate,
     NSTabViewItem, NSTextAlignment, NSTextField, NSView,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 
 pub(crate) struct TargetIvars {
     on_action: Box<dyn Fn(&AnyObject)>,
@@ -502,6 +502,17 @@ impl GlassButton {
         if self.button.respondsToSelector(sel!(setTintProminence:)) {
             self.button
                 .setTintProminence(objc2_app_kit::NSTintProminence::Primary);
+        }
+        // A prominent button picks its own glyph color, white over any fill; the glyph is
+        // drawn black into the image itself so it shows on the white.
+        if let Some(image) = self.button.image() {
+            let black = objc2_app_kit::NSImageSymbolConfiguration::configurationWithPaletteColors(
+                &NSArray::from_retained_slice(&[NSColor::blackColor()]),
+            );
+            if let Some(image) = image.imageWithSymbolConfiguration(&black) {
+                image.setTemplate(false);
+                self.button.setImage(Some(&image));
+            }
         }
         self.button
             .setContentTintColor(Some(&NSColor::blackColor()));

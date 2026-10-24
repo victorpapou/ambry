@@ -45,11 +45,11 @@ const MODE_WIDTH: f64 = 32.;
 const AVATAR_SIZE: f64 = 28.;
 /// The box's icon tile next to its name, as big as a shortcut's in the Shortcuts editor.
 const TILE: f64 = 26.;
-/// Font sizes of the box's name and of the status under it.
+/// Font size of the box's name and status.
 const TITLE_SIZE: f64 = 14.;
-const STATUS_SIZE: f64 = 11.;
-/// One pass of the light sweeping over the status, in seconds.
+/// One pass of the light sweeping over the status, in seconds, and its lean from upright.
 const SWEEP: f64 = 1.6;
+const SWEEP_LEAN: f64 = 30.;
 const CHEVRON_SIZE: f64 = 12.;
 /// Room the chevron takes after the name when it shows.
 const CHEVRON_GAP: f64 = 5.;
@@ -282,14 +282,24 @@ fn fit_sweep(label: &NSTextField) {
         return;
     };
     let size = label.fittingSize();
+    if size.width <= 0. || size.height <= 0. {
+        return;
+    }
+    // The band leans like a "/": the light runs right and down at the lean, measured in
+    // points, so its slant does not change with the text's length.
+    let drop = size.width * SWEEP_LEAN.to_radians().tan() / size.height / 2.;
     CATransaction::begin();
     CATransaction::setDisableActions(true);
     mask.setFrame(NSRect::new(NSPoint::ZERO, size));
+    unsafe {
+        let _: () = msg_send![&*mask, setStartPoint: NSPoint::new(0., 0.5 + drop)];
+        let _: () = msg_send![&*mask, setEndPoint: NSPoint::new(1., 0.5 - drop)];
+    }
     CATransaction::commit();
 }
 
 /// The chevron after the box's name: it comes out of a blur while the pointer is over the
-/// name or the box list is open.
+/// name or the box list is open, pushing the status aside.
 struct Chevron {
     image: Retained<NSImageView>,
     width: Retained<NSLayoutConstraint>,
@@ -528,7 +538,7 @@ impl WindowToolbar {
         }
 
         let status = NSTextField::labelWithString(&NSString::new(), mtm);
-        status.setFont(Some(&NSFont::systemFontOfSize(STATUS_SIZE)));
+        status.setFont(Some(&NSFont::systemFontOfSize(TITLE_SIZE)));
         status.setTextColor(Some(&NSColor::secondaryLabelColor()));
         sweep(&status);
         // An empty view after the status gives the chevron its room while it is hidden and
@@ -539,33 +549,20 @@ impl WindowToolbar {
             .widthAnchor()
             .constraintEqualToConstant(open_width);
         spare.setActive(true);
-        // The name with its chevron, and the status under them.
-        let name_row = NSStackView::stackViewWithViews(
+        let stack = NSStackView::stackViewWithViews(
             &NSArray::from_retained_slice(&[
+                tile.clone(),
                 Retained::into_super(Retained::into_super(name.clone())),
                 holder.clone(),
+                Retained::into_super(Retained::into_super(status.clone())),
                 spare_view,
             ]),
             mtm,
         );
-        name_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        name_row.setSpacing(0.);
-        let titles = NSStackView::stackViewWithViews(
-            &NSArray::from_retained_slice(&[
-                Retained::into_super(name_row),
-                Retained::into_super(Retained::into_super(status.clone())),
-            ]),
-            mtm,
-        );
-        titles.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-        titles.setAlignment(objc2_app_kit::NSLayoutAttribute::Leading);
-        titles.setSpacing(0.);
-        let stack = NSStackView::stackViewWithViews(
-            &NSArray::from_retained_slice(&[tile.clone(), Retained::into_super(titles)]),
-            mtm,
-        );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         stack.setSpacing(10.);
+        stack.setCustomSpacing_afterView(0., &name);
+        stack.setCustomSpacing_afterView(0., &status);
         // Shortcuts keeps its icon 16 points from the traffic lights.
         stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
             top: 0.,

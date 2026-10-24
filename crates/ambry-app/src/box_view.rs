@@ -174,7 +174,7 @@ struct NativeControls {
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
     /// The blur behind the toolbar.
-    _toolbar_blur: ambry_macos::SoftEdge,
+    toolbar_blur: ambry_macos::SoftEdge,
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
     scroll: ambry_macos::CanvasScrollView,
     /// The add button, bottom right.
@@ -309,7 +309,7 @@ impl BoxView {
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
-                _toolbar_blur: toolbar_blur,
+                toolbar_blur,
                 scroll,
                 add,
                 shown_scroll: None,
@@ -395,6 +395,7 @@ impl BoxView {
         let Some(controls) = &mut self.controls else {
             return;
         };
+        controls.toolbar_blur.set_color(palette().canvas);
         let items = self.doc.items.len();
         let shown = (box_label(&self.doc.name, &self.doc.icon, items), status);
         if controls.shown_box.as_ref() != Some(&shown) {
