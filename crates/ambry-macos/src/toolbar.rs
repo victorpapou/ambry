@@ -7,8 +7,8 @@ use objc2::{
     AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor, NSControlSize, NSImage,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSView,
+    NSAutoresizingMaskOptions, NSBezelStyle, NSButton, NSColor, NSControlSize, NSGlassEffectView,
+    NSImage, NSSegmentStyle, NSSegmentSwitchTracking, NSSegmentedControl, NSTextField, NSView,
 };
 use objc2_foundation::{NSArray, NSData, NSPoint, NSRect, NSSize, NSString};
 
@@ -141,6 +141,94 @@ impl Toolbar {
             segments,
             _target: target,
         })
+    }
+
+    /// Temporary: stacks numbered variants of the canvas/list switch above the toolbar
+    /// so the design can be picked from one screenshot.
+    ///
+    /// # Safety
+    /// Same as [`Toolbar::attach`].
+    pub unsafe fn attach_switch_gallery(ns_view: NonNull<c_void>) -> Option<()> {
+        let mtm = MainThreadMarker::new()?;
+        let parent: &NSView = unsafe { ns_view.cast().as_ref() };
+        let glass = has_liquid_glass();
+        let variants: [(bool, NSSegmentStyle, Option<Retained<NSColor>>); 8] = [
+            (false, NSSegmentStyle::Automatic, None),
+            (false, NSSegmentStyle::Separated, None),
+            (false, NSSegmentStyle::Capsule, None),
+            (false, NSSegmentStyle::TexturedRounded, None),
+            (glass, NSSegmentStyle::Automatic, None),
+            (glass, NSSegmentStyle::Separated, None),
+            (glass, NSSegmentStyle::Capsule, None),
+            (
+                glass,
+                NSSegmentStyle::Automatic,
+                Some(NSColor::tertiarySystemFillColor()),
+            ),
+        ];
+        for (index, (in_glass, style, bezel)) in variants.into_iter().enumerate() {
+            let images = NSArray::from_retained_slice(&[
+                template_png(FRAME_ICON, 18.)?,
+                symbol("list.bullet", "List")?,
+            ]);
+            let segments = unsafe {
+                NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
+                    &images,
+                    NSSegmentSwitchTracking::SelectOne,
+                    None,
+                    None,
+                    mtm,
+                )
+            };
+            segments.setControlSize(NSControlSize::Large);
+            segments.setSegmentStyle(style);
+            if let Some(bezel) = &bezel {
+                segments.setSelectedSegmentBezelColor(Some(bezel));
+            }
+            segments.setSelectedSegment(0);
+            let size = segments.fittingSize();
+
+            let row_y = INSET + (HEIGHT + 14.) * (index as f64 + 1.);
+            let y = if parent.isFlipped() {
+                parent.bounds().size.height - row_y - HEIGHT
+            } else {
+                row_y
+            };
+            let label =
+                NSTextField::labelWithString(&NSString::from_str(&format!("{}", index + 1)), mtm);
+            label.setFrame(rect(INSET, y + (HEIGHT - 17.) / 2., 24., 17.));
+            parent.addSubview(&label);
+
+            let x = INSET + AVATAR + GAP_AFTER_AVATAR;
+            if in_glass {
+                let pad = 3.;
+                let frame = rect(x, y, size.width + 2. * pad, HEIGHT);
+                let shape = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+                shape.setCornerRadius(HEIGHT / 2.);
+                let wrapper = NSView::initWithFrame(
+                    NSView::alloc(mtm),
+                    rect(0., 0., frame.size.width, HEIGHT),
+                );
+                segments.setFrame(rect(
+                    pad,
+                    ((HEIGHT - size.height) / 2.).max(0.),
+                    size.width,
+                    size.height.min(HEIGHT),
+                ));
+                wrapper.addSubview(&segments);
+                shape.setContentView(Some(&wrapper));
+                parent.addSubview(&shape);
+            } else {
+                segments.setFrame(rect(
+                    x,
+                    y + ((HEIGHT - size.height) / 2.).max(0.),
+                    size.width,
+                    size.height.min(HEIGHT),
+                ));
+                parent.addSubview(&segments);
+            }
+        }
+        Some(())
     }
 
     /// Selects the canvas (0) or list (1) segment without sending an event.

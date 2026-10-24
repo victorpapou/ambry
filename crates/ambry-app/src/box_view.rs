@@ -117,6 +117,10 @@ impl BoxView {
                 events.try_send(event).ok();
             })
         }?;
+        if std::env::var_os("AMBRY_SWITCH_GALLERY").is_some() {
+            // SAFETY: as above.
+            unsafe { ambry_macos::Toolbar::attach_switch_gallery(appkit.ns_view) };
+        }
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
