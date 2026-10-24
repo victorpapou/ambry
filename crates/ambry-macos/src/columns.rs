@@ -25,7 +25,10 @@ const LIMIT: usize = 500;
 
 /// How far its highlight keeps from the column's sides, and its corners:
 /// Finder's column view on macOS 26.
-const ROW_INSET: f64 = 6.;
+const ROW_INSET: f64 = 10.;
+/// Height of a row. A browser with a matrix delegate refuses `setRowHeight:`, so each
+/// column's matrix is given it.
+const ROW_HEIGHT: f64 = 24.;
 const ROW_RADIUS: f64 = 6.;
 const FONT_SIZE: f64 = 13.;
 
@@ -101,6 +104,19 @@ define_class!(
 
         #[unsafe(method(browser:willDisplayCell:atRow:column:))]
         fn will_display(&self, browser: &NSBrowser, cell: &AnyObject, row: isize, column: isize) {
+            let matrix: *mut AnyObject = unsafe { msg_send![browser, matrixInColumn: column] };
+            if let Some(matrix) = unsafe { matrix.as_ref() } {
+                let size: NSSize = unsafe { msg_send![matrix, cellSize] };
+                if size.height != ROW_HEIGHT {
+                    unsafe {
+                        let _: () = msg_send![
+                            matrix,
+                            setCellSize: NSSize::new(size.width, ROW_HEIGHT)
+                        ];
+                        let _: () = msg_send![matrix, sizeToCells];
+                    }
+                }
+            }
             let Some(path) = self.entries(browser, column).get(row as usize).cloned() else {
                 return;
             };

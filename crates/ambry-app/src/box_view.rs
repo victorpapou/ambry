@@ -42,6 +42,8 @@ const ACCENT: u32 = 0x2f7cf6;
 /// How hard a pinch past the zoom limits pulls: the zoom shown grows as this power of the
 /// zoom asked for.
 const RUBBER: f32 = 0.3;
+/// How much bigger a dragged item is drawn.
+const LIFT: f32 = 0.06;
 /// How long the canvas takes to spring back to an edge, in seconds.
 const SPRING_RESPONSE: f32 = 0.4;
 const MIN_ZOOM: f32 = 0.3;
@@ -123,6 +125,15 @@ struct Marquee {
     now: Point<Pixels>,
 }
 
+/// How an item came to rest on the canvas, which sets its bounce.
+#[derive(Clone, Copy)]
+enum Landing {
+    /// Just added: it opens out from small, like a new folder in Finder.
+    Added,
+    /// Let go after a drag: it drops a little below its size and settles.
+    Dropped,
+}
+
 struct Drag {
     id: u64,
     /// Mouse position minus the item's top-left corner, in window coordinates.
@@ -165,6 +176,11 @@ pub struct BoxView {
     drop_preview: Option<DropPreview>,
     /// Seconds to wait before a card plays its appear animation, so a batch lands one by one.
     appear_delay: HashMap<u64, f32>,
+    /// When each item last landed, for its bounce, and when the dragged one was lifted.
+    landed: HashMap<u64, (std::time::Instant, Landing)>,
+    lifted_at: Option<std::time::Instant>,
+    /// Items that have been selected, whose highlight fades out when they are not.
+    was_selected: std::cell::RefCell<HashSet<u64>>,
     viewport: gpui::Size<Pixels>,
     avatar: Option<PathBuf>,
     focus: FocusHandle,
@@ -259,6 +275,9 @@ impl BoxView {
             drag: None,
             drop_preview: None,
             appear_delay,
+            landed: HashMap::new(),
+            lifted_at: None,
+            was_selected: Default::default(),
             viewport: window.viewport_size(),
             #[cfg(target_os = "macos")]
             controls: Self::attach_controls(boxes_dir, window, cx),
@@ -969,6 +988,8 @@ impl BoxView {
         let added = self.doc.add_paths(&paths, x, y);
         for (index, id) in added.iter().enumerate() {
             self.appear_delay.insert(*id, index as f32 * 0.05);
+            self.landed
+                .insert(*id, (std::time::Instant::now(), Landing::Added));
         }
         if let Some(&last) = added.last() {
             self.selected = Some(last);
@@ -1056,6 +1077,37 @@ impl BoxView {
         cx.notify();
     }
 
+    /// How much bigger than its size item `id` is drawn now: lifted while dragged, and
+    /// bouncing for a moment after it lands.
+    fn pop(&self, id: u64, lifted: bool) -> f32 {
+        if lifted {
+            let t = self.lifted_at.map_or(1., |at| at.elapsed().as_secs_f32());
+            return 1. + LIFT * (1. - (-t / 0.06).exp());
+        }
+        let Some((at, landing)) = self.landed.get(&id) else {
+            return 1.;
+        };
+        let delay = self.appear_delay.get(&id).copied().unwrap_or(0.);
+        let t = at.elapsed().as_secs_f32();
+        match landing {
+            Landing::Added => {
+                let t = (t - delay).max(0.);
+                1. - 0.45 * (-7. * t).exp() * (13. * t).cos()
+            }
+            Landing::Dropped => 1. + LIFT * (-8. * t).exp() * (16. * t).cos(),
+        }
+    }
+
+    /// Whether some item is still bouncing or growing, so frames keep coming.
+    fn popping(&self) -> bool {
+        self.lifted_at
+            .is_some_and(|at| at.elapsed().as_secs_f32() < 0.4)
+            || self
+                .landed
+                .values()
+                .any(|(at, _)| at.elapsed().as_secs_f32() < 1.2)
+    }
+
     fn is_picked(&self, id: u64) -> bool {
         self.selected == Some(id) || self.picked.contains(&id)
     }
@@ -1124,6 +1176,9 @@ impl BoxView {
         let x = self.canvas_left(origin.x);
         self.doc.move_item(id, x, y);
         if let Some(drag) = &mut self.drag {
+            if !drag.moved {
+                self.lifted_at = Some(std::time::Instant::now());
+            }
             drag.moved = true;
         }
         cx.notify();
@@ -1135,8 +1190,11 @@ impl BoxView {
         }
         if let Some(drag) = self.drag.take() {
             if drag.moved {
+                self.landed
+                    .insert(drag.id, (std::time::Instant::now(), Landing::Dropped));
                 self.save();
             }
+            self.lifted_at = None;
             cx.notify();
         }
     }
@@ -1293,6 +1351,51 @@ impl BoxView {
         let left = self.screen_left(item.x);
         let top = self.pan.y + px(item.y * self.zoom) - if lifted { px(3.) } else { px(0.) };
         let delay = self.appear_delay.get(&id).copied().unwrap_or(0.);
+        let pop = self.pop(id, lifted);
+        let fade = selected || self.was_selected.borrow().contains(&id);
+        if selected {
+            self.was_selected.borrow_mut().insert(id);
+        }
+        let face = finder_face(item, self.icon(item), false, lifted, self.zoom * pop);
+        let face = if fade {
+            face.with_animation(
+                (if selected { "select" } else { "deselect" }, id as usize),
+                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                move |this, t| {
+                    let mut tint = palette().selection;
+                    tint.a *= if selected { t } else { 1. - t };
+                    this.bg(tint)
+                },
+            )
+            .into_any_element()
+        } else {
+            face.into_any_element()
+        };
+        let label = item_label(item.name(), false, item.exists());
+        let label = if fade {
+            label
+                .with_animation(
+                    (
+                        if selected {
+                            "select-label"
+                        } else {
+                            "deselect-label"
+                        },
+                        id as usize,
+                    ),
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    move |this, t| {
+                        let on = if selected { t } else { 1. - t };
+                        let mut accent: Hsla = rgb(ACCENT).into();
+                        accent.a = on;
+                        this.bg(accent)
+                            .when(on > 0.5, |this| this.text_color(gpui::white()))
+                    },
+                )
+                .into_any_element()
+        } else {
+            label.into_any_element()
+        };
 
         div()
             .id(("item", id as usize))
@@ -1315,14 +1418,8 @@ impl BoxView {
                     this.on_item_mouse_down(id, event, window, cx)
                 }),
             )
-            .child(finder_face(
-                item,
-                self.icon(item),
-                selected,
-                lifted,
-                self.zoom,
-            ))
-            .child(item_label(item.name(), selected, item.exists()))
+            .child(face)
+            .child(label)
             .with_animation(
                 ("appear", id as usize),
                 Animation::new(Duration::from_secs_f32(0.45 + delay))
@@ -1364,12 +1461,13 @@ impl BoxView {
         self.icons.get(&item.path).cloned().flatten()
     }
 
-    /// Finder's column view, AppKit's own browser, under the toolbar.
+    /// Finder's column view, AppKit's own browser. It runs under the toolbar as Finder's
+    /// does: its columns inset themselves below the bar and scroll under its glass.
     #[cfg(target_os = "macos")]
     fn render_columns(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .absolute()
-            .top(px(layout::BAR as f32))
+            .top_0()
             .left_0()
             .right_0()
             .bottom_0()
@@ -1557,6 +1655,11 @@ impl BoxView {
 
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.popping() {
+            window.request_animation_frame();
+        } else {
+            self.landed.clear();
+        }
         self.viewport = window.viewport_size();
         // A canvas pulled past an edge stays there until it springs back.
         if self.drag.is_none() && !self.fingers && !self.springing {
@@ -1641,8 +1744,13 @@ impl Render for BoxView {
                     root.child(
                         div()
                             .absolute()
-                            .bottom(px((layout::ADD_MARGIN + (layout::ADD - 22.) / 2.) as f32))
-                            .left(px(layout::LIGHTS_LEFT as f32))
+                            // Over the add button, centred on it; it shows while the zoom
+                            // changes and fades out after.
+                            .bottom(px((layout::ADD_MARGIN + layout::ADD + 4.) as f32))
+                            .right(px(layout::TOOLBAR_SIDE as f32))
+                            .w(px(layout::ADD as f32))
+                            .flex()
+                            .justify_center()
                             .child(native(controls.zoom_label.native())),
                     )
                 })
@@ -1717,22 +1825,38 @@ fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32, window: &mu
     while spacing < DOT_SPACING / 2. {
         spacing *= 2.;
     }
+    // Every other dot fades out as the grid closes in, gone by the time it halves.
+    let between = ((spacing - DOT_SPACING / 2.) / (DOT_SPACING / 2.)).clamp(0., 1.);
     let radius = (DOT_RADIUS * zoom.sqrt()).clamp(0.75, 2.5);
-    let start_x = f32::from(pan.x).rem_euclid(spacing);
-    let start_y = f32::from(pan.y).rem_euclid(spacing);
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
     let dot = size(px(radius * 2.), px(radius * 2.));
-
-    let mut y = start_y;
-    while y < height {
-        let mut x = start_x;
-        while x < width {
-            let origin = bounds.origin + point(px(x - radius), px(y - radius));
-            window.paint_quad(fill(Bounds::new(origin, dot), color).corner_radii(px(radius)));
-            x += spacing;
+    // Index the dots from the canvas origin, so the same ones fade wherever it is panned.
+    let first = |pan: f32| (-pan / spacing).ceil() as i64;
+    let (first_x, first_y) = (first(f32::from(pan.x)), first(f32::from(pan.y)));
+    let mut row = first_y;
+    loop {
+        let y = f32::from(pan.y) + row as f32 * spacing;
+        if y >= height {
+            break;
         }
-        y += spacing;
+        let mut column = first_x;
+        loop {
+            let x = f32::from(pan.x) + column as f32 * spacing;
+            if x >= width {
+                break;
+            }
+            let odd = column.rem_euclid(2) == 1 || row.rem_euclid(2) == 1;
+            let alpha = if odd { between } else { 1. };
+            if alpha > 0.01 {
+                let origin = bounds.origin + point(px(x - radius), px(y - radius));
+                let mut shade = color;
+                shade.a *= alpha;
+                window.paint_quad(fill(Bounds::new(origin, dot), shade).corner_radii(px(radius)));
+            }
+            column += 1;
+        }
+        row += 1;
     }
 }
 
@@ -1933,7 +2057,7 @@ fn ghost_face(item: &Item, icon: Option<PathBuf>, scale: f32) -> gpui::AnyElemen
         .into_any_element()
 }
 
-fn item_label(name: String, selected: bool, exists: bool) -> impl IntoElement {
+fn item_label(name: String, selected: bool, exists: bool) -> gpui::Div {
     div()
         .max_w(px(ITEM_WIDTH))
         .px(px(6.))

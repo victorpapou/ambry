@@ -22,6 +22,8 @@ const FONT_SIZE: f64 = 11.;
 const DIGITS: usize = 3;
 /// How long a digit takes to roll.
 const ROLL: f64 = 0.28;
+/// How long the label shows after the zoom changes, fading in and out included.
+const SHOWN: f64 = 1.8;
 
 /// The zoom's percentage.
 pub struct ZoomLabel {
@@ -67,6 +69,8 @@ impl ZoomLabel {
         );
         view.setWantsLayer(true);
         let root = view.layer()?;
+        // At rest the label is gone; it shows only while the zoom changes.
+        root.setOpacity(0.);
         let scale = parent
             .window()
             .map_or(2., |window| window.backingScaleFactor());
@@ -146,6 +150,9 @@ impl ZoomLabel {
         }
         let text: String = value.max(0).to_string().chars().take(DIGITS).collect();
         let old = self.shown.replace(text.clone());
+        if old != text && !old.is_empty() {
+            self.show_for_a_moment();
+        }
         if old != text {
             let regrow = old.len() != text.len();
             if regrow {
@@ -168,6 +175,43 @@ impl ZoomLabel {
         }
         CATransaction::commit();
         let _ = &self.font;
+    }
+
+    /// Fades the label in, holds it while the zoom keeps changing, then fades it out.
+    fn show_for_a_moment(&self) {
+        let Some(layer) = self.view.layer() else {
+            return;
+        };
+        let Some(class) = AnyClass::get(c"CAKeyframeAnimation") else {
+            return;
+        };
+        let from = layer
+            .presentationLayer()
+            .map_or(layer.opacity(), |shown| shown.opacity());
+        layer.setOpacity(0.);
+        unsafe {
+            let fade: Retained<AnyObject> = msg_send![
+                class,
+                animationWithKeyPath: &*NSString::from_str("opacity")
+            ];
+            let values = objc2_foundation::NSArray::from_retained_slice(&[
+                objc2_foundation::NSNumber::new_f32(from),
+                objc2_foundation::NSNumber::new_f32(1.),
+                objc2_foundation::NSNumber::new_f32(1.),
+                objc2_foundation::NSNumber::new_f32(0.),
+            ]);
+            let times = objc2_foundation::NSArray::from_retained_slice(&[
+                objc2_foundation::NSNumber::new_f64(0.),
+                objc2_foundation::NSNumber::new_f64(0.1),
+                objc2_foundation::NSNumber::new_f64(0.7),
+                objc2_foundation::NSNumber::new_f64(1.),
+            ]);
+            let _: () = msg_send![&*fade, setValues: &*values];
+            let _: () = msg_send![&*fade, setKeyTimes: &*times];
+            let _: () = msg_send![&*fade, setDuration: SHOWN];
+            let _: () =
+                msg_send![&*layer, addAnimation: &*fade, forKey: &*NSString::from_str("shown")];
+        }
     }
 
     /// Lays out `count` digit slots and the "%" after them.
