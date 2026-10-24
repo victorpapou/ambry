@@ -217,8 +217,12 @@ fn spring_to(layer: &CALayer, to: CATransform3D, (duration, bounce): (f64, f64))
     CATransaction::setDisableActions(true);
     layer.setTransform(to);
     CATransaction::commit();
-    let from = NSValue::valueWithCATransform3D(from);
-    let to = NSValue::valueWithCATransform3D(to);
+    let (from, to) = unsafe {
+        (
+            NSValue::valueWithCATransform3D(from),
+            NSValue::valueWithCATransform3D(to),
+        )
+    };
     animate(layer, "transform", &from, &to, duration, bounce);
 }
 

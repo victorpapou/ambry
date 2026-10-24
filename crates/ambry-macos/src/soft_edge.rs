@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSGradient, NSImage, NSImageResizingMode, NSResponder, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
