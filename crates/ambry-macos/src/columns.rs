@@ -12,9 +12,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSBezierPath, NSBrowser, NSBrowserCell, NSCell, NSColor, NSFont, NSView, NSWorkspace,
+    NSBezierPath, NSBrowser, NSBrowserCell, NSCell, NSColor, NSCompositingOperation, NSFont,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration,
+    NSImageSymbolScale, NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName,
+    NSStringDrawing, NSView, NSWorkspace,
 };
-use objc2_foundation::{NSIndexSet, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSIndexSet, NSPoint, NSRect, NSSize, NSString};
 
 use crate::native::{NativeView, Target};
 
@@ -29,12 +32,24 @@ const ROW_INSET: f64 = 10.;
 /// Height of a row. A browser with a matrix delegate refuses `setRowHeight:`, so each
 /// column's matrix is given it.
 const ROW_HEIGHT: f64 = 24.;
+/// The highlight leaves this much clear above and below it, so neighbours do not touch.
+const ROW_GAP: f64 = 1.;
 const ROW_RADIUS: f64 = 6.;
 const FONT_SIZE: f64 = 13.;
+/// The icon, how far it sits inside the highlight, and the gap from it to the name.
+const ICON: f64 = 16.;
+const ICON_INSET: f64 = 7.;
+const ICON_GAP: f64 = 6.;
+/// Finder's chevron after a folder: its size, and how far it keeps from the highlight's end.
+const CHEVRON: f64 = 10.;
+const CHEVRON_INSET: f64 = 8.;
+/// The pocket edges AppKit allows a plain scroll view by default.
+const POCKET_EDGES: usize = 3;
 
 define_class!(
     // A browser row drawn the way Finder draws it: a rounded highlight inset from the column's
-    // edges instead of a bar across it.
+    // edges, blue in the column being worked in and grey in the ones before it, the icon and
+    // the name centred in it, and a chevron after a folder.
     #[unsafe(super(NSBrowserCell, NSCell, objc2::runtime::NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "AmbryColumnCell"]
@@ -49,27 +64,125 @@ define_class!(
         #[unsafe(method(drawWithFrame:inView:))]
         fn draw(&self, frame: NSRect, view: &NSView) {
             let highlighted: bool = unsafe { msg_send![self, isHighlighted] };
+            let leaf: bool = unsafe { msg_send![self, isLeaf] };
+            // Blue only where the keyboard is: the column whose matrix has focus in the key
+            // window. The path to it stays picked in grey.
+            let focused = view.window().is_some_and(|window| {
+                window.isKeyWindow()
+                    && window
+                        .firstResponder()
+                        .is_some_and(|responder| std::ptr::eq(&*responder as *const _ as *const NSView, view))
+            });
+            let emphasized = highlighted && focused;
             let inner = NSRect::new(
-                NSPoint::new(frame.origin.x + ROW_INSET, frame.origin.y + 1.),
-                NSSize::new(frame.size.width - ROW_INSET * 2., frame.size.height - 2.),
+                NSPoint::new(frame.origin.x + ROW_INSET, frame.origin.y + ROW_GAP),
+                NSSize::new(
+                    frame.size.width - ROW_INSET * 2.,
+                    frame.size.height - ROW_GAP * 2.,
+                ),
             );
             if highlighted {
-                NSColor::selectedContentBackgroundColor().setFill();
+                if emphasized {
+                    NSColor::selectedContentBackgroundColor().setFill();
+                } else {
+                    NSColor::unemphasizedSelectedContentBackgroundColor().setFill();
+                }
                 NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
                     inner, ROW_RADIUS, ROW_RADIUS,
                 )
                 .fill();
             }
-            let text = NSRect::new(
-                NSPoint::new(inner.origin.x + 4., frame.origin.y),
-                NSSize::new(inner.size.width - 4., frame.size.height),
-            );
-            unsafe {
-                let _: () = msg_send![super(self), drawInteriorWithFrame: text, inView: view];
+            let middle = frame.origin.y + frame.size.height / 2.;
+            let image: Option<Retained<NSImage>> = unsafe { msg_send![self, image] };
+            let icon_x = inner.origin.x + ICON_INSET;
+            if let Some(image) = image {
+                let rect = NSRect::new(
+                    NSPoint::new(icon_x, (middle - ICON / 2.).round()),
+                    NSSize::new(ICON, ICON),
+                );
+                unsafe {
+                    image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+                        rect,
+                        NSRect::ZERO,
+                        NSCompositingOperation::SourceOver,
+                        1.,
+                        true,
+                        None,
+                    );
+                }
             }
+            let ink = if emphasized {
+                NSColor::alternateSelectedControlTextColor()
+            } else {
+                NSColor::labelColor()
+            };
+            let mut text_end = inner.origin.x + inner.size.width - ICON_INSET;
+            if !leaf {
+                if let Some(chevron) = chevron(if emphasized {
+                    NSColor::alternateSelectedControlTextColor()
+                } else {
+                    NSColor::secondaryLabelColor()
+                }) {
+                    let size = chevron.size();
+                    let x = inner.origin.x + inner.size.width - CHEVRON_INSET - size.width;
+                    let rect = NSRect::new(
+                        NSPoint::new(x.round(), (middle - size.height / 2.).round()),
+                        size,
+                    );
+                    unsafe {
+                        chevron.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+                            rect,
+                            NSRect::ZERO,
+                            NSCompositingOperation::SourceOver,
+                            1.,
+                            true,
+                            None,
+                        );
+                    }
+                    text_end = x - ICON_GAP;
+                }
+            }
+            let name: Retained<NSString> = unsafe { msg_send![self, stringValue] };
+            let font = NSFont::systemFontOfSize(FONT_SIZE);
+            let line = (font.ascender() - font.descender()).ceil();
+            let style = NSMutableParagraphStyle::new();
+            style.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            let text_x = icon_x + ICON + ICON_GAP;
+            let rect = NSRect::new(
+                NSPoint::new(text_x, (middle - line / 2.).round()),
+                NSSize::new((text_end - text_x).max(0.), line),
+            );
+            let attributes = unsafe {
+                NSDictionary::<NSString, AnyObject>::from_slices(
+                    &[
+                        NSFontAttributeName,
+                        NSForegroundColorAttributeName,
+                        NSParagraphStyleAttributeName,
+                    ],
+                    &[&*font as &AnyObject, &*ink as &AnyObject, &*style as &AnyObject],
+                )
+            };
+            unsafe { name.drawInRect_withAttributes(rect, Some(&attributes)) };
         }
     }
 );
+
+/// Finder's chevron after a folder, in `color`.
+fn chevron(color: Retained<NSColor>) -> Option<Retained<NSImage>> {
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("chevron.right"),
+        None,
+    )?;
+    let size = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
+        CHEVRON,
+        unsafe { objc2_app_kit::NSFontWeightSemibold },
+        NSImageSymbolScale::Small,
+    );
+    let tint = NSImageSymbolConfiguration::configurationWithPaletteColors(
+        &NSArray::from_retained_slice(&[color]),
+    );
+    image.imageWithSymbolConfiguration(&size.configurationByApplyingConfiguration(&tint))
+}
 
 /// What the user did in the column view.
 pub enum ColumnEvent {
@@ -116,6 +229,10 @@ define_class!(
                         let _: () = msg_send![matrix, sizeToCells];
                     }
                 }
+                let scroll: *mut AnyObject = unsafe { msg_send![matrix, enclosingScrollView] };
+                if let Some(scroll) = unsafe { scroll.as_ref() } {
+                    allow_pocket(scroll);
+                }
             }
             let Some(path) = self.entries(browser, column).get(row as usize).cloned() else {
                 return;
@@ -136,6 +253,22 @@ define_class!(
         }
     }
 );
+
+/// Lets a column run under the toolbar's scroll edge effect, as Finder's columns do. AppKit
+/// gives every scroll view the toolbar's pocket on macOS 26 except a browser's columns.
+fn allow_pocket(scroll: &AnyObject) {
+    let responds: bool =
+        unsafe { msg_send![scroll, respondsToSelector: sel!(setAllowedPocketEdges:)] };
+    if !responds {
+        return;
+    }
+    let allowed: usize = unsafe { msg_send![scroll, allowedPocketEdges] };
+    if allowed != POCKET_EDGES {
+        unsafe {
+            let _: () = msg_send![scroll, setAllowedPocketEdges: POCKET_EDGES];
+        }
+    }
+}
 
 impl Source {
     /// What column `column` lists: the box's items first, then the entries of the folder

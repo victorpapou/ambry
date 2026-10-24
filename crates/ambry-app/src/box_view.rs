@@ -44,6 +44,8 @@ const ACCENT: u32 = 0x2f7cf6;
 const RUBBER: f32 = 0.3;
 /// How much bigger a dragged item is drawn.
 const LIFT: f32 = 0.06;
+/// How long a folder takes to open under a drag, and to close after it.
+const OPEN_FADE_MS: u64 = 160;
 /// How long the in-between dots take to switch on or off, in seconds.
 const DOT_FADE: f32 = 0.18;
 /// How long the canvas takes to spring back to an edge, in seconds.
@@ -141,6 +143,8 @@ struct Drag {
     /// Mouse position minus the item's top-left corner, in window coordinates.
     grab: Point<Pixels>,
     moved: bool,
+    /// Where the mouse is now, in window coordinates.
+    at: Point<Pixels>,
 }
 
 /// Files being dragged in from Finder, shown as ghost cards under the cursor.
@@ -187,11 +191,17 @@ pub struct BoxView {
     between_dots: f32,
     /// Items that have been selected, whose highlight fades out when they are not.
     was_selected: std::cell::RefCell<HashSet<u64>>,
+    /// The folder something is being dragged over, which opens like Finder's, and the folders
+    /// that have opened, whose lid closes again when the drag moves on.
+    open_folder: Option<u64>,
+    was_open: std::cell::RefCell<HashSet<u64>>,
+    /// Finder's open folder icon, rendered once into the data directory.
+    open_icon: Option<PathBuf>,
     viewport: gpui::Size<Pixels>,
     avatar: Option<PathBuf>,
     focus: FocusHandle,
     /// Finder's icon for each item path, rendered once into the data directory.
-    icons: HashMap<PathBuf, Option<PathBuf>>,
+    icons: HashMap<PathBuf, (Option<std::time::SystemTime>, Option<PathBuf>)>,
     /// Date modified, size and kind of each item path, as the list shows them.
     #[cfg(target_os = "macos")]
     details: HashMap<PathBuf, [String; 3]>,
@@ -286,6 +296,9 @@ impl BoxView {
             dense_dots: (true, std::time::Instant::now() - Duration::from_secs(1)),
             between_dots: 1.,
             was_selected: Default::default(),
+            open_folder: None,
+            was_open: Default::default(),
+            open_icon: open_folder_file(),
             viewport: window.viewport_size(),
             #[cfg(target_os = "macos")]
             controls: Self::attach_controls(boxes_dir, window, cx),
@@ -385,6 +398,18 @@ impl BoxView {
                 events: previewed,
             }
         };
+        // AMBRY_DUMP=<file> writes the window's views and their frames there once it settles.
+        if let Some(file) = std::env::var_os("AMBRY_DUMP") {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                // SAFETY: the window outlives this task's few seconds, on the main thread.
+                let tree = unsafe { ambry_macos::probe::window_tree(ns_view) };
+                std::fs::write(file, tree).ok();
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
@@ -541,19 +566,26 @@ impl BoxView {
         controls.toolbar_blur.set_hidden(!in_canvas);
     }
 
-    /// Renders Finder's icon for every item that has none yet.
+    /// Renders Finder's icon for every item that has none yet, or whose file changed since:
+    /// a folder's shows the documents peeking out of it once it has some.
     fn load_icons(&mut self) {
-        let paths = self
+        let paths: Vec<PathBuf> = self
             .doc
             .items
             .iter()
             .chain(self.drop_preview.iter().flat_map(|preview| &preview.items))
             .filter(|item| !item.is_image())
-            .map(|item| item.path.clone());
+            .map(|item| item.path.clone())
+            .collect();
         for path in paths {
-            self.icons
-                .entry(path)
-                .or_insert_with_key(|path| finder_icon_file(path));
+            let stamp = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if self.icons.get(&path).is_some_and(|(seen, _)| *seen == stamp) {
+                continue;
+            }
+            let icon = finder_icon_file(&path, stamp);
+            self.icons.insert(path, (stamp, icon));
         }
         #[cfg(target_os = "macos")]
         for item in &self.doc.items {
@@ -1079,6 +1111,7 @@ impl BoxView {
                     id,
                     grab: event.position - self.item_origin(item),
                     moved: false,
+                    at: event.position,
                 });
             }
         }
@@ -1114,6 +1147,28 @@ impl BoxView {
                 .landed
                 .values()
                 .any(|(at, _)| at.elapsed().as_secs_f32() < 1.2)
+    }
+
+    /// The folder on the canvas under what is being dragged: an item of the box, or files
+    /// coming in from Finder.
+    fn folder_under_drag(&self) -> Option<u64> {
+        let (at, dragged) = match (&self.drag, &self.drop_preview) {
+            (Some(drag), _) if drag.moved => (drag.at, Some(drag.id)),
+            (_, Some(preview)) => (preview.position, None),
+            _ => return None,
+        };
+        let side = ICON_SIZE * self.zoom + 8.;
+        self.doc
+            .items
+            .iter()
+            .rev()
+            .filter(|item| item.kind == ItemKind::Folder && Some(item.id) != dragged)
+            .find(|item| {
+                let middle = self.screen_left(item.x) + px(ITEM_WIDTH / 2.);
+                let top = self.pan.y + px(item.y * self.zoom);
+                (at.x - middle).abs() <= px(side / 2.) && at.y >= top && at.y <= top + px(side)
+            })
+            .map(|item| item.id)
     }
 
     fn is_picked(&self, id: u64) -> bool {
@@ -1180,6 +1235,9 @@ impl BoxView {
         }
         let id = drag.id;
         let origin = event.position - drag.grab;
+        if let Some(drag) = &mut self.drag {
+            drag.at = event.position;
+        }
         let (_, y) = self.to_canvas(origin);
         let x = self.canvas_left(origin.x);
         self.doc.move_item(id, x, y);
@@ -1306,10 +1364,12 @@ impl BoxView {
             items.extend(self.render_ghosts(preview));
         }
 
+        // Under the toolbar too, as Finder's content runs under its glass: the toolbar stays
+        // clear over the canvas and the soft shade keeps it readable.
         div()
             .id("canvas")
             .absolute()
-            .top(px(layout::BAR as f32))
+            .top_0()
             .left_0()
             .right_0()
             .bottom_0()
@@ -1364,7 +1424,19 @@ impl BoxView {
         if selected {
             self.was_selected.borrow_mut().insert(id);
         }
-        let face = finder_face(item, self.icon(item), false, lifted, self.zoom * pop);
+        let open = self.open_folder == Some(id);
+        let closing = !open && self.was_open.borrow().contains(&id);
+        if open {
+            self.was_open.borrow_mut().insert(id);
+        }
+        let face = match (&self.open_icon, self.icon(item)) {
+            (Some(open_icon), Some(icon))
+                if item.kind == ItemKind::Folder && (open || closing) =>
+            {
+                folder_face(icon, open_icon.clone(), open, id, self.zoom * pop)
+            }
+            (_, icon) => finder_face(item, icon, false, lifted, self.zoom * pop),
+        };
         let face = if fade {
             face.with_animation(
                 (if selected { "select" } else { "deselect" }, id as usize),
@@ -1466,7 +1538,7 @@ impl BoxView {
     }
 
     fn icon(&self, item: &Item) -> Option<PathBuf> {
-        self.icons.get(&item.path).cloned().flatten()
+        self.icons.get(&item.path).and_then(|(_, icon)| icon.clone())
     }
 
     /// Finder's column view, AppKit's own browser. It runs under the toolbar as Finder's
@@ -1687,6 +1759,7 @@ impl Render for BoxView {
             self.landed.clear();
         }
         self.viewport = window.viewport_size();
+        self.open_folder = self.folder_under_drag();
         // A canvas pulled past an edge stays there until it springs back.
         if self.drag.is_none() && !self.fingers && !self.springing {
             self.clamp_pan();
@@ -1951,18 +2024,48 @@ fn finder_face(
         )
 }
 
-/// Finder's icon for `path` as a PNG in the data directory, rendered the first time it is
-/// asked for.
-#[cfg(target_os = "macos")]
-fn finder_icon_file(path: &Path) -> Option<PathBuf> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
+/// A folder opening under a drag, or closing after it: its own icon gives way to Finder's
+/// open folder with a short cross-fade, under a grey highlight as Finder's drop target has.
+fn folder_face(closed: PathBuf, open: PathBuf, opening: bool, id: u64, scale: f32) -> gpui::Div {
+    let size = px(ICON_SIZE * scale);
+    let fade = || Animation::new(Duration::from_millis(OPEN_FADE_MS)).with_easing(ease_out_quint());
+    let key = |name: &'static str| (name, id as usize);
+    div()
+        .relative()
+        .p(px(4.))
+        .rounded(px(6.))
+        .when(opening, |this| this.bg(palette().selection))
+        .child(
+            img(closed)
+                .size(size)
+                .object_fit(ObjectFit::Contain)
+                .with_animation(
+                    key(if opening { "lid-up" } else { "lid-down" }),
+                    fade(),
+                    move |this, t| this.opacity(if opening { 1. - t } else { t }),
+                ),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(4.))
+                .left(px(4.))
+                .child(img(open).size(size).object_fit(ObjectFit::Contain))
+                .with_animation(
+                    key(if opening { "open-in" } else { "open-out" }),
+                    fade(),
+                    move |this, t| this.opacity(if opening { t } else { 1. - t }),
+                ),
+        )
+}
 
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+/// Finder's open folder as a PNG in the data directory, rendered the first time.
+#[cfg(target_os = "macos")]
+fn open_folder_file() -> Option<PathBuf> {
     let dir = ambry_core::data_dir().ok()?.join("icons");
-    let file = dir.join(format!("{:016x}.png", hasher.finish()));
+    let file = dir.join(format!("open-folder-{}.png", ICON_SIZE as u32));
     if !file.exists() {
-        let png = ambry_macos::finder::icon_png(path, ICON_SIZE.into())?;
+        let png = ambry_macos::finder::open_folder_png(ICON_SIZE.into())?;
         std::fs::create_dir_all(&dir).ok()?;
         std::fs::write(&file, png).ok()?;
     }
@@ -1970,7 +2073,34 @@ fn finder_icon_file(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn finder_icon_file(_path: &Path) -> Option<PathBuf> {
+fn open_folder_file() -> Option<PathBuf> {
+    None
+}
+
+/// Finder's picture for `path` as a PNG in the data directory: the thumbnail Finder's icon
+/// view shows, or its plain icon when Quick Look has none. Rendered the first time it is asked
+/// for at this `stamp`, the file's modification time, so it follows the file's changes.
+#[cfg(target_os = "macos")]
+fn finder_icon_file(path: &Path, stamp: Option<std::time::SystemTime>) -> Option<PathBuf> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    stamp.hash(&mut hasher);
+    let dir = ambry_core::data_dir().ok()?.join("icons");
+    let file = dir.join(format!("{:016x}.png", hasher.finish()));
+    if !file.exists() {
+        std::fs::create_dir_all(&dir).ok()?;
+        if !ambry_macos::finder::thumbnail_png(path, ICON_SIZE.into(), &file) {
+            let png = ambry_macos::finder::icon_png(path, ICON_SIZE.into())?;
+            std::fs::write(&file, png).ok()?;
+        }
+    }
+    Some(file)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn finder_icon_file(_path: &Path, _stamp: Option<std::time::SystemTime>) -> Option<PathBuf> {
     None
 }
 
