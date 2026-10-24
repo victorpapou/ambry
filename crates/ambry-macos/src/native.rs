@@ -415,9 +415,17 @@ pub(crate) fn segments(tabs: &NSTabView) -> Option<Retained<NSSegmentedControl>>
 }
 
 pub(crate) fn decorate(tabs: &NSTabView, images: &[Retained<NSImage>], item_width: f64) {
-    let Some(control) = segments(tabs) else {
-        return;
-    };
+    if let Some(control) = segments(tabs) {
+        decorate_strip(&control, images, item_width);
+    }
+}
+
+/// Puts `images` on a tab strip's segments, `item_width` points wide (0 keeps AppKit's).
+pub(crate) fn decorate_strip(
+    control: &NSSegmentedControl,
+    images: &[Retained<NSImage>],
+    item_width: f64,
+) {
     for (i, image) in images.iter().enumerate() {
         let segment = i as isize;
         control.setLabel_forSegment(&NSString::from_str(""), segment);

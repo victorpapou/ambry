@@ -16,14 +16,16 @@ use objc2::{
 use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSControlStateValueOn, NSFont,
     NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSPopover, NSPopoverBehavior,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSStackView, NSTextField, NSToolbar,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSStackView, NSTabView, NSTextField, NSToolbar,
     NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
     NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSUserInterfaceLayoutOrientation,
     NSView, NSViewController, NSWindowToolbarStyle,
 };
 use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
 
-use crate::native::{Target, symbol};
+use crate::native::{
+    Target, decorate_strip, icon_images, icon_tab_view, segments, selected_index, symbol,
+};
 
 const BOX: &str = "box";
 const ADD: &str = "add";
@@ -241,7 +243,7 @@ fn list_row(mtm: MainThreadMarker, title: &str, target: &Target, tag: isize) -> 
 /// The toolbar of the window that holds `ns_view`.
 pub struct WindowToolbar {
     state: Rc<State>,
-    modes: Retained<NSSegmentedControl>,
+    modes: Retained<NSTabView>,
     status: Retained<NSTextField>,
     _delegate: Retained<Delegate>,
     _targets: Vec<Retained<Target>>,
@@ -416,38 +418,34 @@ impl WindowToolbar {
             add.setAction(Some(sel!(fire:)));
         }
 
-        // Canvas and list.
-        let modes_target = Target::new(mtm, {
-            let state = state.clone();
-            move |sender| {
-                if let Some(control) = sender.downcast_ref::<NSSegmentedControl>() {
-                    if let Ok(index) = usize::try_from(control.selectedSegment()) {
+        // Canvas and list: the tab strip of a real NSTabView, which is the control that lifts
+        // the glass bubble while pressed. The strip alone goes in the toolbar; the tab view
+        // stays out of the window and keeps driving it.
+        let images = icon_images(&[("number", "Canvas"), ("list.bullet", "List")])?;
+        let tabs = icon_tab_view(mtm, images.len(), &images, 0.);
+        let strip = segments(&tabs)?;
+        strip.removeFromSuperview();
+        let modes_target = Target::with_tabs(
+            mtm,
+            {
+                let state = state.clone();
+                let strip = strip.clone();
+                move |sender| {
+                    let Some(tabs) = sender.downcast_ref::<NSTabView>() else {
+                        return;
+                    };
+                    // NSTabView may rebuild its segments on selection; put the icons back.
+                    decorate_strip(&strip, &images, 0.);
+                    if let Some(index) = selected_index(tabs) {
                         (state.on_event)(ToolbarEvent::Mode(index));
                     }
                 }
-            }
-        });
-        let images: Vec<Retained<NSImage>> = [("number", "Canvas"), ("list.bullet", "List")]
-            .iter()
-            .filter_map(|(name, description)| symbol(name, description))
-            .collect();
-        // A segmented control as the item's view: the toolbar draws it as one glass capsule
-        // with a grey pill under the selected segment, and lifts the bubble while pressed.
-        let modes = unsafe {
-            NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
-                &NSArray::from_retained_slice(&images),
-                NSSegmentSwitchTracking::SelectOne,
-                Some(&modes_target),
-                Some(sel!(fire:)),
-                mtm,
-            )
-        };
-        for (segment, label) in ["Canvas", "List"].iter().enumerate() {
-            modes.setToolTip_forSegment(Some(&NSString::from_str(label)), segment as isize);
-        }
-        modes.setSelectedSegment(0);
+            },
+            |_, _| true,
+        );
+        tabs.setDelegate(Some(ProtocolObject::from_ref(&*modes_target)));
         let modes_item = item(mtm, MODES, "View");
-        modes_item.setView(Some(&modes));
+        modes_item.setView(Some(&strip));
 
         let avatar_item = item(mtm, AVATAR, "Account");
         avatar_item.setView(Some(&account(mtm, avatar, initial)));
@@ -469,11 +467,12 @@ impl WindowToolbar {
         );
         toolbar.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         toolbar.setAllowsUserCustomization(false);
+        toolbar.setDisplayMode(objc2_app_kit::NSToolbarDisplayMode::IconOnly);
         window.setToolbarStyle(NSWindowToolbarStyle::Unified);
         window.setToolbar(Some(&toolbar));
         Some(Self {
             state,
-            modes,
+            modes: tabs,
             status,
             _delegate: delegate,
             _targets: vec![
@@ -489,8 +488,8 @@ impl WindowToolbar {
 
     /// Selects canvas (0) or list (1) without reporting it.
     pub fn select_mode(&self, index: usize) {
-        if self.modes.selectedSegment() != index as isize {
-            self.modes.setSelectedSegment(index as isize);
+        if selected_index(&self.modes) != Some(index) {
+            self.modes.selectTabViewItemAtIndex(index as isize);
         }
     }
 
