@@ -8,7 +8,7 @@ use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::{MainThreadMarker, msg_send, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSClickGestureRecognizer, NSColor, NSFont, NSTextAlignment, NSTextField, NSView,
 };

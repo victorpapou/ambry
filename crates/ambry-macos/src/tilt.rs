@@ -175,7 +175,6 @@ impl Tilt {
 
     /// Leans toward the pointer of `event` on `spring` and moves the highlight under it.
     fn follow(&self, layer: &CALayer, event: &NSEvent, spring: (f64, f64)) {
-        let view = &self.ivars().view;
         let area = &self.ivars().area;
         let size = area.bounds().size;
         if size.width <= 0. || size.height <= 0. {
