@@ -12,6 +12,8 @@ mod lab_toolbar;
 #[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
+pub mod probe;
+#[cfg(target_os = "macos")]
 mod table;
 
 #[cfg(target_os = "macos")]

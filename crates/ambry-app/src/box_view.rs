@@ -1017,6 +1017,19 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
     controls.switch.set_look(tint("tabs", None), strip);
     controls.add.set_tint(tint("add", None));
     controls.avatar.set_tint(tint("avatar", None));
+
+    // `poke` and `dump` lines look into AppKit's views; the report goes next to the file.
+    if tune
+        .lines()
+        .any(|line| line.starts_with("poke") || line.trim() == "dump")
+    {
+        let mut targets = controls.switch.probe_targets();
+        targets.extend(controls.add.probe_targets());
+        let report = ambry_macos::probe::run(&targets, tune);
+        if let Some(file) = tune_file() {
+            std::fs::write(file.with_file_name("probe-out.txt"), report).ok();
+        }
+    }
 }
 
 /// `target/glass-tune.txt` in the checkout the app was built from.

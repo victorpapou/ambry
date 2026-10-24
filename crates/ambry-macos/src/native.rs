@@ -242,6 +242,24 @@ impl TabSwitch {
         self.tabs.setAlphaValue(strip_alpha);
     }
 
+    /// The views behind the strip, by name, for [`crate::probe::run`].
+    pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
+        let mut targets = vec![("tabs".to_string(), object(self.tabs.clone()))];
+        if let Some(glass) = &self.glass {
+            targets.push(("tabs-root".into(), object(glass.clone())));
+        }
+        if let Some(control) = segments(&self.tabs) {
+            if let Some(cell) = control.cell() {
+                targets.push(("cell".into(), object(cell)));
+            }
+            if let Some(hosting) = control.subviews().firstObject() {
+                targets.push(("hosting".into(), object(hosting)));
+            }
+            targets.push(("control".into(), object(control)));
+        }
+        targets
+    }
+
     /// Selects tab `index` without reporting a change.
     pub fn select(&self, index: usize) {
         if selected_index(&self.tabs) != Some(index) {
@@ -299,6 +317,11 @@ fn toolbar_look(tabs: &NSTabView) {
             _ => {}
         }
     }
+}
+
+fn object<T: objc2::Message>(object: Retained<T>) -> Retained<AnyObject> {
+    // SAFETY: every Objective-C object is an AnyObject.
+    unsafe { Retained::cast_unchecked(object) }
 }
 
 fn tint_color(tint: Option<(f64, f64)>) -> Option<Retained<NSColor>> {
@@ -422,6 +445,18 @@ impl GlassButton {
     /// Tints the glass with `(white, alpha)`.
     pub fn set_tint(&self, tint: Option<(f64, f64)>) {
         self.button.setBezelColor(tint_color(tint).as_deref());
+    }
+
+    /// The button and its insides, by name, for [`crate::probe::run`].
+    pub fn probe_targets(&self) -> Vec<(String, Retained<AnyObject>)> {
+        let mut targets = vec![("button-root".to_string(), object(self.button.clone()))];
+        if let Some(cell) = self.button.cell() {
+            targets.push(("button-cell".into(), object(cell)));
+        }
+        if let Some(hosting) = self.button.subviews().firstObject() {
+            targets.push(("button-hosting".into(), object(hosting)));
+        }
+        targets
     }
 }
 
