@@ -44,6 +44,8 @@ const ACCENT: u32 = 0x2f7cf6;
 const RUBBER: f32 = 0.3;
 /// How much bigger a dragged item is drawn.
 const LIFT: f32 = 0.06;
+/// How long the in-between dots take to switch on or off, in seconds.
+const DOT_FADE: f32 = 0.18;
 /// How long the canvas takes to spring back to an edge, in seconds.
 const SPRING_RESPONSE: f32 = 0.4;
 const MIN_ZOOM: f32 = 0.3;
@@ -179,6 +181,10 @@ pub struct BoxView {
     /// When each item last landed, for its bounce, and when the dragged one was lifted.
     landed: HashMap<u64, (std::time::Instant, Landing)>,
     lifted_at: Option<std::time::Instant>,
+    /// Whether the dots between every other one show, when that last switched, and how
+    /// opaque they are now: they switch off as the grid closes in, with a short fade.
+    dense_dots: (bool, std::time::Instant),
+    between_dots: f32,
     /// Items that have been selected, whose highlight fades out when they are not.
     was_selected: std::cell::RefCell<HashSet<u64>>,
     viewport: gpui::Size<Pixels>,
@@ -277,6 +283,8 @@ impl BoxView {
             appear_delay,
             landed: HashMap::new(),
             lifted_at: None,
+            dense_dots: (true, std::time::Instant::now() - Duration::from_secs(1)),
+            between_dots: 1.,
             was_selected: Default::default(),
             viewport: window.viewport_size(),
             #[cfg(target_os = "macos")]
@@ -1287,7 +1295,7 @@ impl BoxView {
     }
 
     fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (pan, zoom) = (self.pan, self.zoom);
+        let (pan, zoom, between) = (self.pan, self.zoom, self.between_dots);
         let mut items: Vec<gpui::AnyElement> = self
             .doc
             .items
@@ -1301,7 +1309,7 @@ impl BoxView {
         div()
             .id("canvas")
             .absolute()
-            .top_0()
+            .top(px(layout::BAR as f32))
             .left_0()
             .right_0()
             .bottom_0()
@@ -1328,7 +1336,7 @@ impl BoxView {
             .child(
                 canvas(
                     |_, _, _| (),
-                    move |bounds, _, window, _| paint_dots(bounds, pan, zoom, window),
+                    move |bounds, _, window, _| paint_dots(bounds, pan, zoom, between, window),
                 )
                 .absolute()
                 .size_full(),
@@ -1655,6 +1663,24 @@ impl BoxView {
 
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The in-between dots switch at the middle of each halving, with a margin either side
+        // so a zoom resting near it does not flicker.
+        let mut spacing = DOT_SPACING * self.zoom;
+        while spacing < DOT_SPACING / 2. {
+            spacing *= 2.;
+        }
+        let closeness = (spacing - DOT_SPACING / 2.) / (DOT_SPACING / 2.);
+        let (dense, since) = self.dense_dots;
+        if (dense && closeness < 0.4) || (!dense && closeness > 0.6) {
+            self.dense_dots = (!dense, std::time::Instant::now());
+        }
+        let (dense, since) = (self.dense_dots.0, self.dense_dots.1.max(since));
+        let t = (since.elapsed().as_secs_f32() / DOT_FADE).min(1.);
+        let t = 1. - (1. - t).powi(3);
+        self.between_dots = if dense { t } else { 1. - t };
+        if t < 1. {
+            window.request_animation_frame();
+        }
         if self.popping() {
             window.request_animation_frame();
         } else {
@@ -1746,7 +1772,7 @@ impl Render for BoxView {
                             .absolute()
                             // Over the add button, centred on it; it shows while the zoom
                             // changes and fades out after.
-                            .bottom(px((layout::ADD_MARGIN + layout::ADD + 4.) as f32))
+                            .bottom(px((layout::TOOLBAR_SIDE + layout::ADD + 4.) as f32))
                             .right(px(layout::TOOLBAR_SIDE as f32))
                             .w(px(layout::ADD as f32))
                             .flex()
@@ -1758,7 +1784,7 @@ impl Render for BoxView {
                 .child(
                     div()
                         .absolute()
-                        .bottom(px(layout::ADD_MARGIN as f32))
+                        .bottom(px(layout::TOOLBAR_SIDE as f32))
                         .right(px(layout::TOOLBAR_SIDE as f32))
                         .child(native(controls.add.native())),
                 )
@@ -1819,14 +1845,18 @@ fn unrubber(offset: f32, extent: f32) -> f32 {
     (extent / c) * (1. / (1. - y / extent) - 1.) * offset.signum()
 }
 
-fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32, window: &mut Window) {
+fn paint_dots(
+    bounds: Bounds<Pixels>,
+    pan: Point<Pixels>,
+    zoom: f32,
+    between: f32,
+    window: &mut Window,
+) {
     let color: Rgba = rgb(palette().dot);
     let mut spacing = DOT_SPACING * zoom;
     while spacing < DOT_SPACING / 2. {
         spacing *= 2.;
     }
-    // Every other dot fades out as the grid closes in, gone by the time it halves.
-    let between = ((spacing - DOT_SPACING / 2.) / (DOT_SPACING / 2.)).clamp(0., 1.);
     let radius = (DOT_RADIUS * zoom.sqrt()).clamp(0.75, 2.5);
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
