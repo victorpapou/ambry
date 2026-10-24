@@ -1,0 +1,14 @@
+[package]
+name = "ambry-app"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "ambry"
+path = "src/main.rs"
+
+[dependencies]
+ambry-core.workspace = true
+anyhow.workspace = true
+gpui.workspace = true
