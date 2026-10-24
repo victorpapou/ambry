@@ -15,6 +15,8 @@ mod native;
 pub mod probe;
 #[cfg(target_os = "macos")]
 mod table;
+#[cfg(target_os = "macos")]
+mod toolbar;
 
 #[cfg(target_os = "macos")]
 pub use lab::open_switch_lab;
@@ -24,6 +26,8 @@ pub use native::{
 };
 #[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
+#[cfg(target_os = "macos")]
+pub use toolbar::WindowToolbar;
 
 /// Toolbar geometry in points, shared by the native and the GPUI-drawn toolbar.
 pub mod layout {

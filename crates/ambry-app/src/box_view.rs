@@ -141,8 +141,8 @@ struct NativeControls {
     /// The paths the table shows, to reload it only when the box changes.
     table_paths: Vec<PathBuf>,
     avatar: ambry_macos::GlassAvatar,
-    switch: ambry_macos::GlassSegments,
-    add: ambry_macos::GlassButton,
+    /// The window toolbar with the canvas/list tabs and the add button.
+    toolbar: ambry_macos::WindowToolbar,
     subtitle: String,
     /// Overrides for the glass look, read from `target/glass-tune.txt` while it exists.
     tune: String,
@@ -225,19 +225,13 @@ impl BoxView {
             let avatar =
                 ambry_macos::GlassAvatar::new(ns_view, avatar, &user_initial(), layout::AVATAR)?;
             let mode = events.clone();
-            let switch = ambry_macos::GlassSegments::new(
+            let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
                 &[("number", "Canvas"), ("list.bullet", "List")],
                 SWITCH_ITEM_WIDTH,
                 move |index| {
                     mode.try_send(ControlEvent::Mode(index)).ok();
                 },
-            )?;
-            let add = ambry_macos::GlassButton::new(
-                ns_view,
-                "plus",
-                "Add files or folders",
-                layout::HEIGHT,
                 move || {
                     events.try_send(ControlEvent::Add).ok();
                 },
@@ -247,8 +241,7 @@ impl BoxView {
                 table,
                 table_paths: Vec::new(),
                 avatar,
-                switch,
-                add,
+                toolbar,
                 subtitle: String::new(),
                 tune: String::new(),
                 look: None,
@@ -369,7 +362,7 @@ impl BoxView {
         #[cfg(target_os = "macos")]
         if let Some(controls) = &self.controls {
             controls
-                .switch
+                .toolbar
                 .select(if mode == Mode::Canvas { 0 } else { 1 });
         }
         cx.notify();
@@ -808,14 +801,7 @@ impl BoxView {
         #[cfg(target_os = "macos")]
         let bar = bar.when_some(self.controls.as_ref(), |bar, controls| {
             let _ = cx;
-            bar.child(native(controls.avatar.native())).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::GAP as f32))
-                    .child(native(controls.switch.native()))
-                    .child(native(controls.add.native())),
-            )
+            bar.child(native(controls.avatar.native()))
         });
         #[cfg(not(target_os = "macos"))]
         let bar = bar
@@ -1008,11 +994,6 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
         }
         None => default,
     };
-    let strip = value("strip")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1.);
-    controls.switch.set_look(tint("tabs", None), strip);
-    controls.add.set_tint(tint("add", None));
     controls.avatar.set_tint(tint("avatar", None));
 
     // `poke` and `dump` lines look into AppKit's views; the report goes next to the file.
@@ -1020,8 +1001,7 @@ fn apply_glass_look(controls: &NativeControls, dark: bool, tune: &str) {
         .lines()
         .any(|line| line.starts_with("poke") || line.trim() == "dump")
     {
-        let mut targets = controls.switch.probe_targets();
-        targets.extend(controls.add.probe_targets());
+        let targets = controls.toolbar.probe_targets();
         let report = ambry_macos::probe::run(&targets, tune);
         if let Some(file) = tune_file() {
             std::fs::write(file.with_file_name("probe-out.txt"), report).ok();

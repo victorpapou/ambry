@@ -56,7 +56,7 @@ define_class!(
 );
 
 impl Target {
-    fn with_tabs(
+    pub(crate) fn with_tabs(
         mtm: MainThreadMarker,
         on_select: impl Fn(&AnyObject) + 'static,
         should_select: impl Fn(&NSTabView, &NSTabViewItem) -> bool + 'static,
@@ -319,7 +319,7 @@ fn toolbar_look(tabs: &NSTabView) {
     }
 }
 
-fn object<T: objc2::Message>(object: Retained<T>) -> Retained<AnyObject> {
+pub(crate) fn object<T: objc2::Message>(object: Retained<T>) -> Retained<AnyObject> {
     // SAFETY: every Objective-C object is an AnyObject.
     unsafe { Retained::cast_unchecked(object) }
 }
@@ -432,7 +432,7 @@ impl GlassSegments {
     }
 }
 
-fn selected_index(tabs: &NSTabView) -> Option<usize> {
+pub(crate) fn selected_index(tabs: &NSTabView) -> Option<usize> {
     let item = tabs.selectedTabViewItem()?;
     usize::try_from(tabs.indexOfTabViewItem(&item)).ok()
 }
@@ -472,13 +472,13 @@ pub(crate) fn icon_tab_view(
     tabs
 }
 
-fn segments(tabs: &NSTabView) -> Option<Retained<NSSegmentedControl>> {
+pub(crate) fn segments(tabs: &NSTabView) -> Option<Retained<NSSegmentedControl>> {
     tabs.subviews()
         .iter()
         .find_map(|view| view.downcast::<NSSegmentedControl>().ok())
 }
 
-fn decorate(tabs: &NSTabView, images: &[Retained<NSImage>], item_width: f64) {
+pub(crate) fn decorate(tabs: &NSTabView, images: &[Retained<NSImage>], item_width: f64) {
     let Some(control) = segments(tabs) else {
         return;
     };
@@ -666,7 +666,7 @@ fn has_liquid_glass() -> bool {
     AnyClass::get(c"NSGlassEffectView").is_some()
 }
 
-fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
+pub(crate) fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
     NSImage::imageWithSystemSymbolName_accessibilityDescription(
         &NSString::from_str(name),
         Some(&NSString::from_str(description)),

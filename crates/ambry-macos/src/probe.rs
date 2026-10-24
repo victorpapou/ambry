@@ -71,6 +71,7 @@ unsafe fn read(object: &AnyObject, selector: Sel, returns: &str) -> Option<Strin
                     .as_bool()
             ),
             "c" => format!("{}", object.send_message::<(), i8>(selector, ())),
+            "C" => format!("{}", object.send_message::<(), u8>(selector, ())),
             "q" | "l" => format!("{}", object.send_message::<(), isize>(selector, ())),
             "Q" | "L" => format!("{}", object.send_message::<(), usize>(selector, ())),
             "i" => format!("{}", object.send_message::<(), i32>(selector, ())),
@@ -108,6 +109,7 @@ pub(crate) fn poke(object: &AnyObject, selector: &str, value: f64) -> String {
                 (objc2::runtime::Bool::new(value != 0.),),
             ),
             "c" => object.send_message::<(i8,), ()>(sel, (value as i8,)),
+            "C" => object.send_message::<(u8,), ()>(sel, (value as u8,)),
             "q" | "l" => object.send_message::<(isize,), ()>(sel, (value as isize,)),
             "Q" | "L" => object.send_message::<(usize,), ()>(sel, (value as usize,)),
             "i" => object.send_message::<(i32,), ()>(sel, (value as i32,)),
