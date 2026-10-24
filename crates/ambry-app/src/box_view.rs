@@ -23,7 +23,7 @@ use crate::native_view::native;
 /// Finder icons on the canvas are this many points wide.
 const ICON_SIZE: f32 = 64.;
 const DOT_SPACING: f32 = 20.;
-const DOT_RADIUS: f32 = 1.5;
+const DOT_RADIUS: f32 = 0.75;
 const CARD_WIDTH: f32 = 64.;
 const CARD_HEIGHT: f32 = 80.;
 /// Width of a card together with its file name underneath.
@@ -150,8 +150,7 @@ struct NativeControls {
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
-    vertical: ambry_macos::CanvasScroller,
-    horizontal: ambry_macos::CanvasScroller,
+    scroll: ambry_macos::CanvasScrollView,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
 }
@@ -164,8 +163,9 @@ enum ControlEvent {
     Symbol(usize),
     OpenBox(usize),
     NewBox,
-    /// The vertical (true) or horizontal scroll bar moved.
-    Scroll(bool, ambry_macos::ScrollerEvent),
+    /// A scroll bar moved the visible part of the canvas to this top-left, counted from the
+    /// top-left of [`BoxView::scroll_area`].
+    Scroll(f64, f64),
     Open(usize),
     Select(Option<usize>),
 }
@@ -236,12 +236,8 @@ impl BoxView {
             )?;
             table.native().set_hidden(true);
             let scrolled = events.clone();
-            let vertical = ambry_macos::CanvasScroller::new(ns_view, true, move |event| {
-                scrolled.try_send(ControlEvent::Scroll(true, event)).ok();
-            })?;
-            let scrolled = events.clone();
-            let horizontal = ambry_macos::CanvasScroller::new(ns_view, false, move |event| {
-                scrolled.try_send(ControlEvent::Scroll(false, event)).ok();
+            let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
+                scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
             let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
@@ -268,8 +264,7 @@ impl BoxView {
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
-                vertical,
-                horizontal,
+                scroll,
                 shown_scroll: None,
             }
         };
@@ -313,7 +308,7 @@ impl BoxView {
                             this.open_item(id, cx);
                         }
                     }
-                    ControlEvent::Scroll(vertical, event) => this.on_scroller(vertical, event, cx),
+                    ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
                     ControlEvent::Select(row) => {
                         this.selected = row
                             .and_then(|row| this.doc.items.get(row))
@@ -341,15 +336,14 @@ impl BoxView {
             f32::from(self.viewport.width),
             f32::from(self.viewport.height),
         );
-        let knob = |min: f32, max: f32, at: f32, visible: f32| {
-            let total = (max - min).max(visible);
-            let travel = total - visible;
-            let value = if travel > 0. { (at - min) / travel } else { 0. };
-            (f64::from(visible / total), f64::from(value))
-        };
-        let (h_proportion, h_value) = knob(area.0, area.2, x, width);
-        let (v_proportion, v_value) = knob(area.1, area.3, y, height);
-        let scroll = [h_proportion, h_value, v_proportion, v_value];
+        // The scroll view sits under the toolbar, so its document is the bar shorter than
+        // the canvas.
+        let scroll = [
+            f64::from((area.2 - area.0).max(width)),
+            f64::from((area.3 - area.1).max(height) - layout::BAR as f32),
+            f64::from(x - area.0),
+            f64::from(y - area.1),
+        ];
         let in_canvas = self.mode == Mode::Canvas;
         let Some(controls) = &mut self.controls else {
             return;
@@ -408,12 +402,11 @@ impl BoxView {
             controls.shown_boxes = (boxes, current);
         }
         if controls.shown_scroll != Some(scroll) {
-            controls.horizontal.set(h_proportion, h_value);
-            controls.vertical.set(v_proportion, v_value);
+            let [width, height, x, y] = scroll;
+            controls.scroll.set(width, height, x, y);
             controls.shown_scroll = Some(scroll);
         }
-        controls.horizontal.native().set_hidden(!in_canvas);
-        controls.vertical.native().set_hidden(!in_canvas);
+        controls.scroll.native().set_hidden(!in_canvas);
     }
 
     /// Renders Finder's icon for every item that has none yet.
@@ -527,43 +520,19 @@ impl BoxView {
         self.clamp_pan();
         #[cfg(target_os = "macos")]
         if let Some(controls) = &self.controls {
-            controls.horizontal.flash();
-            controls.vertical.flash();
+            controls.scroll.flash();
         }
         cx.notify();
     }
 
-    /// Follows a drag of a scroll bar's knob or a click in its track.
+    /// Follows a drag of a scroll bar's knob or a click in its track, which moved the visible
+    /// part of the canvas to `(x, y)` from the top-left of [`Self::scroll_area`].
     #[cfg(target_os = "macos")]
-    fn on_scroller(
-        &mut self,
-        vertical: bool,
-        event: ambry_macos::ScrollerEvent,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scroller(&mut self, x: f64, y: f64, cx: &mut Context<Self>) {
         let area = self.scroll_area();
-        let (min, max, visible, pan) = if vertical {
-            (area.1, area.3, f32::from(self.viewport.height), self.pan.y)
-        } else {
-            (area.0, area.2, f32::from(self.viewport.width), self.pan.x)
-        };
-        let at = match event {
-            ambry_macos::ScrollerEvent::Moved(value) => {
-                min + value as f32 * (max - min - visible).max(0.)
-            }
-            ambry_macos::ScrollerEvent::Page(direction) => {
-                -f32::from(pan) + direction as f32 * visible * 0.9
-            }
-        };
-        let delta = px(-at) - pan;
-        self.scroll_by(
-            if vertical {
-                point(px(0.), delta)
-            } else {
-                point(delta, px(0.))
-            },
-            cx,
-        );
+        self.pan = point(px(-(x as f32 + area.0)), px(-(y as f32 + area.1)));
+        self.clamp_pan();
+        cx.notify();
     }
 
     /// Converts a window position into canvas coordinates.
@@ -1112,24 +1081,14 @@ impl Render for BoxView {
         #[cfg(target_os = "macos")]
         let root = root
             .when_some(self.controls.as_ref(), |root, controls| {
-                let thickness = px(controls.vertical.width() as f32);
                 root.child(
                     div()
                         .absolute()
                         .top(px(layout::BAR as f32))
-                        .right_0()
-                        .bottom(thickness)
-                        .w(thickness)
-                        .child(native(controls.vertical.native()).fill()),
-                )
-                .child(
-                    div()
-                        .absolute()
                         .left_0()
-                        .right(thickness)
+                        .right_0()
                         .bottom_0()
-                        .h(thickness)
-                        .child(native(controls.horizontal.native()).fill()),
+                        .child(native(controls.scroll.native()).fill()),
                 )
             })
             .font_family(".SystemUIFont");

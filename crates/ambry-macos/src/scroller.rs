@@ -1,88 +1,126 @@
-//! AppKit's overlay scroll bars over a canvas GPUI draws: the same scrollers NSScrollView
-//! shows, appearing while the canvas moves and fading out after.
+//! A real NSScrollView over a canvas GPUI draws, there only for its scroll bars: the same
+//! overlay scrollers Freeform shows, appearing while the canvas moves and fading out after.
+//! Clicks and wheel events outside the scrollers pass through to the canvas underneath.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, MainThreadOnly, msg_send, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSControlSize, NSScroller, NSScrollerPart, NSScrollerStyle,
-    NSView,
+    NSBorderType, NSResponder, NSScrollView, NSScrollerStyle, NSView,
+    NSViewBoundsDidChangeNotification,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSNotificationCenter, NSPoint, NSRect, NSSize};
 
 use crate::native::{NativeView, Target};
 
-/// Seconds a scroller stays after the canvas stops moving, like NSScrollView's.
-const LINGER: f64 = 1.2;
+define_class!(
+    // A scroll view that only answers clicks on its scroll bars.
+    #[unsafe(super(NSScrollView, NSView, NSResponder, objc2::runtime::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryCanvasScrollView"]
+    struct PassThroughScrollView;
 
-/// What the user did with a [`CanvasScroller`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ScrollerEvent {
-    /// Dragged the knob to `0.0..=1.0` of the way along.
-    Moved(f64),
-    /// Clicked the track before (-1) or after (1) the knob.
-    Page(i32),
-}
+    impl PassThroughScrollView {
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> *mut NSView {
+            let hit: *mut NSView = unsafe { msg_send![super(self), hitTest: point] };
+            let Some(view) = (unsafe { hit.as_ref() }) else {
+                return std::ptr::null_mut();
+            };
+            let on_scroller = [self.verticalScroller(), self.horizontalScroller()]
+                .into_iter()
+                .flatten()
+                .any(|scroller| view.isDescendantOf(&scroller));
+            if on_scroller { hit } else { std::ptr::null_mut() }
+        }
+    }
+);
 
-/// One overlay scroll bar along the right or bottom edge of the canvas.
-pub struct CanvasScroller {
+define_class!(
+    // The empty document of the scroll view, laid out from the top-left like the canvas.
+    #[unsafe(super(NSView, NSResponder, objc2::runtime::NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryCanvasDocument"]
+    struct FlippedView;
+
+    impl FlippedView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
+/// The scroll bars along the right and bottom edges of the canvas.
+pub struct CanvasScrollView {
     native: NativeView,
-    scroller: Retained<NSScroller>,
-    fade: Retained<Target>,
+    scroll: Retained<PassThroughScrollView>,
+    document: Retained<FlippedView>,
+    /// Set while the canvas moves the scroll view, so that move is not reported back.
+    syncing: Rc<Cell<bool>>,
+    observer: Retained<Target>,
 }
 
-impl CanvasScroller {
+impl CanvasScrollView {
+    /// `on_scroll` hears the top-left of the visible part of the document, in points, when the
+    /// user drags a knob or clicks a track.
+    ///
     /// # Safety
     /// `ns_view` must point to a live `NSView`, and this must run on the main thread.
     pub unsafe fn new(
         ns_view: NonNull<c_void>,
-        vertical: bool,
-        on_event: impl Fn(ScrollerEvent) + 'static,
+        on_scroll: impl Fn(f64, f64) + 'static,
     ) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
         let parent: &NSView = unsafe { ns_view.cast().as_ref() };
-        let width = NSScroller::scrollerWidthForControlSize_scrollerStyle(
-            NSControlSize::Regular,
-            NSScrollerStyle::Overlay,
-            mtm,
-        );
-        // A scroller is vertical when it is taller than wide.
-        let size = if vertical {
-            NSSize::new(width, width * 4.)
-        } else {
-            NSSize::new(width * 4., width)
-        };
-        let scroller =
-            NSScroller::initWithFrame(NSScroller::alloc(mtm), NSRect::new(NSPoint::ZERO, size));
-        scroller.setScrollerStyle(NSScrollerStyle::Overlay);
-        scroller.setEnabled(true);
-        scroller.setAlphaValue(0.);
-        let target = Target::new(mtm, move |sender| {
-            let Some(scroller) = sender.downcast_ref::<NSScroller>() else {
-                return;
-            };
-            on_event(match scroller.hitPart() {
-                NSScrollerPart::DecrementPage => ScrollerEvent::Page(-1),
-                NSScrollerPart::IncrementPage => ScrollerEvent::Page(1),
-                _ => ScrollerEvent::Moved(scroller.doubleValue()),
-            });
+        let frame = NSRect::new(NSPoint::ZERO, NSSize::new(100., 100.));
+        let scroll: Retained<PassThroughScrollView> =
+            unsafe { msg_send![PassThroughScrollView::alloc(mtm), initWithFrame: frame] };
+        scroll.setDrawsBackground(false);
+        scroll.setBorderType(NSBorderType::NoBorder);
+        scroll.setHasVerticalScroller(true);
+        scroll.setHasHorizontalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setScrollerStyle(NSScrollerStyle::Overlay);
+        scroll.setAutomaticallyAdjustsContentInsets(false);
+        let clip = scroll.contentView();
+        clip.setDrawsBackground(false);
+        let document: Retained<FlippedView> =
+            unsafe { msg_send![FlippedView::alloc(mtm), initWithFrame: frame] };
+        scroll.setDocumentView(Some(&document));
+
+        let syncing = Rc::new(Cell::new(false));
+        let observer = Target::new(mtm, {
+            let syncing = syncing.clone();
+            let clip = clip.clone();
+            move |_| {
+                if !syncing.get() {
+                    let origin = clip.bounds().origin;
+                    on_scroll(origin.x, origin.y);
+                }
+            }
         });
+        clip.setPostsBoundsChangedNotifications(true);
         unsafe {
-            scroller.setTarget(Some(&target));
-            scroller.setAction(Some(sel!(fire:)));
+            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                &observer,
+                sel!(fire:),
+                Some(NSViewBoundsDidChangeNotification),
+                Some(&clip),
+            );
         }
-        let fade = Target::new(mtm, {
-            let scroller = scroller.clone();
-            move |_| scroller.animator().setAlphaValue(0.)
-        });
-        let view: Retained<NSView> = Retained::into_super(Retained::into_super(scroller.clone()));
+        let view: Retained<NSView> = Retained::into_super(Retained::into_super(scroll.clone()));
         Some(Self {
-            native: NativeView::host(parent, view, target),
-            scroller,
-            fade,
+            native: NativeView::host(parent, view, None),
+            scroll,
+            document,
+            syncing,
+            observer,
         })
     }
 
@@ -90,52 +128,31 @@ impl CanvasScroller {
         &self.native
     }
 
-    /// The scroller's thickness, in points.
-    pub fn width(&self) -> f64 {
-        let size = self.scroller.frame().size;
-        size.width.min(size.height)
+    /// Makes the document `width` by `height` points and shows it from `(x, y)`.
+    pub fn set(&self, width: f64, height: f64, x: f64, y: f64) {
+        self.syncing.set(true);
+        let size = NSSize::new(width, height);
+        if self.document.frame().size != size {
+            self.document.setFrameSize(size);
+        }
+        let clip = self.scroll.contentView();
+        let origin = NSPoint::new(x, y);
+        if clip.bounds().origin != origin {
+            clip.scrollToPoint(origin);
+            self.scroll.reflectScrolledClipView(&clip);
+        }
+        self.syncing.set(false);
     }
 
-    /// Shows the visible part as `proportion` of the whole, `value` of the way along. A
-    /// proportion of 1 or more hides the scroller: there is nothing to scroll.
-    pub fn set(&self, proportion: f64, value: f64) {
-        let scrollable = proportion < 1.;
-        self.scroller.setKnobProportion(proportion.clamp(0.05, 1.));
-        self.scroller.setDoubleValue(value.clamp(0., 1.));
-        self.scroller.setEnabled(scrollable);
-        self.scroller.setHidden(!scrollable);
-    }
-
-    /// Shows the scroller now and fades it out once the canvas has been still for a moment.
+    /// Shows the scroll bars for a moment, as when the canvas moves.
     pub fn flash(&self) {
-        if self.scroller.isHidden() {
-            return;
-        }
-        self.scroller.setAlphaValue(1.);
-        let fade: &AnyObject = &self.fade;
-        unsafe {
-            let _: () = msg_send![
-                objc2::class!(NSObject),
-                cancelPreviousPerformRequestsWithTarget: fade
-            ];
-            let _: () = msg_send![
-                fade,
-                performSelector: sel!(fire:),
-                withObject: fade,
-                afterDelay: LINGER
-            ];
-        }
+        self.scroll.flashScrollers();
     }
 }
 
-impl Drop for CanvasScroller {
+impl Drop for CanvasScrollView {
     fn drop(&mut self) {
-        let fade: &AnyObject = &self.fade;
-        unsafe {
-            let _: () = msg_send![
-                objc2::class!(NSObject),
-                cancelPreviousPerformRequestsWithTarget: fade
-            ];
-        }
+        let observer: &AnyObject = &self.observer;
+        unsafe { NSNotificationCenter::defaultCenter().removeObserver(observer) };
     }
 }

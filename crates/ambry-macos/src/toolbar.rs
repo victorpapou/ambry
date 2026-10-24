@@ -16,10 +16,9 @@ use objc2::{
 use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSClickGestureRecognizer, NSColor, NSControlSize,
     NSControlStateValueOn, NSEvent, NSFont, NSImage, NSImageScaling, NSImageSymbolConfiguration,
-    NSImageView, NSPopover, NSPopoverBehavior, NSSegmentSwitchTracking, NSSegmentedControl,
-    NSStackView, NSTabView, NSTextField, NSToolbar, NSToolbarDelegate,
-    NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem, NSToolbarItemIdentifier,
-    NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
+    NSImageView, NSPopover, NSPopoverBehavior, NSSegmentedControl, NSStackView, NSTabView,
+    NSTextField, NSToolbar, NSToolbarDelegate, NSToolbarFlexibleSpaceItemIdentifier, NSToolbarItem,
+    NSToolbarItemIdentifier, NSToolbarSpaceItemIdentifier, NSTrackingArea, NSTrackingAreaOptions,
     NSUserInterfaceLayoutOrientation, NSView, NSViewController, NSWindowToolbarStyle,
 };
 use objc2_foundation::{NSArray, NSCopying, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
@@ -32,17 +31,21 @@ const BOX: &str = "box";
 const ADD: &str = "add";
 const MODES: &str = "modes";
 const AVATAR: &str = "avatar";
-/// Width of each canvas/list segment, as in Freeform's Grid/List.
-const MODE_WIDTH: f64 = 38.;
+/// Width given to each canvas/list segment; AppKit pads it to about Freeform's 37 and 39.
+const MODE_WIDTH: f64 = 32.;
 /// Point size of the account picture inside its glass circle.
 const AVATAR_SIZE: f64 = 28.;
-/// The box's icon tile next to its name.
-const TILE: f64 = 22.;
-/// Swatches and glyphs in the icon picker, which is laid out like the one in Shortcuts.
-const SWATCH: f64 = 32.;
-const SWATCH_GAP: f64 = 12.;
-const SWATCH_COLUMNS: usize = 5;
-const GLYPH: f64 = 36.;
+/// The box's icon tile next to its name, as big as a shortcut's in the Shortcuts editor.
+const TILE: f64 = 26.;
+/// The icon picker, laid out like the one under a shortcut's icon in Shortcuts: icon tiles,
+/// a line, then rows of color dots.
+const SWATCH: f64 = 17.;
+const SWATCH_PITCH: f64 = 29.;
+const SWATCH_COLUMNS: usize = 10;
+const GLYPH: f64 = 24.;
+/// The highlight around the chosen icon.
+const GLYPH_SELECTED: f64 = 34.;
+const GLYPH_PITCH: f64 = 44.;
 const GLYPH_COLUMNS: usize = 6;
 const PICKER_PADDING: f64 = 16.;
 /// Tags of the glyph buttons in the picker start here; colors use 0 up.
@@ -329,7 +332,7 @@ impl WindowToolbar {
         );
         tile.setWantsLayer(true);
         if let Some(layer) = tile.layer() {
-            layer.setCornerRadius(6.);
+            layer.setCornerRadius(7.);
         }
         tile.setTranslatesAutoresizingMaskIntoConstraints(false);
         tile.widthAnchor()
@@ -385,7 +388,14 @@ impl WindowToolbar {
             mtm,
         );
         stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        stack.setSpacing(8.);
+        stack.setSpacing(10.);
+        // Shortcuts keeps its icon 16 points from the traffic lights.
+        stack.setEdgeInsets(objc2_foundation::NSEdgeInsets {
+            top: 0.,
+            left: 5.,
+            bottom: 0.,
+            right: 0.,
+        });
 
         let picker = NSPopover::new(mtm);
         picker.setBehavior(NSPopoverBehavior::Transient);
@@ -400,10 +410,6 @@ impl WindowToolbar {
                 let Some(state) = state.borrow().clone() else {
                     return;
                 };
-                if let Some(tabs) = sender.downcast_ref::<NSSegmentedControl>() {
-                    state.picker_view.show_tab(tabs.selectedSegment());
-                    return;
-                }
                 let Some(button) = sender.downcast_ref::<NSButton>() else {
                     return;
                 };
@@ -601,193 +607,185 @@ fn item(mtm: MainThreadMarker, id: &str, label: &str) -> Retained<NSToolbarItem>
     item
 }
 
-/// The icon picker: a Color / Glyph switch over a grid of swatches or glyphs, like the one in
-/// Shortcuts.
+/// The icon picker under the box's icon, like the one under a shortcut's icon in Shortcuts:
+/// tiles of the glyphs in the box's color with the chosen one highlighted, a line, and color
+/// dots with a checkmark on the chosen one.
 struct Picker {
     view: Retained<NSView>,
-    colors: Vec<(String, Retained<NSButton>)>,
-    glyphs: Vec<(String, Retained<NSButton>)>,
-    color_grid: Retained<NSView>,
-    glyph_grid: Retained<NSView>,
+    colors: Vec<(String, Retained<NSImageView>)>,
+    glyphs: Vec<(String, Retained<NSButton>, Retained<NSView>)>,
 }
 
 impl Picker {
     fn new(mtm: MainThreadMarker, colors: &[&str], symbols: &[&str], target: &Target) -> Self {
-        let width = PICKER_PADDING * 2. + GLYPH_COLUMNS as f64 * GLYPH;
+        let dots_width = (SWATCH_COLUMNS - 1) as f64 * SWATCH_PITCH + SWATCH;
+        let width = PICKER_PADDING * 2. + dots_width;
         let glyph_rows = symbols.len().div_ceil(GLYPH_COLUMNS);
-        let grid_height = glyph_rows as f64 * GLYPH;
-        let tabs_height = 24.;
-        let height = PICKER_PADDING * 3. + tabs_height + grid_height;
+        let glyphs_height = (glyph_rows - 1) as f64 * GLYPH_PITCH + GLYPH_SELECTED;
+        let dot_rows = colors.len().div_ceil(SWATCH_COLUMNS);
+        let dots_height = (dot_rows - 1) as f64 * SWATCH_PITCH + SWATCH;
+        let height = PICKER_PADDING * 4. + glyphs_height + dots_height;
         let view = NSView::initWithFrame(
             NSView::alloc(mtm),
             NSRect::new(NSPoint::ZERO, NSSize::new(width, height)),
         );
 
-        let tabs = unsafe {
-            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
-                &NSArray::from_retained_slice(&[
-                    NSString::from_str("Color"),
-                    NSString::from_str("Glyph"),
-                ]),
-                NSSegmentSwitchTracking::SelectOne,
-                Some(target),
-                Some(sel!(fire:)),
-                mtm,
-            )
-        };
-        tabs.setSelectedSegment(0);
-        tabs.setSegmentDistribution(objc2_app_kit::NSSegmentDistribution::FillEqually);
-        tabs.setFrame(NSRect::new(
-            NSPoint::new(PICKER_PADDING, height - PICKER_PADDING - tabs_height),
-            NSSize::new(width - PICKER_PADDING * 2., tabs_height),
-        ));
-        view.addSubview(&tabs);
+        // AppKit counts y from the bottom: rows go down from the top.
+        let glyphs_left = (width - (GLYPH_COLUMNS - 1) as f64 * GLYPH_PITCH - GLYPH_SELECTED) / 2.;
+        let glyphs_top = height - PICKER_PADDING;
+        let mut glyphs = Vec::new();
+        for (index, name) in symbols.iter().enumerate() {
+            let row = index / GLYPH_COLUMNS;
+            let column = index % GLYPH_COLUMNS;
+            let button = picker_button(mtm, target, GLYPH_TAG + index as isize, name);
+            if let Some(layer) = button.layer() {
+                layer.setCornerRadius(10.);
+            }
+            button.setFrame(NSRect::new(
+                NSPoint::new(
+                    glyphs_left + column as f64 * GLYPH_PITCH,
+                    glyphs_top - GLYPH_SELECTED - row as f64 * GLYPH_PITCH,
+                ),
+                NSSize::new(GLYPH_SELECTED, GLYPH_SELECTED),
+            ));
+            let inset = (GLYPH_SELECTED - GLYPH) / 2.;
+            let tile = NSView::initWithFrame(
+                NSView::alloc(mtm),
+                NSRect::new(NSPoint::new(inset, inset), NSSize::new(GLYPH, GLYPH)),
+            );
+            tile.setWantsLayer(true);
+            if let Some(layer) = tile.layer() {
+                layer.setCornerRadius(6.);
+            }
+            let image = NSImageView::initWithFrame(
+                NSImageView::alloc(mtm),
+                NSRect::new(NSPoint::ZERO, NSSize::new(GLYPH, GLYPH)),
+            );
+            image.setImageScaling(NSImageScaling::ScaleNone);
+            image.setImage(sized_symbol(name, name, 12.).as_deref());
+            image.setContentTintColor(Some(&NSColor::whiteColor()));
+            tile.addSubview(&image);
+            button.addSubview(&tile);
+            view.addSubview(&button);
+            glyphs.push((name.to_string(), button, tile));
+        }
 
-        let grid_frame = NSRect::new(
-            NSPoint::new(PICKER_PADDING, PICKER_PADDING),
-            NSSize::new(width - PICKER_PADDING * 2., grid_height),
+        let line_y = PICKER_PADDING * 2. + dots_height;
+        let line = NSBox::initWithFrame(
+            NSBox::alloc(mtm),
+            NSRect::new(NSPoint::new(0., line_y), NSSize::new(width, 1.)),
         );
-        let color_grid = NSView::initWithFrame(NSView::alloc(mtm), grid_frame);
-        let glyph_grid = NSView::initWithFrame(NSView::alloc(mtm), grid_frame);
-        glyph_grid.setHidden(true);
-        view.addSubview(&color_grid);
-        view.addSubview(&glyph_grid);
+        line.setBoxType(NSBoxType::Separator);
+        view.addSubview(&line);
 
-        // AppKit counts y from the bottom: rows go down from the top of the grid.
-        let swatch_left = (grid_frame.size.width
-            - SWATCH_COLUMNS as f64 * SWATCH
-            - (SWATCH_COLUMNS - 1) as f64 * SWATCH_GAP)
-            / 2.;
+        let dots_top = line_y - PICKER_PADDING;
         let mut swatches = Vec::new();
         for (index, color) in colors.iter().enumerate() {
             let row = index / SWATCH_COLUMNS;
             let column = index % SWATCH_COLUMNS;
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::new(),
-                    Some(target),
-                    Some(sel!(fire:)),
-                    mtm,
-                )
-            };
-            button.setBordered(false);
-            button.setTag(index as isize);
-            button.setToolTip(Some(&NSString::from_str(color)));
-            let swatch = NSView::initWithFrame(
-                NSView::alloc(mtm),
-                NSRect::new(NSPoint::new(4., 4.), NSSize::new(SWATCH - 8., SWATCH - 8.)),
-            );
-            swatch.setWantsLayer(true);
-            if let Some(layer) = swatch.layer() {
-                layer.setCornerRadius((SWATCH - 8.) / 2.);
-                layer.setBackgroundColor(Some(&box_color(color).CGColor()));
-            }
-            button.addSubview(&swatch);
-            button.setWantsLayer(true);
+            let button = picker_button(mtm, target, index as isize, color);
             if let Some(layer) = button.layer() {
                 layer.setCornerRadius(SWATCH / 2.);
+                layer.setBackgroundColor(Some(&box_color(color).CGColor()));
             }
             button.setFrame(NSRect::new(
                 NSPoint::new(
-                    swatch_left + column as f64 * (SWATCH + SWATCH_GAP),
-                    grid_height - (row + 1) as f64 * (SWATCH + SWATCH_GAP),
+                    PICKER_PADDING + column as f64 * SWATCH_PITCH,
+                    dots_top - SWATCH - row as f64 * SWATCH_PITCH,
                 ),
                 NSSize::new(SWATCH, SWATCH),
             ));
-            color_grid.addSubview(&button);
-            swatches.push((color.to_string(), button));
-        }
-
-        let mut glyphs = Vec::new();
-        for (index, name) in symbols.iter().enumerate() {
-            let Some(image) = symbol(name, name) else {
-                continue;
-            };
-            let row = index / GLYPH_COLUMNS;
-            let column = index % GLYPH_COLUMNS;
-            let button = unsafe {
-                NSButton::buttonWithImage_target_action(
-                    &image,
-                    Some(target),
-                    Some(sel!(fire:)),
-                    mtm,
-                )
-            };
-            button.setBordered(false);
-            button.setTag(GLYPH_TAG + index as isize);
-            button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-            button.setWantsLayer(true);
-            if let Some(layer) = button.layer() {
-                layer.setCornerRadius(8.);
-            }
-            button.setFrame(NSRect::new(
-                NSPoint::new(
-                    column as f64 * GLYPH,
-                    grid_height - (row + 1) as f64 * GLYPH,
-                ),
-                NSSize::new(GLYPH, GLYPH),
-            ));
-            glyph_grid.addSubview(&button);
-            glyphs.push((name.to_string(), button));
+            let check = NSImageView::initWithFrame(
+                NSImageView::alloc(mtm),
+                NSRect::new(NSPoint::ZERO, NSSize::new(SWATCH, SWATCH)),
+            );
+            check.setImageScaling(NSImageScaling::ScaleNone);
+            check.setImage(sized_symbol("checkmark", "Chosen", 9.).as_deref());
+            check.setContentTintColor(Some(&NSColor::whiteColor()));
+            check.setHidden(true);
+            button.addSubview(&check);
+            view.addSubview(&button);
+            swatches.push((color.to_string(), check));
         }
         Self {
             view,
             colors: swatches,
             glyphs,
-            color_grid,
-            glyph_grid,
         }
     }
 
-    fn show_tab(&self, index: isize) {
-        self.color_grid.setHidden(index != 0);
-        self.glyph_grid.setHidden(index == 0);
-    }
-
-    /// Rings the box's color and highlights its glyph.
+    /// Checks the box's color, paints the glyph tiles in it and highlights its glyph.
     fn mark(&self, color: &str, glyph: &str) {
-        for (name, button) in &self.colors {
-            if let Some(layer) = button.layer() {
-                let selected = name == color;
-                layer.setBorderWidth(if selected { 2.5 } else { 0. });
-                layer.setBorderColor(Some(&box_color(name).CGColor()));
-            }
+        for (name, check) in &self.colors {
+            check.setHidden(name != color);
         }
-        for (name, button) in &self.glyphs {
-            let selected = name == glyph;
-            if let Some(layer) = button.layer() {
-                let fill = NSColor::quaternaryLabelColor().CGColor();
-                layer.setBackgroundColor(selected.then_some(&*fill));
+        let fill = box_color(color).CGColor();
+        let highlight = NSColor::quaternaryLabelColor().CGColor();
+        for (name, button, tile) in &self.glyphs {
+            if let Some(layer) = tile.layer() {
+                layer.setBackgroundColor(Some(&fill));
             }
-            button.setContentTintColor(Some(&*if selected {
-                NSColor::labelColor()
-            } else {
-                NSColor::secondaryLabelColor()
-            }));
+            if let Some(layer) = button.layer() {
+                layer.setBackgroundColor((name == glyph).then_some(&*highlight));
+            }
         }
     }
 }
 
-/// The system color a box color name stands for.
+/// A borderless, layer-backed button of the icon picker.
+fn picker_button(
+    mtm: MainThreadMarker,
+    target: &Target,
+    tag: isize,
+    tooltip: &str,
+) -> Retained<NSButton> {
+    let button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::new(),
+            Some(target),
+            Some(sel!(fire:)),
+            mtm,
+        )
+    };
+    button.setBordered(false);
+    button.setTag(tag);
+    button.setToolTip(Some(&NSString::from_str(tooltip)));
+    button.setWantsLayer(true);
+    button
+}
+
+/// The color a box color name stands for: Shortcuts' icon colors.
 fn box_color(name: &str) -> Retained<NSColor> {
-    match name {
-        "red" => NSColor::systemRedColor(),
-        "orange" => NSColor::systemOrangeColor(),
-        "yellow" => NSColor::systemYellowColor(),
-        "green" => NSColor::systemGreenColor(),
-        "mint" => NSColor::systemMintColor(),
-        "teal" => NSColor::systemTealColor(),
-        "indigo" => NSColor::systemIndigoColor(),
-        "purple" => NSColor::systemPurpleColor(),
-        "pink" => NSColor::systemPinkColor(),
-        _ => NSColor::systemBlueColor(),
-    }
+    let rgb: u32 = match name {
+        "red" => 0xe94f4a,
+        "coral" => 0xee7e62,
+        "orange" => 0xf0a04c,
+        "yellow" => 0xe6c03a,
+        "green" => 0x5bb85c,
+        "teal" | "mint" => 0x2fbfa0,
+        "sky" => 0x77c2e8,
+        "indigo" => 0x4b5fc4,
+        "violet" | "purple" => 0x7a4cc4,
+        "magenta" => 0xb44fc4,
+        "pink" => 0xe27fc6,
+        "gray" => 0x78808a,
+        "sage" => 0x8da58f,
+        "taupe" => 0xb19b80,
+        _ => 0x3d83f0,
+    };
+    let channel = |shift: u32| f64::from((rgb >> shift) & 0xff) / 255.;
+    NSColor::colorWithSRGBRed_green_blue_alpha(channel(16), channel(8), channel(0), 1.)
 }
 
 /// An SF Symbol at the size of the box's tile.
 fn small_symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
+    sized_symbol(name, description, 14.)
+}
+
+/// A semibold SF Symbol at `size` points.
+fn sized_symbol(name: &str, description: &str, size: f64) -> Option<Retained<NSImage>> {
     let image = symbol(name, description)?;
-    let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(12., unsafe {
+    let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(size, unsafe {
         objc2_app_kit::NSFontWeightSemibold
     });
     image.imageWithSymbolConfiguration(&config)

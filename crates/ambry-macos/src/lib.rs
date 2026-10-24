@@ -28,7 +28,7 @@ pub use native::{
     set_window_subtitle,
 };
 #[cfg(target_os = "macos")]
-pub use scroller::{CanvasScroller, ScrollerEvent};
+pub use scroller::CanvasScrollView;
 #[cfg(target_os = "macos")]
 pub use table::{FileRow, FileTable};
 #[cfg(target_os = "macos")]

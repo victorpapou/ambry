@@ -71,8 +71,10 @@ pub struct BoxIcon {
 }
 
 impl BoxIcon {
-    pub const COLORS: [&str; 10] = [
-        "red", "orange", "yellow", "green", "mint", "teal", "blue", "indigo", "purple", "pink",
+    /// The colors Shortcuts offers for a shortcut's icon, in its order.
+    pub const COLORS: [&str; 15] = [
+        "red", "coral", "orange", "yellow", "green", "teal", "sky", "blue", "indigo", "violet",
+        "magenta", "pink", "gray", "sage", "taupe",
     ];
     pub const SYMBOLS: [&str; 30] = [
         "tray",
