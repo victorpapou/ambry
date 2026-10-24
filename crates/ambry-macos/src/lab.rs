@@ -5,10 +5,11 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyClass;
 use objc2::{MainThreadMarker, MainThreadOnly, Message, msg_send};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSGlassEffectContainerView, NSGlassEffectView,
-    NSGlassEffectViewStyle, NSImage, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSBackingStoreType, NSBezelStyle, NSButton, NSColor, NSControlBorderShape, NSControlSize,
+    NSGlassEffectContainerView, NSGlassEffectView, NSGlassEffectViewStyle, NSImage,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 
 const ROW: f64 = 56.;
 const CONTROL_X: f64 = 240.;
@@ -18,6 +19,12 @@ pub fn open_switch_lab() {
         return;
     };
     let rows: Vec<(&str, Retained<NSView>)> = vec![
+        ("X glass button (reference)", glass_button(mtm)),
+        (
+            "V segmented, toolbar look, glass",
+            in_glass(mtm, &toolbar_look_segments(mtm)),
+        ),
+        ("W segmented, toolbar look", toolbar_look_segments(mtm)),
         ("R glass + tabs", in_glass(mtm, &icon_tabs(mtm, 40.))),
         ("S glass + tabs, no bg", in_glass(mtm, &bare_tabs(mtm))),
         (
@@ -47,7 +54,7 @@ pub fn open_switch_lab() {
     };
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("Switch lab"));
-    window.setBackgroundColor(Some(&NSColor::whiteColor()));
+    window.setBackgroundColor(Some(&NSColor::windowBackgroundColor()));
     let content = window.contentView().unwrap();
     for (i, (name, control)) in rows.iter().enumerate() {
         let y = height - 10. - ROW * (i as f64 + 1.);
@@ -152,6 +159,45 @@ fn bare_tabs(mtm: MainThreadMarker) -> Retained<NSView> {
     let tabs = crate::native::icon_tab_view(mtm, icons.len(), &images, 40.);
     tabs.setDrawsBackground(false);
     Retained::into_super(tabs)
+}
+
+fn glass_button(mtm: MainThreadMarker) -> Retained<NSView> {
+    let image = symbol("plus", "Add").unwrap();
+    let button = unsafe { NSButton::buttonWithImage_target_action(&image, None, None, mtm) };
+    button.setControlSize(NSControlSize::Large);
+    if glass() {
+        button.setBezelStyle(NSBezelStyle::Glass);
+    }
+    button.setFrameSize(NSSize::new(36., 36.));
+    Retained::into_super(Retained::into_super(button))
+}
+
+/// A plain segmented control asked to draw like one in a window toolbar.
+fn toolbar_look_segments(mtm: MainThreadMarker) -> Retained<NSView> {
+    let icons = [("number", "Canvas"), ("list.bullet", "List")];
+    let images = crate::native::icon_images(&icons).unwrap();
+    let control = unsafe {
+        NSSegmentedControl::segmentedControlWithImages_trackingMode_target_action(
+            &NSArray::from_retained_slice(&images),
+            NSSegmentSwitchTracking::SelectOne,
+            None,
+            None,
+            mtm,
+        )
+    };
+    control.setControlSize(crate::native::control_size());
+    if glass() {
+        control.setBorderShape(NSControlBorderShape::Capsule);
+    }
+    for segment in 0..icons.len() as isize {
+        control.setWidth_forSegment(40., segment);
+    }
+    unsafe {
+        let _: () = msg_send![&*control, setToolbarAppearance: 1isize];
+    }
+    control.setSelectedSegment(0);
+    control.sizeToFit();
+    Retained::into_super(Retained::into_super(control))
 }
 
 fn in_container(mtm: MainThreadMarker, inner: &NSView) -> Retained<NSView> {
