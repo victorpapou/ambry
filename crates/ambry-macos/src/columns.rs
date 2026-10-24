@@ -23,9 +23,8 @@ const COLUMN_WIDTH: f64 = 240.;
 /// The most entries one folder's column lists.
 const LIMIT: usize = 500;
 
-/// Height of a row, how far its highlight keeps from the column's sides, and its corners:
+/// How far its highlight keeps from the column's sides, and its corners:
 /// Finder's column view on macOS 26.
-const ROW_HEIGHT: f64 = 24.;
 const ROW_INSET: f64 = 6.;
 const ROW_RADIUS: f64 = 6.;
 const FONT_SIZE: f64 = 13.;
@@ -227,7 +226,6 @@ impl ColumnBrowser {
         unsafe {
             let _: () =
                 msg_send![&*browser, setCellClass: <RoundCell as objc2::ClassType>::class()];
-            let _: () = msg_send![&*browser, setRowHeight: ROW_HEIGHT];
         }
         browser.setAllowsMultipleSelection(true);
         browser.setHasHorizontalScroller(true);
