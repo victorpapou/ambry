@@ -28,6 +28,8 @@ pub mod settings;
 #[cfg(target_os = "macos")]
 mod table;
 #[cfg(target_os = "macos")]
+mod tilt;
+#[cfg(target_os = "macos")]
 mod toolbar;
 
 #[cfg(target_os = "macos")]

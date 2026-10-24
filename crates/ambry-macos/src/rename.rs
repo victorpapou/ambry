@@ -6,11 +6,10 @@ use std::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
-use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message, msg_send, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, Message, msg_send, sel};
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSColor, NSControlSize, NSEvent, NSEventMask, NSFont,
-    NSTextAlignment, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::NSMutableArray;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -18,7 +17,8 @@ use objc2_quartz_core::CALayer;
 
 use crate::box_list::icon_tile;
 use crate::native::Target;
-use crate::toolbar::{BoxLabel, Hover, bouncy_spring, box_color};
+use crate::tilt::Tilt;
+use crate::toolbar::{BoxLabel, box_color};
 
 const WIDTH: f64 = 280.;
 const SIDE: f64 = 20.;
@@ -26,9 +26,6 @@ const TOP: f64 = 24.;
 const TILE: f64 = 44.;
 const TILE_RADIUS: f64 = 10.;
 const GLYPH: f64 = 21.;
-/// How much the icon grows under the pointer, and how long its spring takes.
-const HOVER_SCALE: f64 = 1.08;
-const HOVER_DURATION: f64 = 0.35;
 /// Between the icon and the title, the title and its note, the note and the field, and the
 /// field and the buttons: tight inside a group, looser between groups.
 const ICON_GAP: f64 = 12.;
@@ -125,27 +122,10 @@ pub(crate) fn ask_name(
     let mut parts: Vec<Retained<NSObject>> = Vec::new();
     if let Some(layer) = tile.layer() {
         give_volume(&layer, &label.color);
-        // Grow about the middle: AppKit pins a view's layer at its corner.
-        let frame = tile.frame();
-        layer.setAnchorPoint(NSPoint::new(0.5, 0.5));
-        layer.setPosition(NSPoint::new(
-            frame.origin.x + frame.size.width / 2.,
-            frame.origin.y + frame.size.height / 2.,
-        ));
-        let hover = Hover::new(mtm, move |inside| lift(&layer, inside));
-        let tracking = unsafe {
-            NSTrackingArea::initWithRect_options_owner_userInfo(
-                NSTrackingArea::alloc(),
-                NSRect::ZERO,
-                NSTrackingAreaOptions::MouseEnteredAndExited
-                    | NSTrackingAreaOptions::ActiveAlways
-                    | NSTrackingAreaOptions::InVisibleRect,
-                Some(&hover),
-                None,
-            )
-        };
-        tile.addTrackingArea(&tracking);
-        parts.push(Retained::into_super(hover));
+    }
+    // Under the pointer the icon leans toward it in 3D and catches the light.
+    if let Some(tilt) = Tilt::attach(mtm, &tile) {
+        parts.push(Retained::into_super(tilt));
     }
     view.addSubview(&tile);
 
@@ -319,46 +299,6 @@ fn give_volume(layer: &CALayer, color: &str) {
     layer.setShadowOffset(NSSize::new(0., SHADOW_DROP));
 }
 
-/// The shadow's blur at rest and lifted under the pointer, and how far it drops.
+/// The shadow's blur at rest, and how far it drops.
 const REST_SHADOW: f64 = 6.;
-const LIFTED_SHADOW: f64 = 11.;
 const SHADOW_DROP: f64 = -4.;
-
-/// Raises the tile toward the pointer with a little bounce, or settles it back.
-fn lift(layer: &CALayer, up: bool) {
-    let (scale, shadow) = if up {
-        (HOVER_SCALE, LIFTED_SHADOW)
-    } else {
-        (1., REST_SHADOW)
-    };
-    let bounce = if up { 0.35 } else { 0.15 };
-    // Start from where the tile is on screen, so a quick in and out doesn't jump.
-    let from_scale = shown(layer, "transform.scale").unwrap_or(if up { 1. } else { HOVER_SCALE });
-    let from_shadow =
-        shown(layer, "shadowRadius").unwrap_or(if up { REST_SHADOW } else { LIFTED_SHADOW });
-    bouncy_spring(
-        layer,
-        "transform.scale",
-        from_scale,
-        scale,
-        HOVER_DURATION,
-        bounce,
-    );
-    bouncy_spring(
-        layer,
-        "shadowRadius",
-        from_shadow,
-        shadow,
-        HOVER_DURATION,
-        bounce,
-    );
-}
-
-/// The value at `key_path` of what is on screen now, mid-animation or not.
-fn shown(layer: &CALayer, key_path: &str) -> Option<f64> {
-    let presented: Option<Retained<CALayer>> = unsafe { msg_send![layer, presentationLayer] };
-    let value: Option<Retained<objc2_foundation::NSNumber>> = unsafe {
-        msg_send![&*presented?, valueForKeyPath: &*objc2_foundation::NSString::from_str(key_path)]
-    };
-    value.map(|value| value.doubleValue())
-}
