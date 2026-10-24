@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, MessageReceiver, Sel};
 use objc2_foundation::NSString;
 
-const KEYWORDS: [&str; 12] = [
+const KEYWORDS: [&str; 20] = [
     "glass",
     "toolbar",
     "appearance",
@@ -19,6 +19,14 @@ const KEYWORDS: [&str; 12] = [
     "vibran",
     "bezel",
     "selection",
+    "interact",
+    "press",
+    "lens",
+    "highlight",
+    "morph",
+    "elastic",
+    "bounce",
+    "touch",
 ];
 
 /// Methods of `object`'s class chain whose names hint at how it is drawn, with their type
