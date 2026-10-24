@@ -1,40 +1,35 @@
-//! The blur behind the toolbar: a frosted band of the window's own material that fades out
-//! toward the content, like the edge Finder and Safari blur under their toolbars. It only
-//! shows; clicks and scrolls go through to the canvas underneath.
+//! The soft shade behind the toolbar: the canvas's own color, opaque along the window's top
+//! edge and fading out toward the content, so what scrolls under the toolbar sinks into it.
+//! No blur, just a gradient. It only shows; clicks and scrolls go through to the canvas.
 //!
-//! The band is a sibling of GPUI's view, laid over it in the window's frame view, the way
-//! AppKit lays its own titlebar: a backdrop blurs the layers beside and below it, not the
-//! contents of the layer it sits in, so as a subview of GPUI's view it would only tint.
+//! The band is a sibling of GPUI's view, laid over it in the window's frame view.
 
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool};
+use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBezierPath, NSColor, NSGradient, NSImage, NSImageResizingMode,
-    NSResponder, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindowOrderingMode,
+    NSAutoresizingMaskOptions, NSColor, NSResponder, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{NSArray, NSMutableArray, NSNumber, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
-/// The share of the band that stays fully frosted before the fade starts.
-const SOLID: f64 = 0.6;
-/// How much of the content's own color is laid over the frost, so the band blurs what
-/// passes under it without turning the lighter grey of the system's material.
-const VEIL: f64 = 0.75;
+/// The share of the band that stays fully shaded before the fade starts, and how opaque the
+/// shade is there.
+const SOLID: f64 = 0.55;
+const OPACITY: f64 = 0.92;
 
 define_class!(
-    // A visual effect view that never takes a click.
-    #[unsafe(super(NSVisualEffectView, NSView, NSResponder, objc2::runtime::NSObject))]
+    // A layer-hosting view that never takes a click.
+    #[unsafe(super(NSView, NSResponder, objc2::runtime::NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "AmbrySoftEdge"]
-    struct PassThroughEffectView;
+    struct Shade;
 
-    impl PassThroughEffectView {
+    impl Shade {
         #[unsafe(method(hitTest:))]
         fn hit_test(&self, _point: NSPoint) -> *mut NSView {
             std::ptr::null_mut()
@@ -42,11 +37,10 @@ define_class!(
     }
 );
 
-/// The frosted band along the top of the window, behind the toolbar.
+/// The shade along the top of the window, behind the toolbar.
 pub struct SoftEdge {
-    view: Retained<PassThroughEffectView>,
-    /// The content's color over the frost, fading out with it.
-    veil: Retained<CALayer>,
+    view: Retained<Shade>,
+    gradient: Retained<CALayer>,
     color: Cell<Option<u32>>,
 }
 
@@ -77,39 +71,28 @@ impl SoftEdge {
             NSPoint::new(below.origin.x, top),
             NSSize::new(below.size.width, height),
         );
-        let view: Retained<PassThroughEffectView> =
-            unsafe { msg_send![PassThroughEffectView::alloc(mtm), initWithFrame: frame] };
+        let view: Retained<Shade> = unsafe { msg_send![Shade::alloc(mtm), initWithFrame: frame] };
         view.setAutoresizingMask(if frame_view.isFlipped() {
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin
         } else {
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin
         });
-        view.setMaterial(NSVisualEffectMaterial::Titlebar);
-        view.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
-        view.setState(NSVisualEffectState::FollowsWindowActiveState);
-        view.setMaskImage(Some(&fade(height)));
-        let veil_view =
-            NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::ZERO, frame.size));
-        veil_view.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable
-                | NSAutoresizingMaskOptions::ViewHeightSizable,
-        );
-        let veil: Retained<CALayer> =
+        let gradient: Retained<CALayer> =
             unsafe { msg_send![AnyClass::get(c"CAGradientLayer")?, layer] };
         unsafe {
-            let _: () = msg_send![&*veil, setStartPoint: NSPoint::new(0.5, 1.)];
-            let _: () = msg_send![&*veil, setEndPoint: NSPoint::new(0.5, 0.)];
+            // From the top edge down.
+            let _: () = msg_send![&*gradient, setStartPoint: NSPoint::new(0.5, 1.)];
+            let _: () = msg_send![&*gradient, setEndPoint: NSPoint::new(0.5, 0.)];
             let locations = NSArray::from_retained_slice(&[
                 NSNumber::new_f64(0.),
                 NSNumber::new_f64(SOLID),
                 NSNumber::new_f64(1.),
             ]);
-            let _: () = msg_send![&*veil, setLocations: &*locations];
+            let _: () = msg_send![&*gradient, setLocations: &*locations];
         }
         // A layer-hosting view: AppKit keeps the gradient the size of the view.
-        veil_view.setLayer(Some(&veil));
-        veil_view.setWantsLayer(true);
-        view.addSubview(&veil_view);
+        view.setLayer(Some(&gradient));
+        view.setWantsLayer(true);
         frame_view.addSubview_positioned_relativeTo(
             &view,
             NSWindowOrderingMode::Above,
@@ -117,12 +100,12 @@ impl SoftEdge {
         );
         Some(Self {
             view,
-            veil,
+            gradient,
             color: Cell::new(None),
         })
     }
 
-    /// Tints the band with the content's color, `0xRRGGBB`, as the appearance changes.
+    /// Colors the shade with the content's color, `0xRRGGBB`, as the appearance changes.
     pub fn set_color(&self, rgb: u32) {
         if self.color.replace(Some(rgb)) == Some(rgb) {
             return;
@@ -132,46 +115,16 @@ impl SoftEdge {
             NSColor::colorWithSRGBRed_green_blue_alpha(channel(16), channel(8), channel(0), alpha)
                 .CGColor()
         };
-        let (veil, clear) = (color(VEIL), color(0.));
+        let (shade, clear) = (color(OPACITY), color(0.));
         let colors = NSMutableArray::<AnyObject>::new();
-        for color in [&veil, &veil, &clear] {
+        for color in [&shade, &shade, &clear] {
             colors.addObject(crate::tilt::bridged(&**color));
         }
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         unsafe {
-            let _: () = msg_send![&*self.veil, setColors: &*colors];
+            let _: () = msg_send![&*self.gradient, setColors: &*colors];
         }
         CATransaction::commit();
     }
-}
-
-/// A mask that is opaque along the top and fades to clear toward the content, stretched to
-/// the band's width.
-fn fade(height: f64) -> Retained<NSImage> {
-    let draw = block2::RcBlock::new(move |rect: NSRect| -> Bool {
-        // AppKit counts y from the bottom.
-        let solid = rect.size.height * SOLID;
-        let fading = rect.size.height - solid;
-        NSColor::blackColor().setFill();
-        NSBezierPath::fillRect(NSRect::new(
-            NSPoint::new(0., fading),
-            NSSize::new(rect.size.width, solid),
-        ));
-        if let Some(gradient) = NSGradient::initWithStartingColor_endingColor(
-            NSGradient::alloc(),
-            &NSColor::clearColor(),
-            &NSColor::blackColor(),
-        ) {
-            gradient.drawInRect_angle(
-                NSRect::new(NSPoint::ZERO, NSSize::new(rect.size.width, fading)),
-                90.,
-            );
-        }
-        Bool::YES
-    });
-    let image =
-        NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(1., height), false, &draw);
-    image.setResizingMode(NSImageResizingMode::Stretch);
-    image
 }

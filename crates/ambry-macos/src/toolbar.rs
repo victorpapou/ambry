@@ -44,7 +44,7 @@ const MODE_WIDTH: f64 = 32.;
 /// Point size of the account picture inside its glass circle.
 const AVATAR_SIZE: f64 = 28.;
 /// The box's icon tile next to its name, as big as a shortcut's in the Shortcuts editor.
-const TILE: f64 = 26.;
+const TILE: f64 = 22.;
 /// Font size of the box's name and status.
 const TITLE_SIZE: f64 = 14.;
 /// One pass of the light sweeping over the status, in seconds, and its lean from upright.
@@ -285,15 +285,15 @@ fn fit_sweep(label: &NSTextField) {
     if size.width <= 0. || size.height <= 0. {
         return;
     }
-    // The band leans like a "/": the light runs right and down at the lean, measured in
-    // points, so its slant does not change with the text's length.
+    // The band leans like a "\": it is tilted by the lean in points, so its slant does not
+    // change with the text's length.
     let drop = size.width * SWEEP_LEAN.to_radians().tan() / size.height / 2.;
     CATransaction::begin();
     CATransaction::setDisableActions(true);
     mask.setFrame(NSRect::new(NSPoint::ZERO, size));
     unsafe {
-        let _: () = msg_send![&*mask, setStartPoint: NSPoint::new(0., 0.5 + drop)];
-        let _: () = msg_send![&*mask, setEndPoint: NSPoint::new(1., 0.5 - drop)];
+        let _: () = msg_send![&*mask, setStartPoint: NSPoint::new(0., 0.5 - drop)];
+        let _: () = msg_send![&*mask, setEndPoint: NSPoint::new(1., 0.5 + drop)];
     }
     CATransaction::commit();
 }
@@ -450,7 +450,7 @@ impl WindowToolbar {
         );
         tile.setWantsLayer(true);
         if let Some(layer) = tile.layer() {
-            layer.setCornerRadius(7.);
+            layer.setCornerRadius(6.);
         }
         tile.setTranslatesAutoresizingMaskIntoConstraints(false);
         tile.widthAnchor()
@@ -753,10 +753,10 @@ impl WindowToolbar {
         let state = &self.state;
         place_symbol(
             &state.glyph,
-            glyph_image(&label.symbol, 14.).as_deref(),
+            glyph_image(&label.symbol, 12.).as_deref(),
             TILE,
         );
-        paint_tile(&state.tile, &label.color, TILE, 7.);
+        paint_tile(&state.tile, &label.color, TILE, 6.);
         state.picker.mark(&label.color, &label.symbol);
         self.state.name.setTitle(&NSString::from_str(&label.name));
         self.status.setStringValue(&NSString::from_str(status));
