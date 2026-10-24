@@ -5,6 +5,7 @@ set -eu
 cd "$(dirname "$0")/.."
 cargo build --release
 app=target/release/Ambry.app
+pkill -x Ambry 2>/dev/null && sleep 1 || true
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp target/release/ambry "$app/Contents/MacOS/Ambry"
@@ -27,4 +28,4 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 codesign --force --sign - "$app" >/dev/null 2>&1 || true
-open "$app"
+open "$app" --args "$@"

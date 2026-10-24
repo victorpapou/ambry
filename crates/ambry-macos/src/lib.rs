@@ -5,7 +5,12 @@
 //! so they pick up Liquid Glass on macOS 26 by themselves.
 
 #[cfg(target_os = "macos")]
+mod lab;
+#[cfg(target_os = "macos")]
 mod toolbar;
+
+#[cfg(target_os = "macos")]
+pub use lab::open_switch_lab;
 
 #[cfg(target_os = "macos")]
 pub use toolbar::Toolbar;

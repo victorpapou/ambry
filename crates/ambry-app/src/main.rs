@@ -37,6 +37,11 @@ fn main() {
             )
             .expect("failed to open window");
 
+            #[cfg(target_os = "macos")]
+            if std::env::args().any(|arg| arg == "--lab") {
+                ambry_macos::open_switch_lab();
+            }
+
             cx.on_window_closed(|cx| cx.quit()).detach();
             cx.activate(true);
         });
