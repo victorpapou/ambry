@@ -217,8 +217,6 @@ struct NativeControls {
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
-    /// The blur behind the toolbar.
-    toolbar_blur: ambry_macos::SoftEdge,
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
     scroll: ambry_macos::CanvasScrollView,
     /// The add button, bottom right.
@@ -337,7 +335,6 @@ impl BoxView {
                     configured.try_send(ControlEvent::Settings(event)).ok();
                 },
             );
-            let toolbar_blur = ambry_macos::SoftEdge::new(ns_view, layout::TOOLBAR_BLUR)?;
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
@@ -388,7 +385,6 @@ impl BoxView {
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
-                toolbar_blur,
                 scroll,
                 add,
                 _pinch: pinch,
@@ -515,7 +511,6 @@ impl BoxView {
         let Some(controls) = &mut self.controls else {
             return;
         };
-        controls.toolbar_blur.set_color(palette().canvas);
         let items = self.doc.items.len();
         let shown = (box_label(&self.doc.name, &self.doc.icon, items), status);
         if controls.shown_box.as_ref() != Some(&shown) {
@@ -555,7 +550,8 @@ impl BoxView {
             .set_percent((zoom * 100.).round() as i32, dark);
         controls.zoom_label.native().set_hidden(!in_canvas);
         controls.columns.native().set_hidden(in_canvas);
-        controls.toolbar.set_bar(!in_canvas);
+        // The toolbar's own bar over both views, as a native window has it.
+        controls.toolbar.set_bar(true);
         let paths: Vec<PathBuf> = self
             .doc
             .items
@@ -563,8 +559,6 @@ impl BoxView {
             .map(|item| item.path.clone())
             .collect();
         controls.columns.set_items(&paths);
-        // Only the canvas passes under the toolbar; the list starts below it.
-        controls.toolbar_blur.set_hidden(!in_canvas);
     }
 
     /// Renders Finder's icon for every item that has none yet, or whose file changed since:
@@ -1425,7 +1419,9 @@ impl BoxView {
         if selected {
             self.was_selected.borrow_mut().insert(id);
         }
-        let open = self.open_folder == Some(id);
+        // A folder opens while it is carried, and while something is carried over it.
+        let target = self.open_folder == Some(id);
+        let open = target || lifted;
         let closing = !open && self.was_open.borrow().contains(&id);
         if open {
             self.was_open.borrow_mut().insert(id);
@@ -1434,7 +1430,7 @@ impl BoxView {
             (Some(open_icon), Some(icon))
                 if item.kind == ItemKind::Folder && (open || closing) =>
             {
-                folder_face(icon, open_icon.clone(), open, id, self.zoom * pop)
+                folder_face(icon, open_icon.clone(), open, target, id, self.zoom * pop)
             }
             (_, icon) => finder_face(item, icon, false, lifted, self.zoom * pop),
         };
@@ -1868,19 +1864,15 @@ impl Render for BoxView {
     }
 }
 
-/// A soft white fade along every edge of the canvas, like Freeform's.
-fn edge_fades() -> [impl IntoElement; 4] {
+/// A soft fade along the canvas's sides and bottom, like Freeform's. The top needs none: the
+/// toolbar's own bar covers it. macOS has no native fade for these edges; its scroll edge
+/// effect only appears where a bar overlaps a scroll view.
+fn edge_fades() -> [impl IntoElement; 3] {
     let canvas = rgb(palette().canvas);
     let white = linear_color_stop(canvas, 0.);
     let clear = linear_color_stop(Rgba { a: 0., ..canvas }, 1.);
     let edge = || div().absolute();
     [
-        edge()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(EDGE_FADE))
-            .bg(linear_gradient(180., white, clear)),
         edge()
             .bottom_0()
             .left_0()
@@ -2025,9 +2017,17 @@ fn finder_face(
         )
 }
 
-/// A folder opening under a drag, or closing after it: its own icon gives way to Finder's
-/// open folder with a short cross-fade, under a grey highlight as Finder's drop target has.
-fn folder_face(closed: PathBuf, open: PathBuf, opening: bool, id: u64, scale: f32) -> gpui::Div {
+/// A folder opening while it is dragged or something is dragged over it, or closing after:
+/// its own icon gives way to Finder's open folder with a short cross-fade, under a grey
+/// highlight when it is the drop `target`, as Finder's is.
+fn folder_face(
+    closed: PathBuf,
+    open: PathBuf,
+    opening: bool,
+    target: bool,
+    id: u64,
+    scale: f32,
+) -> gpui::Div {
     let size = px(ICON_SIZE * scale);
     let fade = || Animation::new(Duration::from_millis(OPEN_FADE_MS)).with_easing(ease_out_quint());
     let key = |name: &'static str| (name, id as usize);
@@ -2035,7 +2035,7 @@ fn folder_face(closed: PathBuf, open: PathBuf, opening: bool, id: u64, scale: f3
         .relative()
         .p(px(4.))
         .rounded(px(6.))
-        .when(opening, |this| this.bg(palette().selection))
+        .when(target, |this| this.bg(palette().selection))
         .child(
             img(closed)
                 .size(size)

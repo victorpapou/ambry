@@ -838,8 +838,8 @@ impl WindowToolbar {
         })
     }
 
-    /// Shows the toolbar's own bar, as Finder's over its content, or leaves the titlebar clear
-    /// for the canvas under it. GPUI makes the titlebar transparent, which hides the bar
+    /// Shows the toolbar's own bar, as Finder's over its content, or leaves the titlebar
+    /// clear. GPUI makes the titlebar transparent, which hides the bar
     /// macOS draws behind the toolbar; it puts it back after full screen, so this is called
     /// on every frame and only touches AppKit when it differs.
     pub fn set_bar(&self, shown: bool) {
