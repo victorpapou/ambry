@@ -33,7 +33,7 @@ use objc2_quartz_core::{CALayer, CAMediaTimingFunction, CATransaction, CATransfo
 use crate::box_list::BoxList;
 use crate::icon_picker::IconPicker;
 use crate::native::{
-    Target, decorate_strip, icon_images, icon_tab_view, segments, selected_index, symbol,
+    NativeView, Target, decorate_strip, icon_images, icon_tab_view, segments, selected_index, symbol,
 };
 use crate::settings::{self, Pane};
 
@@ -488,6 +488,64 @@ pub struct WindowToolbar {
     _list_watcher: Retained<PopoverWatcher>,
     /// The window, for its titlebar's bar. Weak: the window owns what owns this.
     window: objc2::rc::Weak<objc2_app_kit::NSWindow>,
+    /// The band under the toolbar that hears the pointer, and when the bar shows.
+    band: NativeView,
+    bar: Rc<Bar>,
+    _band_hover: Retained<Hover>,
+}
+
+define_class!(
+    // The band under the toolbar that hears the pointer come and go. It never takes a click.
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AmbryToolbarBand"]
+    struct Band;
+
+    impl Band {
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+            std::ptr::null_mut()
+        }
+    }
+);
+
+/// The toolbar's own bar, NSTitlebarBackgroundView: always there over the columns, as in
+/// Finder; over the canvas it fades in while the pointer is on the toolbar and out after.
+struct Bar {
+    window: objc2::rc::Weak<objc2_app_kit::NSWindow>,
+    canvas: Cell<bool>,
+    hovered: Cell<bool>,
+    shown: Cell<Option<bool>>,
+}
+
+impl Bar {
+    fn update(&self) {
+        let show = !self.canvas.get() || self.hovered.get();
+        let Some(view) = self.window.load().and_then(|window| {
+            let frame = unsafe { window.contentView()?.superview() }?;
+            find_view(&frame, "NSTitlebarBackgroundView")
+        }) else {
+            return;
+        };
+        let alpha = if show { 1. } else { 0. };
+        let first = self.shown.replace(Some(show)).is_none();
+        if view.alphaValue() == alpha {
+            return;
+        }
+        if first {
+            view.setAlphaValue(alpha);
+            return;
+        }
+        NSAnimationContext::runAnimationGroup_completionHandler(
+            &block2::RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
+                let context = unsafe { context.as_ref() };
+                context.setDuration(BAR_FADE);
+                context.setAllowsImplicitAnimation(true);
+                view.animator().setAlphaValue(alpha);
+            }),
+            None,
+        );
+    }
 }
 
 impl WindowToolbar {
@@ -820,8 +878,41 @@ impl WindowToolbar {
         window.setToolbar(Some(&toolbar));
         let edge_target = pull_trailing(mtm, &window);
         let weak_window = objc2::rc::Weak::from_retained(&window);
+        let bar = Rc::new(Bar {
+            window: weak_window.clone(),
+            canvas: Cell::new(false),
+            hovered: Cell::new(false),
+            shown: Cell::new(None),
+        });
+        let band: Retained<Band> =
+            unsafe { msg_send![Band::alloc(mtm), initWithFrame: NSRect::ZERO] };
+        let band_hover = Hover::new(mtm, {
+            let bar = Rc::downgrade(&bar);
+            move |inside| {
+                if let Some(bar) = bar.upgrade() {
+                    bar.hovered.set(inside);
+                    bar.update();
+                }
+            }
+        });
+        let band_tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::ActiveAlways
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(&band_hover),
+                None,
+            )
+        };
+        band.addTrackingArea(&band_tracking);
+        let band = NativeView::host(view, Retained::into_super(band), None);
         Some(Self {
             window: weak_window,
+            band,
+            bar,
+            _band_hover: band_hover,
             state,
             modes: tabs,
             status,
@@ -847,6 +938,19 @@ impl WindowToolbar {
             if window.titlebarAppearsTransparent() == shown {
                 window.setTitlebarAppearsTransparent(!shown);
             }
+        }
+    }
+
+    /// The band under the toolbar, as tall as the bar, that hears the pointer on the toolbar.
+    pub fn band(&self) -> &NativeView {
+        &self.band
+    }
+
+    /// Whether the canvas shows, where the bar only comes while the pointer is on the
+    /// toolbar, or the columns, where it always shows.
+    pub fn set_canvas(&self, canvas: bool) {
+        if self.bar.canvas.replace(canvas) != canvas || self.bar.shown.get().is_none() {
+            self.bar.update();
         }
     }
 
@@ -893,6 +997,9 @@ fn size_modes(strip: &NSSegmentedControl, images: &[Retained<NSImage>]) {
     strip.setControlSize(NSControlSize::ExtraLarge);
     strip.sizeToFit();
 }
+
+/// How long the bar takes to fade in or out over the canvas, in seconds.
+const BAR_FADE: f64 = 0.2;
 
 /// How far from the window's right edge AppKit ends the toolbar's last item, measured on
 /// macOS 26. Finder's sits as far from the right as from the top, so ours is pulled over to

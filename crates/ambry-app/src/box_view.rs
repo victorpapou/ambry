@@ -545,6 +545,7 @@ impl BoxView {
             controls.shown_scroll = Some(scroll);
         }
         controls.scroll.native().set_hidden(!in_canvas);
+        controls.toolbar.set_canvas(in_canvas);
         controls
             .zoom_label
             .set_percent((zoom * 100.).round() as i32, dark);
@@ -1834,6 +1835,15 @@ impl Render for BoxView {
                         .right_0()
                         .bottom_0()
                         .child(native(controls.scroll.native()).fill()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(layout::BAR as f32))
+                        .child(native(controls.toolbar.band()).fill()),
                 )
                 // The zoom, bottom left, level with the add button.
                 .when(self.mode == Mode::Canvas, |root| {

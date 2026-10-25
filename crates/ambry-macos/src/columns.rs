@@ -13,9 +13,10 @@ use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBezierPath, NSBrowser, NSBrowserCell, NSCell, NSColor, NSCompositingOperation, NSFont,
-    NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName,
-    NSStringDrawing, NSView, NSWorkspace,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSImageScaling,
+    NSImageView, NSLineBreakMode,
+    NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSScrollView, NSStackView,
+    NSStringDrawing, NSTextField, NSView, NSViewController, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSIndexSet, NSPoint, NSRect, NSSize, NSString};
 
@@ -40,14 +41,19 @@ const FONT_SIZE: f64 = 13.;
 const ICON: f64 = 16.;
 const ICON_INSET: f64 = 7.;
 const ICON_GAP: f64 = 6.;
-/// Finder's chevron after a folder: its size, and how far it keeps from the highlight's end.
-const CHEVRON: f64 = 10.;
-const CHEVRON_INSET: f64 = 8.;
+/// Room the browser's chevron after a folder takes at the row's end.
+const CHEVRON_ROOM: f64 = 16.;
+/// Room above a column's first row and below its last, as Finder leaves.
+const COLUMN_PAD: f64 = 8.;
+/// The preview column: its picture, how far it sits from the top, and its info's font size.
+const PREVIEW: f64 = 160.;
+const PREVIEW_TOP: f64 = 24.;
+const PREVIEW_INFO_SIZE: f64 = 11.;
 
 define_class!(
     // A browser row drawn the way Finder draws it: a rounded highlight inset from the column's
-    // edges, blue in the column being worked in and grey in the ones before it, the icon and
-    // the name centred in it, and a chevron after a folder.
+    // edges, blue in the column being worked in and grey in the ones before it, and the icon
+    // and the name centred in it.
     #[unsafe(super(NSBrowserCell, NSCell, objc2::runtime::NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "AmbryColumnCell"]
@@ -59,8 +65,20 @@ define_class!(
             Retained::autorelease_return(NSColor::clearColor())
         }
 
+        // Everything is drawn in drawWithFrame:inView:; an item-based browser also asks for
+        // the interior on its own, which would draw AppKit's row over it.
+        #[unsafe(method(drawInteriorWithFrame:inView:))]
+        fn draw_interior(&self, _frame: NSRect, _view: &NSView) {}
+
         #[unsafe(method(drawWithFrame:inView:))]
         fn draw(&self, frame: NSRect, view: &NSView) {
+            // The row across the whole column: an item-based browser hands the cell its
+            // interior too, indented, and the row must come out the same either way.
+            let bounds = view.bounds();
+            let frame = NSRect::new(
+                NSPoint::new(bounds.origin.x, frame.origin.y),
+                NSSize::new(bounds.size.width, frame.size.height),
+            );
             let highlighted: bool = unsafe { msg_send![self, isHighlighted] };
             let leaf: bool = unsafe { msg_send![self, isLeaf] };
             // Blue only where the keyboard is: the column whose matrix has focus in the key
@@ -115,30 +133,9 @@ define_class!(
                 NSColor::labelColor()
             };
             let mut text_end = inner.origin.x + inner.size.width - ICON_INSET;
+            // A folder's chevron is AppKit's own: the browser draws it at the row's end.
             if !leaf {
-                if let Some(chevron) = chevron(if emphasized {
-                    NSColor::alternateSelectedControlTextColor()
-                } else {
-                    NSColor::secondaryLabelColor()
-                }) {
-                    let size = chevron.size();
-                    let x = inner.origin.x + inner.size.width - CHEVRON_INSET - size.width;
-                    let rect = NSRect::new(
-                        NSPoint::new(x.round(), (middle - size.height / 2.).round()),
-                        size,
-                    );
-                    unsafe {
-                        chevron.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-                            rect,
-                            NSRect::ZERO,
-                            NSCompositingOperation::SourceOver,
-                            1.,
-                            true,
-                            None,
-                        );
-                    }
-                    text_end = x - ICON_GAP;
-                }
+                text_end -= CHEVRON_ROOM;
             }
             let name: Retained<NSString> = unsafe { msg_send![self, stringValue] };
             let font = NSFont::systemFontOfSize(FONT_SIZE);
@@ -165,23 +162,6 @@ define_class!(
     }
 );
 
-/// Finder's chevron after a folder, in `color`.
-fn chevron(color: Retained<NSColor>) -> Option<Retained<NSImage>> {
-    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str("chevron.right"),
-        None,
-    )?;
-    let size = NSImageSymbolConfiguration::configurationWithPointSize_weight_scale(
-        CHEVRON,
-        unsafe { objc2_app_kit::NSFontWeightSemibold },
-        NSImageSymbolScale::Small,
-    );
-    let tint = NSImageSymbolConfiguration::configurationWithPaletteColors(
-        &NSArray::from_retained_slice(&[color]),
-    );
-    image.imageWithSymbolConfiguration(&size.configurationByApplyingConfiguration(&tint))
-}
-
 /// What the user did in the column view.
 pub enum ColumnEvent {
     /// Picked these rows of the first column, the box's items.
@@ -195,6 +175,9 @@ pub(crate) struct SourceIvars {
     items: RefCell<Vec<PathBuf>>,
     /// The entries of each folder opened.
     folders: RefCell<HashMap<PathBuf, Vec<PathBuf>>>,
+    /// The browser's items: the root, and each path as one string the browser keeps seeing.
+    root: Retained<NSString>,
+    names: RefCell<HashMap<PathBuf, Retained<NSString>>>,
 }
 
 define_class!(
@@ -208,9 +191,54 @@ define_class!(
     unsafe impl NSObjectProtocol for Source {}
 
     impl Source {
-        #[unsafe(method(browser:numberOfRowsInColumn:))]
-        fn rows(&self, browser: &NSBrowser, column: isize) -> isize {
-            self.entries(browser, column).len() as isize
+        // The item-based delegate, which is the one AppKit gives a preview column to.
+        #[unsafe(method(rootItemForBrowser:))]
+        fn root_item(&self, _browser: &NSBrowser) -> *mut AnyObject {
+            Retained::autorelease_return(self.ivars().root.clone()).cast()
+        }
+
+        #[unsafe(method(browser:numberOfChildrenOfItem:))]
+        fn children(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> isize {
+            self.children_of(item).len() as isize
+        }
+
+        #[unsafe(method(browser:child:ofItem:))]
+        fn child(&self, _browser: &NSBrowser, index: isize, item: Option<&AnyObject>) -> *mut AnyObject {
+            let Some(path) = self.children_of(item).get(index as usize).cloned() else {
+                return std::ptr::null_mut();
+            };
+            let name = self
+                .ivars()
+                .names
+                .borrow_mut()
+                .entry(path.clone())
+                .or_insert_with(|| NSString::from_str(&path.to_string_lossy()))
+                .clone();
+            Retained::autorelease_return(name).cast()
+        }
+
+        #[unsafe(method(browser:isLeafItem:))]
+        fn is_leaf(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> bool {
+            item_path(item).is_none_or(|path| !path.is_dir())
+        }
+
+        #[unsafe(method(browser:objectValueForItem:))]
+        fn object_value(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> *mut AnyObject {
+            let name = item_path(item)
+                .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            Retained::autorelease_return(NSString::from_str(&name)).cast()
+        }
+
+        #[unsafe(method(browser:previewViewControllerForLeafItem:))]
+        fn preview(&self, _browser: &NSBrowser, item: Option<&AnyObject>) -> *mut AnyObject {
+            let Some(path) = item_path(item) else {
+                return std::ptr::null_mut();
+            };
+            let Some(mtm) = MainThreadMarker::new() else {
+                return std::ptr::null_mut();
+            };
+            Retained::autorelease_return(preview_controller(mtm, &path)).cast()
         }
 
         #[unsafe(method(browser:willDisplayCell:atRow:column:))]
@@ -226,6 +254,10 @@ define_class!(
                         ];
                         let _: () = msg_send![matrix, sizeToCells];
                     }
+                }
+                let scroll: *mut NSScrollView = unsafe { msg_send![matrix, enclosingScrollView] };
+                if let Some(scroll) = unsafe { scroll.as_ref() } {
+                    pad(scroll);
                 }
             }
             let Some(path) = self.entries(browser, column).get(row as usize).cloned() else {
@@ -248,7 +280,100 @@ define_class!(
     }
 );
 
+/// The path a browser item stands for; the root is none.
+fn item_path(item: Option<&AnyObject>) -> Option<PathBuf> {
+    let text = item?.downcast_ref::<NSString>()?.to_string();
+    (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
+/// Finder's preview column for a file: its picture as Finder's icon view shows it, its name,
+/// and its kind and size, centred at the top of the column.
+fn preview_controller(mtm: MainThreadMarker, path: &Path) -> Retained<NSViewController> {
+    let picture = crate::finder::thumbnail_image(path, PREVIEW)
+        .unwrap_or_else(|| crate::finder::icon(path));
+    let image = NSImageView::imageViewWithImage(&picture, mtm);
+    image.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+    image.setTranslatesAutoresizingMaskIntoConstraints(false);
+    image.widthAnchor().constraintEqualToConstant(PREVIEW).setActive(true);
+    image.heightAnchor().constraintEqualToConstant(PREVIEW).setActive(true);
+    let name = NSTextField::wrappingLabelWithString(
+        &NSString::from_str(
+            &path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ),
+        mtm,
+    );
+    name.setFont(Some(&NSFont::boldSystemFontOfSize(FONT_SIZE)));
+    name.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    name.setMaximumNumberOfLines(2);
+    if let Some(cell) = name.cell() {
+        cell.setTruncatesLastVisibleLine(true);
+    }
+    let size = std::fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| crate::finder::size(metadata.len()));
+    let info = [crate::finder::kind(path), size]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" – ");
+    let details = NSTextField::labelWithString(&NSString::from_str(&info), mtm);
+    details.setFont(Some(&NSFont::systemFontOfSize(PREVIEW_INFO_SIZE)));
+    details.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    details.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+    let stack = NSStackView::stackViewWithViews(
+        &NSArray::from_retained_slice(&[
+            Retained::into_super(Retained::into_super(image)),
+            Retained::into_super(Retained::into_super(name.clone())),
+            Retained::into_super(Retained::into_super(details)),
+        ]),
+        mtm,
+    );
+    stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Vertical);
+    stack.setAlignment(objc2_app_kit::NSLayoutAttribute::CenterX);
+    stack.setSpacing(6.);
+    stack.setCustomSpacing_afterView(12., &stack.arrangedSubviews().objectAtIndex(0));
+    stack.setTranslatesAutoresizingMaskIntoConstraints(false);
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::ZERO, NSSize::new(COLUMN_WIDTH, PREVIEW * 2.)),
+    );
+    view.addSubview(&stack);
+    stack
+        .topAnchor()
+        .constraintEqualToAnchor_constant(&view.topAnchor(), PREVIEW_TOP)
+        .setActive(true);
+    stack
+        .centerXAnchor()
+        .constraintEqualToAnchor(&view.centerXAnchor())
+        .setActive(true);
+    name.widthAnchor()
+        .constraintLessThanOrEqualToAnchor_constant(&view.widthAnchor(), -2. * ROW_INSET)
+        .setActive(true);
+    let controller = NSViewController::new(mtm);
+    controller.setView(&view);
+    controller
+}
+
 impl Source {
+    /// The paths under browser item `item`: the box's items under the root, a folder's
+    /// entries, read the first time it is opened, under the folder.
+    fn children_of(&self, item: Option<&AnyObject>) -> Vec<PathBuf> {
+        match item_path(item) {
+            None => self.ivars().items.borrow().clone(),
+            Some(folder) => self
+                .ivars()
+                .folders
+                .borrow_mut()
+                .entry(folder.clone())
+                .or_insert_with(|| list(&folder))
+                .clone(),
+        }
+    }
+
     /// What column `column` lists: the box's items first, then the entries of the folder
     /// picked in each column before, read the first time it is opened.
     fn entries(&self, browser: &NSBrowser, column: isize) -> Vec<PathBuf> {
@@ -294,6 +419,42 @@ fn list(folder: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// Gives a column Finder's room above its first row and below its last, on top of the toolbar
+/// AppKit already keeps it clear of; once, when it first shows.
+fn pad(scroll: &NSScrollView) {
+    if !scroll.automaticallyAdjustsContentInsets() {
+        return;
+    }
+    let insets = scroll.contentInsets();
+    scroll.setAutomaticallyAdjustsContentInsets(false);
+    scroll.setContentInsets(objc2_foundation::NSEdgeInsets {
+        top: insets.top + COLUMN_PAD,
+        bottom: insets.bottom + COLUMN_PAD,
+        ..insets
+    });
+    let clip = scroll.contentView();
+    clip.scrollToPoint(NSPoint::new(0., -(insets.top + COLUMN_PAD)));
+    scroll.reflectScrolledClipView(&clip);
+}
+
+/// Keeps the toolbar's bar showing over the columns, as Finder's does, even before anything
+/// has scrolled under it: macOS 27 otherwise leaves the bar clear while the scroll view under
+/// the toolbar is at its top.
+fn always_show_bar(browser: &NSBrowser) {
+    for child in browser.subviews() {
+        let scroll: &AnyObject = &child;
+        let responds: bool =
+            unsafe { msg_send![scroll, respondsToSelector: sel!(setAlwaysShownPocketEdges:)] };
+        if !responds {
+            continue;
+        }
+        let allowed: usize = unsafe { msg_send![scroll, allowedPocketEdges] };
+        unsafe {
+            let _: () = msg_send![scroll, setAlwaysShownPocketEdges: allowed];
+        }
+    }
+}
+
 /// The column view.
 pub struct ColumnBrowser {
     native: NativeView,
@@ -316,6 +477,8 @@ impl ColumnBrowser {
         let source = Source::alloc(mtm).set_ivars(SourceIvars {
             items: RefCell::new(Vec::new()),
             folders: RefCell::new(HashMap::new()),
+            root: NSString::new(),
+            names: RefCell::new(HashMap::new()),
         });
         let source: Retained<Source> = unsafe { msg_send![super(source), init] };
         let target = Target::new(mtm, {
@@ -362,6 +525,7 @@ impl ColumnBrowser {
         browser
             .setColumnResizingType(objc2_app_kit::NSBrowserColumnResizingType::UserColumnResizing);
         browser.setReusesColumns(false);
+        always_show_bar(&browser);
         let view: Retained<NSView> = Retained::into_super(Retained::into_super(browser.clone()));
         Some(Self {
             native: NativeView::host(parent, view, Some(target)),
@@ -383,6 +547,7 @@ impl ColumnBrowser {
         *self.shown.borrow_mut() = paths.to_vec();
         *self.source.ivars().items.borrow_mut() = paths.to_vec();
         self.source.ivars().folders.borrow_mut().clear();
+        self.source.ivars().names.borrow_mut().clear();
         self.browser.loadColumnZero();
     }
 }

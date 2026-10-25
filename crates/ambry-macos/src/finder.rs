@@ -25,7 +25,9 @@ pub fn icon_png(path: &Path, points: f64) -> Option<Vec<u8>> {
 /// Finder's open folder, which a folder turns into while something is dragged over it, as a
 /// PNG `points` wide for a 2x display.
 pub fn open_folder_png(points: f64) -> Option<Vec<u8>> {
-    // The HFS type of the open folder icon, 'ofld', as AppKit spells file types.
+    // The HFS type of the open folder icon, 'ofld', as AppKit spells file types; it has no
+    // content type to ask for instead.
+    #[allow(deprecated)]
     let image = NSWorkspace::sharedWorkspace().iconForFileType(&NSString::from_str("'ofld'"));
     image_png(&image, points)
 }
@@ -46,6 +48,19 @@ fn image_png(image: &NSImage, points: f64) -> Option<Vec<u8>> {
 /// peeking out of a folder that has some, which `icon` never shows. Waits for Quick Look a
 /// moment; false when it has nothing by then.
 pub fn thumbnail_png(path: &Path, points: f64, into: &Path) -> bool {
+    thumbnail_bytes(path, points).is_some_and(|png| std::fs::write(into, png).is_ok())
+}
+
+/// Quick Look's picture for `path`, as [`thumbnail_png`] makes it.
+pub(crate) fn thumbnail_image(path: &Path, points: f64) -> Option<Retained<NSImage>> {
+    let png = thumbnail_bytes(path, points)?;
+    let data = objc2_foundation::NSData::with_bytes(&png);
+    let image = NSImage::initWithData(NSImage::alloc(), &data)?;
+    image.setSize(NSSize::new(points, points));
+    Some(image)
+}
+
+fn thumbnail_bytes(path: &Path, points: f64) -> Option<Vec<u8>> {
     use objc2_quick_look_thumbnailing::{
         QLThumbnailGenerationRequest, QLThumbnailGenerationRequestRepresentationTypes,
         QLThumbnailGenerator, QLThumbnailRepresentation,
@@ -83,11 +98,10 @@ pub fn thumbnail_png(path: &Path, points: f64, into: &Path) -> bool {
     let generator = unsafe { QLThumbnailGenerator::sharedGenerator() };
     unsafe { generator.generateBestRepresentationForRequest_completionHandler(&request, &handler) };
     match finished.recv_timeout(std::time::Duration::from_secs(2)) {
-        Ok(Some(png)) => std::fs::write(into, png).is_ok(),
-        Ok(None) => false,
+        Ok(png) => png,
         Err(_) => {
             unsafe { generator.cancelRequest(&request) };
-            false
+            None
         }
     }
 }
