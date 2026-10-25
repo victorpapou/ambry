@@ -486,6 +486,8 @@ pub struct WindowToolbar {
     /// The tracking area's owner and the box list's delegate, which AppKit does not retain.
     _hover: Retained<Hover>,
     _list_watcher: Retained<PopoverWatcher>,
+    /// The window, for its titlebar's bar. Weak: the window owns what owns this.
+    window: objc2::rc::Weak<objc2_app_kit::NSWindow>,
 }
 
 impl WindowToolbar {
@@ -817,7 +819,9 @@ impl WindowToolbar {
         window.setToolbarStyle(NSWindowToolbarStyle::Unified);
         window.setToolbar(Some(&toolbar));
         let edge_target = pull_trailing(mtm, &window);
+        let weak_window = objc2::rc::Weak::from_retained(&window);
         Some(Self {
+            window: weak_window,
             state,
             modes: tabs,
             status,
@@ -832,6 +836,18 @@ impl WindowToolbar {
             ]
             .concat(),
         })
+    }
+
+    /// Shows the toolbar's own bar, as Finder's over its content, or leaves the titlebar clear
+    /// for the canvas under it. GPUI makes the titlebar transparent, which hides the bar
+    /// macOS draws behind the toolbar; it puts it back after full screen, so this is called
+    /// on every frame and only touches AppKit when it differs.
+    pub fn set_bar(&self, shown: bool) {
+        if let Some(window) = self.window.load() {
+            if window.titlebarAppearsTransparent() == shown {
+                window.setTitlebarAppearsTransparent(!shown);
+            }
+        }
     }
 
     /// Selects canvas (0) or list (1) without reporting it.

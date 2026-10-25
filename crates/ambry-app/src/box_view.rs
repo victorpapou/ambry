@@ -555,6 +555,7 @@ impl BoxView {
             .set_percent((zoom * 100.).round() as i32, dark);
         controls.zoom_label.native().set_hidden(!in_canvas);
         controls.columns.native().set_hidden(in_canvas);
+        controls.toolbar.set_bar(!in_canvas);
         let paths: Vec<PathBuf> = self
             .doc
             .items

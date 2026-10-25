@@ -43,8 +43,6 @@ const ICON_GAP: f64 = 6.;
 /// Finder's chevron after a folder: its size, and how far it keeps from the highlight's end.
 const CHEVRON: f64 = 10.;
 const CHEVRON_INSET: f64 = 8.;
-/// The pocket edges AppKit allows a plain scroll view by default.
-const POCKET_EDGES: usize = 3;
 
 define_class!(
     // A browser row drawn the way Finder draws it: a rounded highlight inset from the column's
@@ -229,10 +227,6 @@ define_class!(
                         let _: () = msg_send![matrix, sizeToCells];
                     }
                 }
-                let scroll: *mut AnyObject = unsafe { msg_send![matrix, enclosingScrollView] };
-                if let Some(scroll) = unsafe { scroll.as_ref() } {
-                    allow_pocket(scroll);
-                }
             }
             let Some(path) = self.entries(browser, column).get(row as usize).cloned() else {
                 return;
@@ -253,22 +247,6 @@ define_class!(
         }
     }
 );
-
-/// Lets a column run under the toolbar's scroll edge effect, as Finder's columns do. AppKit
-/// gives every scroll view the toolbar's pocket on macOS 26 except a browser's columns.
-fn allow_pocket(scroll: &AnyObject) {
-    let responds: bool =
-        unsafe { msg_send![scroll, respondsToSelector: sel!(setAllowedPocketEdges:)] };
-    if !responds {
-        return;
-    }
-    let allowed: usize = unsafe { msg_send![scroll, allowedPocketEdges] };
-    if allowed != POCKET_EDGES {
-        unsafe {
-            let _: () = msg_send![scroll, setAllowedPocketEdges: POCKET_EDGES];
-        }
-    }
-}
 
 impl Source {
     /// What column `column` lists: the box's items first, then the entries of the folder
