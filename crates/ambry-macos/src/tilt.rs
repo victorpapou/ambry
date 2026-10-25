@@ -22,8 +22,8 @@ use objc2_quartz_core::{
 
 /// Growth under the pointer, the steepest lean in radians, and the viewer's distance in
 /// points: nearer looks deeper.
-const SCALE: f64 = 1.08;
-const LEAN: f64 = 0.24;
+const SCALE: f64 = 1.;
+const LEAN: f64 = 0.42;
 const DISTANCE: f64 = 300.;
 /// The springs into the hover, after the moving pointer, and back flat when it leaves.
 const LIFT: (f64, f64) = (0.3, 0.2);
@@ -41,6 +41,8 @@ const RELEASE: (f64, f64) = (0.5, 0.55);
 
 pub(crate) struct TiltIvars {
     view: Retained<NSView>,
+    /// The view the pointer is measured across; the lean is relative to its whole size.
+    area: Retained<NSView>,
     /// The highlight that follows the pointer, a radial gradient.
     shine: Retained<CALayer>,
     /// Where the pointer last was, -1 to 1 across the view, and whether it is pressing.
@@ -113,13 +115,18 @@ define_class!(
 );
 
 impl Tilt {
-    /// Makes `view`, which must have a layer, lean toward the pointer. The returned watcher
+    /// Makes `view`, which must have a layer, lean toward the pointer anywhere over `area`. The returned watcher
     /// must be kept alive as long as the view.
-    pub(crate) fn attach(mtm: MainThreadMarker, view: &NSView) -> Option<Retained<Self>> {
+    pub(crate) fn attach(
+        mtm: MainThreadMarker,
+        view: &NSView,
+        area: &NSView,
+    ) -> Option<Retained<Self>> {
         let layer = view.layer()?;
         let shine = shine(&layer)?;
         let this = Self::alloc(mtm).set_ivars(TiltIvars {
             view: view.retain(),
+            area: area.retain(),
             shine,
             lean: Cell::new((0., 0.)),
             pressed: Cell::new(false),
@@ -148,7 +155,7 @@ impl Tilt {
                 None,
             )
         };
-        view.addTrackingArea(&tracking);
+        area.addTrackingArea(&tracking);
         Some(this)
     }
 
@@ -168,13 +175,13 @@ impl Tilt {
 
     /// Leans toward the pointer of `event` on `spring` and moves the highlight under it.
     fn follow(&self, layer: &CALayer, event: &NSEvent, spring: (f64, f64)) {
-        let view = &self.ivars().view;
-        let size = view.bounds().size;
+        let area = &self.ivars().area;
+        let size = area.bounds().size;
         if size.width <= 0. || size.height <= 0. {
             return;
         }
-        let at = view.convertPoint_fromView(event.locationInWindow(), None);
-        // -1 to 1 across the view, from its left and bottom edges.
+        let at = area.convertPoint_fromView(event.locationInWindow(), None);
+        // -1 to 1 across the area, from its left and bottom edges.
         let x = (at.x / size.width * 2. - 1.).clamp(-1., 1.);
         let y = (at.y / size.height * 2. - 1.).clamp(-1., 1.);
         self.ivars().lean.set((x, y));

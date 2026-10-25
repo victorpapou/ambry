@@ -14,7 +14,7 @@ use objc2_app_kit::{
     NSSegmentedControl, NSTabPosition, NSTabView, NSTabViewBorderType, NSTabViewDelegate,
     NSTabViewItem, NSTextAlignment, NSTextField, NSView,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 
 pub(crate) struct TargetIvars {
     on_action: Box<dyn Fn(&AnyObject)>,
@@ -495,17 +495,39 @@ impl GlassButton {
         self.button.setBezelColor(tint_color(tint).as_deref());
     }
 
-    /// Fills the glass with the accent color and draws the symbol white over it, the look of
-    /// a window's main action.
-    pub fn set_accent(&self) {
-        self.button
-            .setBezelColor(Some(&NSColor::controlAccentColor()));
+    /// Fills the glass white, draws the symbol black over it and casts a shadow under it, the
+    /// look of a window's main action.
+    pub fn set_white(&self) {
+        // White, with a touch of the accent color, like the system's own main actions.
+        let fill = NSColor::whiteColor()
+            .blendedColorWithFraction_ofColor(0.12, &NSColor::controlAccentColor())
+            .unwrap_or_else(NSColor::whiteColor);
+        self.button.setBezelColor(Some(&fill));
         if self.button.respondsToSelector(sel!(setTintProminence:)) {
             self.button
                 .setTintProminence(objc2_app_kit::NSTintProminence::Primary);
         }
+        // A prominent button picks its own glyph color, white over any fill; the glyph is
+        // drawn black into the image itself so it shows on the white.
+        if let Some(image) = self.button.image() {
+            let black = objc2_app_kit::NSImageSymbolConfiguration::configurationWithPaletteColors(
+                &NSArray::from_retained_slice(&[NSColor::blackColor()]),
+            );
+            if let Some(image) = image.imageWithSymbolConfiguration(&black) {
+                image.setTemplate(false);
+                self.button.setImage(Some(&image));
+            }
+        }
         self.button
-            .setContentTintColor(Some(&NSColor::whiteColor()));
+            .setContentTintColor(Some(&NSColor::blackColor()));
+        // A soft shadow under it, so it floats over the canvas.
+        self.button.setWantsLayer(true);
+        if let Some(layer) = self.button.layer() {
+            layer.setShadowColor(Some(&NSColor::blackColor().CGColor()));
+            layer.setShadowOpacity(0.3);
+            layer.setShadowRadius(8.);
+            layer.setShadowOffset(NSSize::new(0., -3.));
+        }
     }
 
     /// The button and its insides, by name, for [`crate::probe::run`].

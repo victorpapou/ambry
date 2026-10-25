@@ -1,7 +1,7 @@
 //! The box window: a dotted canvas of files drawn like Finder's icon view, a list view and the
 //! bottom bar. On macOS the list, the avatar and the bottom bar controls are AppKit views.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,22 +36,23 @@ const EDGE_FADE: f32 = 40.;
 const CANVAS_MARGIN: f32 = 400.;
 const TITLE_SIZE: f32 = 15.;
 const LABEL_SIZE: f32 = 13.;
-/// The list's rows and their inset from the window's sides.
-#[cfg(target_os = "macos")]
-const LIST_ROW: f32 = 28.;
-#[cfg(target_os = "macos")]
-const LIST_ROW_PAD: f32 = 10.;
-#[cfg(target_os = "macos")]
-const LIST_SIDE: f32 = 10.;
-#[cfg(target_os = "macos")]
-const LIST_HEADER: f32 = 28.;
-#[cfg(target_os = "macos")]
-const LIST_ICON: f32 = 18.;
-/// How long a list row's hover highlight takes to fade in or out, in milliseconds.
-#[cfg(target_os = "macos")]
-const ROW_FADE: u64 = 180;
-
 const ACCENT: u32 = 0x2f7cf6;
+
+/// How far the canvas zooms, and how much a key press or a click on a scroll wheel step zooms.
+/// How hard a pinch past the zoom limits pulls: the zoom shown grows as this power of the
+/// zoom asked for.
+const RUBBER: f32 = 0.3;
+/// How much bigger a dragged item is drawn.
+const LIFT: f32 = 0.06;
+/// How long a folder takes to open under a drag, and to close after it.
+const OPEN_FADE_MS: u64 = 160;
+/// How long the in-between dots take to switch on or off, in seconds.
+const DOT_FADE: f32 = 0.18;
+/// How long the canvas takes to spring back to an edge, in seconds.
+const SPRING_RESPONSE: f32 = 0.4;
+const MIN_ZOOM: f32 = 0.3;
+const MAX_ZOOM: f32 = 4.;
+const ZOOM_STEP: f32 = 1.25;
 
 /// The window's colors in one appearance.
 struct Palette {
@@ -119,7 +120,22 @@ fn palette() -> &'static Palette {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Canvas,
-    List,
+    Columns,
+}
+
+#[derive(Clone, Copy)]
+struct Marquee {
+    start: Point<Pixels>,
+    now: Point<Pixels>,
+}
+
+/// How an item came to rest on the canvas, which sets its bounce.
+#[derive(Clone, Copy)]
+enum Landing {
+    /// Just added: it opens out from small, like a new folder in Finder.
+    Added,
+    /// Let go after a drag: it drops a little below its size and settles.
+    Dropped,
 }
 
 struct Drag {
@@ -127,6 +143,8 @@ struct Drag {
     /// Mouse position minus the item's top-left corner, in window coordinates.
     grab: Point<Pixels>,
     moved: bool,
+    /// Where the mouse is now, in window coordinates.
+    at: Point<Pixels>,
 }
 
 /// Files being dragged in from Finder, shown as ghost cards under the cursor.
@@ -143,26 +161,52 @@ pub struct BoxView {
     mode: Mode,
     /// Offset of the canvas origin from the top-left of the canvas area.
     pan: Point<Pixels>,
+    /// How big the canvas is drawn, 1 for actual size.
+    zoom: f32,
+    /// Counts wheel scrolls, so a spring back to the edge knows it was overtaken.
+    scroll_gen: u64,
+    /// Whether fingers are on the trackpad, scrolling; whether a pull past an edge is
+    /// springing back, and how fast.
+    fingers: bool,
+    springing: bool,
+    pan_velocity: Point<Pixels>,
+    /// The zoom a pinch under way asks for, before the resistance past the limits.
+    pinch_raw: Option<f32>,
     selected: Option<u64>,
+    /// Items picked by dragging a rectangle over them.
+    picked: HashSet<u64>,
+    /// The rectangle being dragged, from where the press landed to the pointer.
+    marquee: Option<Marquee>,
+    /// The contents of each folder picked in the column view.
     drag: Option<Drag>,
     drop_preview: Option<DropPreview>,
     /// Seconds to wait before a card plays its appear animation, so a batch lands one by one.
     appear_delay: HashMap<u64, f32>,
+    /// When each item last landed, for its bounce, and when the dragged one was lifted.
+    landed: HashMap<u64, (std::time::Instant, Landing)>,
+    lifted_at: Option<std::time::Instant>,
+    /// Whether the dots between every other one show, when that last switched, and how
+    /// opaque they are now: they switch off as the grid closes in, with a short fade.
+    dense_dots: (bool, std::time::Instant),
+    between_dots: f32,
+    /// Items that have been selected, whose highlight fades out when they are not.
+    was_selected: std::cell::RefCell<HashSet<u64>>,
+    /// The folder something is being dragged over, which opens like Finder's, and the folders
+    /// that have opened, whose lid closes again when the drag moves on.
+    open_folder: Option<u64>,
+    was_open: std::cell::RefCell<HashSet<u64>>,
+    /// Finder's open folder icon, rendered once into the data directory.
+    open_icon: Option<PathBuf>,
     viewport: gpui::Size<Pixels>,
     avatar: Option<PathBuf>,
     focus: FocusHandle,
     /// Finder's icon for each item path, rendered once into the data directory.
-    icons: HashMap<PathBuf, Option<PathBuf>>,
+    icons: HashMap<PathBuf, (Option<std::time::SystemTime>, Option<PathBuf>)>,
     /// Date modified, size and kind of each item path, as the list shows them.
     #[cfg(target_os = "macos")]
     details: HashMap<PathBuf, [String; 3]>,
     #[cfg(target_os = "macos")]
     controls: Option<NativeControls>,
-    /// The list row under the pointer, and the row it last left.
-    #[cfg(target_os = "macos")]
-    hovered_row: Option<u64>,
-    #[cfg(target_os = "macos")]
-    left_row: Option<u64>,
 }
 
 /// The AppKit views of the window. GPUI lays each out through a `native()` element.
@@ -173,13 +217,16 @@ struct NativeControls {
     /// What the toolbar shows, to touch AppKit only when it changes.
     shown_box: Option<(ambry_macos::BoxLabel, String)>,
     shown_boxes: (Vec<ambry_macos::BoxLabel>, Option<usize>),
-    /// The frosted bands under the toolbar and behind the footer.
-    top_edge: ambry_macos::SoftEdge,
-    bottom_edge: ambry_macos::SoftEdge,
     /// AppKit's overlay scroll bars along the canvas's right and bottom edges.
     scroll: ambry_macos::CanvasScrollView,
-    /// The accent add button in the footer.
+    /// The add button, bottom right.
     add: ambry_macos::GlassButton,
+    /// Pinching over the window zooms the canvas.
+    _pinch: ambry_macos::PinchZoom,
+    /// The zoom as a percentage, bottom left.
+    zoom_label: ambry_macos::ZoomLabel,
+    /// Finder's column view.
+    columns: ambry_macos::ColumnBrowser,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
     /// Where Quick Look sends the item it moved to.
@@ -195,11 +242,16 @@ enum ControlEvent {
     OpenBox(usize),
     NewBox,
     RenameBox(usize, String),
+    Columns(ambry_macos::ColumnEvent),
     /// A scroll bar moved the visible part of the canvas to this top-left, counted from the
     /// top-left of [`BoxView::scroll_area`].
     Scroll(f64, f64),
     /// Quick Look moved to the item at this index.
     Preview(usize),
+    /// Fingers pinched by this fraction, at this position from the window's top-left.
+    Zoom(f64, f64, f64),
+    /// The zoom label was clicked: back to actual size.
+    ZoomReset,
     Settings(ambry_macos::settings::SettingsEvent),
 }
 
@@ -225,10 +277,26 @@ impl BoxView {
             boxes,
             mode: default_mode(),
             pan: point(px(0.), px(0.)),
+            zoom: 1.,
+            scroll_gen: 0,
+            pinch_raw: None,
+            fingers: false,
+            springing: false,
+            pan_velocity: point(px(0.), px(0.)),
             selected: None,
+            picked: HashSet::new(),
+            marquee: None,
             drag: None,
             drop_preview: None,
             appear_delay,
+            landed: HashMap::new(),
+            lifted_at: None,
+            dense_dots: (true, std::time::Instant::now() - Duration::from_secs(1)),
+            between_dots: 1.,
+            was_selected: Default::default(),
+            open_folder: None,
+            was_open: Default::default(),
+            open_icon: open_folder_file(),
             viewport: window.viewport_size(),
             #[cfg(target_os = "macos")]
             controls: Self::attach_controls(boxes_dir, window, cx),
@@ -237,10 +305,6 @@ impl BoxView {
             icons: HashMap::new(),
             #[cfg(target_os = "macos")]
             details: HashMap::new(),
-            #[cfg(target_os = "macos")]
-            hovered_row: None,
-            #[cfg(target_os = "macos")]
-            left_row: None,
         }
     }
 
@@ -262,6 +326,7 @@ impl BoxView {
         let controls = unsafe {
             let scrolled = events.clone();
             let previewed = events.clone();
+            let pinched = events.clone();
             let configured = events.clone();
             ambry_macos::settings::configure(
                 avatar_path().unwrap_or_default(),
@@ -270,17 +335,10 @@ impl BoxView {
                     configured.try_send(ControlEvent::Settings(event)).ok();
                 },
             );
-            // Created first, so the scroll bars and the add button sit on top of them.
-            let top_edge =
-                ambry_macos::SoftEdge::new(ns_view, ambry_macos::Edge::Top, layout::TOP_EDGE)?;
-            let bottom_edge = ambry_macos::SoftEdge::new(
-                ns_view,
-                ambry_macos::Edge::Bottom,
-                layout::BOTTOM_EDGE,
-            )?;
             let scroll = ambry_macos::CanvasScrollView::new(ns_view, move |x, y| {
                 scrolled.try_send(ControlEvent::Scroll(x, y)).ok();
             })?;
+            let reset = events.clone();
             let toolbar = ambry_macos::WindowToolbar::attach(
                 ns_view,
                 &BoxIcon::COLORS,
@@ -301,6 +359,16 @@ impl BoxView {
                     events.try_send(event).ok();
                 },
             )?;
+            let pinch = ambry_macos::PinchZoom::new(ns_view, move |step, x, y| {
+                pinched.try_send(ControlEvent::Zoom(step, x, y)).ok();
+            })?;
+            let browsed = previewed.clone();
+            let columns = ambry_macos::ColumnBrowser::new(ns_view, move |event| {
+                browsed.try_send(ControlEvent::Columns(event)).ok();
+            })?;
+            let zoom_label = ambry_macos::ZoomLabel::new(ns_view, move || {
+                reset.try_send(ControlEvent::ZoomReset).ok();
+            })?;
             let added = previewed.clone();
             let add = ambry_macos::GlassButton::new(
                 ns_view,
@@ -311,27 +379,58 @@ impl BoxView {
                     added.try_send(ControlEvent::Add).ok();
                 },
             )?;
-            add.set_accent();
+            add.set_white();
             NativeControls {
                 ns_view,
                 toolbar,
                 shown_box: None,
                 shown_boxes: (Vec::new(), None),
-                top_edge,
-                bottom_edge,
                 scroll,
                 add,
+                _pinch: pinch,
+                zoom_label,
+                columns,
                 shown_scroll: None,
                 events: previewed,
             }
         };
+        // AMBRY_DUMP=<file> writes the window's views and their frames there once it settles.
+        if let Some(file) = std::env::var_os("AMBRY_DUMP") {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                // SAFETY: the window outlives this task's few seconds, on the main thread.
+                let tree = unsafe { ambry_macos::probe::window_tree(ns_view) };
+                std::fs::write(file, tree).ok();
+            })
+            .detach();
+        }
         cx.spawn(async move |this, cx| {
             while let Ok(event) = received.recv().await {
                 let handled = this.update(cx, |this, cx| match event {
-                    ControlEvent::Mode(index) => {
-                        this.set_mode(if index == 0 { Mode::Canvas } else { Mode::List }, cx)
-                    }
+                    ControlEvent::Mode(index) => this.set_mode(
+                        if index == 0 {
+                            Mode::Canvas
+                        } else {
+                            Mode::Columns
+                        },
+                        cx,
+                    ),
                     ControlEvent::Add => this.pick_paths(cx),
+                    ControlEvent::Columns(ambry_macos::ColumnEvent::Open(path)) => {
+                        cx.open_with_system(&path)
+                    }
+                    ControlEvent::Columns(ambry_macos::ColumnEvent::Pick(rows)) => {
+                        let ids: Vec<u64> = rows
+                            .iter()
+                            .filter_map(|row| this.doc.items.get(*row).map(|item| item.id))
+                            .collect();
+                        this.selected = ids.last().copied();
+                        this.picked = ids.into_iter().collect();
+                        this.preview(false);
+                        cx.notify();
+                    }
                     ControlEvent::Color(index) => {
                         if let Some(color) = BoxIcon::COLORS.get(index) {
                             this.doc.icon.color = color.to_string();
@@ -360,6 +459,13 @@ impl BoxView {
                         this.open_box(store, cx);
                     }
                     ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
+                    ControlEvent::ZoomReset => {
+                        let centre = this.viewport_centre();
+                        this.zoom_at(1. / this.zoom, centre, cx)
+                    }
+                    ControlEvent::Zoom(step, x, y) => {
+                        this.pinch(step as f32, point(px(x as f32), px(y as f32)), cx)
+                    }
                     ControlEvent::Settings(event) => this.on_settings(event, cx),
                     ControlEvent::Preview(index) => {
                         if let Some(item) = this.doc.items.get(index) {
@@ -401,6 +507,7 @@ impl BoxView {
             f64::from(y - area.1),
         ];
         let in_canvas = self.mode == Mode::Canvas;
+        let (zoom, dark) = (self.zoom, DARK_MODE.get());
         let Some(controls) = &mut self.controls else {
             return;
         };
@@ -438,21 +545,43 @@ impl BoxView {
             controls.shown_scroll = Some(scroll);
         }
         controls.scroll.native().set_hidden(!in_canvas);
+        controls.toolbar.set_canvas(in_canvas);
+        controls
+            .zoom_label
+            .set_percent((zoom * 100.).round() as i32, dark);
+        controls.zoom_label.native().set_hidden(!in_canvas);
+        controls.columns.native().set_hidden(in_canvas);
+        // The toolbar's own bar over both views, as a native window has it.
+        controls.toolbar.set_bar(true);
+        let paths: Vec<PathBuf> = self
+            .doc
+            .items
+            .iter()
+            .map(|item| item.path.clone())
+            .collect();
+        controls.columns.set_items(&paths);
     }
 
-    /// Renders Finder's icon for every item that has none yet.
+    /// Renders Finder's icon for every item that has none yet, or whose file changed since:
+    /// a folder's shows the documents peeking out of it once it has some.
     fn load_icons(&mut self) {
-        let paths = self
+        let paths: Vec<PathBuf> = self
             .doc
             .items
             .iter()
             .chain(self.drop_preview.iter().flat_map(|preview| &preview.items))
             .filter(|item| !item.is_image())
-            .map(|item| item.path.clone());
+            .map(|item| item.path.clone())
+            .collect();
         for path in paths {
-            self.icons
-                .entry(path)
-                .or_insert_with_key(|path| finder_icon_file(path));
+            let stamp = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if self.icons.get(&path).is_some_and(|(seen, _)| *seen == stamp) {
+                continue;
+            }
+            let icon = finder_icon_file(&path, stamp);
+            self.icons.insert(path, (stamp, icon));
         }
         #[cfg(target_os = "macos")]
         for item in &self.doc.items {
@@ -542,8 +671,10 @@ impl BoxView {
         self.doc = doc;
         self.store = store;
         self.selected = None;
+        self.picked.clear();
         self.drag = None;
         self.pan = point(px(0.), px(0.));
+        self.zoom = 1.;
         self.boxes = ambry_core::list_boxes(self.store.dir());
         self.set_mode(default_mode(), cx);
     }
@@ -570,27 +701,34 @@ impl BoxView {
             f32::from(self.viewport.width),
             f32::from(self.viewport.height),
         );
+        // Zooming spreads the items apart; the items themselves keep their size.
         for item in &self.doc.items {
-            area.0 = area.0.min(item.x - CANVAS_MARGIN);
-            area.1 = area.1.min(item.y - CANVAS_MARGIN);
-            area.2 = area.2.max(item.x + ITEM_WIDTH + CANVAS_MARGIN);
-            area.3 = area.3.max(item.y + ITEM_HEIGHT + CANVAS_MARGIN);
+            let (x, y) = (item.x * self.zoom, item.y * self.zoom);
+            area.0 = area.0.min(x - CANVAS_MARGIN);
+            area.1 = area.1.min(y - CANVAS_MARGIN);
+            area.2 = area.2.max(x + ITEM_WIDTH + CANVAS_MARGIN);
+            area.3 = area.3.max(y + ITEM_HEIGHT + CANVAS_MARGIN);
         }
         area
     }
 
-    /// Keeps the view inside [`Self::scroll_area`].
-    fn clamp_pan(&mut self) {
+    /// Where the view comes to rest: `pan` held inside [`Self::scroll_area`].
+    fn rest_pan(&self) -> Point<Pixels> {
         let area = self.scroll_area();
         let clamp = |pan: Pixels, min: f32, max: f32, visible: Pixels| {
             let at = -f32::from(pan);
             let at = at.min(max - f32::from(visible)).max(min);
             px(-at)
         };
-        self.pan = point(
+        point(
             clamp(self.pan.x, area.0, area.2, self.viewport.width),
             clamp(self.pan.y, area.1, area.3, self.viewport.height),
-        );
+        )
+    }
+
+    /// Keeps the view inside [`Self::scroll_area`].
+    fn clamp_pan(&mut self) {
+        self.pan = self.rest_pan();
     }
 
     /// Moves the canvas by `delta` and shows the scroll bars while it moves.
@@ -602,6 +740,226 @@ impl BoxView {
             controls.scroll.flash();
         }
         cx.notify();
+    }
+
+    /// Moves the canvas under a trackpad the way an NSScrollView does: past an edge the canvas
+    /// follows the fingers with growing resistance, and the moment they lift, or the coasting
+    /// after a flick runs into the edge, it springs back.
+    fn scroll_elastic(
+        &mut self,
+        delta: Point<Pixels>,
+        phase: gpui::TouchPhase,
+        cx: &mut Context<Self>,
+    ) {
+        match phase {
+            gpui::TouchPhase::Started => self.fingers = true,
+            gpui::TouchPhase::Ended => self.fingers = false,
+            gpui::TouchPhase::Moved => {}
+        }
+        let rest = self.rest_pan();
+        let pull = |pan: Pixels, rest: Pixels, delta: Pixels, extent: Pixels| {
+            // The fingers' own travel past the edge, from which AppKit's rubber band curve
+            // gives how far the canvas goes: it never quite reaches the size of the view.
+            let over = f32::from(pan - rest);
+            let extent = f32::from(extent).max(1.);
+            let travel = unrubber(over, extent) + f32::from(delta);
+            if travel * over > 0. {
+                px(f32::from(rest) + rubber(travel, extent))
+            } else {
+                // Back over the edge: the rest of the move is inside, one to one.
+                px(f32::from(rest) + travel)
+            }
+        };
+        let moved = point(self.pan.x + delta.x, self.pan.y + delta.y);
+        let rest_moved = {
+            let saved = self.pan;
+            self.pan = moved;
+            let rest = self.rest_pan();
+            self.pan = saved;
+            rest
+        };
+        // Inside the edges the canvas moves one to one; only what goes past one stretches.
+        let axis = |pan: Pixels,
+                    moved: Pixels,
+                    rest: Pixels,
+                    rest_moved: Pixels,
+                    delta: Pixels,
+                    extent: Pixels| {
+            if pan == rest && moved == rest_moved {
+                moved
+            } else if pan == rest {
+                // Reaching the edge in this step: up to it freely, the rest stretched.
+                let free = rest_moved - pan;
+                let left = f32::from(delta) - f32::from(free);
+                px(f32::from(rest_moved) + rubber(left, f32::from(extent).max(1.)))
+            } else {
+                pull(pan, rest, delta, extent)
+            }
+        };
+        self.pan = point(
+            axis(
+                self.pan.x,
+                moved.x,
+                rest.x,
+                rest_moved.x,
+                delta.x,
+                self.viewport.width,
+            ),
+            axis(
+                self.pan.y,
+                moved.y,
+                rest.y,
+                rest_moved.y,
+                delta.y,
+                self.viewport.height,
+            ),
+        );
+        let stretched = self.pan != self.rest_pan();
+        if stretched && !self.fingers && !self.springing {
+            self.spring_back(cx);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &self.controls {
+            controls.scroll.flash();
+        }
+        cx.notify();
+    }
+
+    /// Springs a canvas pulled past an edge back to it, on a critically damped spring like
+    /// AppKit's.
+    fn spring_back(&mut self, cx: &mut Context<Self>) {
+        self.springing = true;
+        self.pan_velocity = point(px(0.), px(0.));
+        cx.spawn(async move |this, cx| {
+            loop {
+                let more = this
+                    .update(cx, |this, cx| {
+                        if this.fingers {
+                            this.springing = false;
+                            return false;
+                        }
+                        let rest = this.rest_pan();
+                        let dt = 1. / 60.;
+                        let omega = 2. * std::f32::consts::PI / SPRING_RESPONSE;
+                        let step = |pan: Pixels, velocity: Pixels, rest: Pixels| {
+                            let offset = f32::from(pan - rest);
+                            let velocity = f32::from(velocity);
+                            let accel = -omega * omega * offset - 2. * omega * velocity;
+                            let velocity = velocity + accel * dt;
+                            (px(f32::from(rest) + offset + velocity * dt), px(velocity))
+                        };
+                        let (x, vx) = step(this.pan.x, this.pan_velocity.x, rest.x);
+                        let (y, vy) = step(this.pan.y, this.pan_velocity.y, rest.y);
+                        this.pan = point(x, y);
+                        this.pan_velocity = point(vx, vy);
+                        let near = |a: Pixels, b: Pixels, v: Pixels| {
+                            f32::from(a - b).abs() < 0.3 && f32::from(v).abs() < 5.
+                        };
+                        let done = near(x, rest.x, vx) && near(y, rest.y, vy);
+                        if done {
+                            this.pan = rest;
+                            this.springing = false;
+                        }
+                        cx.notify();
+                        !done
+                    })
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Follows a pinch, `step` more magnification about `at`, as Maps and Photos do: past the
+    /// smallest or largest zoom it keeps going with growing resistance, and when the fingers
+    /// lift (`step` 0) it springs back to the limit.
+    fn pinch(&mut self, step: f32, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.mode != Mode::Canvas {
+            return;
+        }
+        if step == 0. {
+            self.pinch_raw = None;
+            return self.spring_zoom(at, cx);
+        }
+        let raw = self.pinch_raw.unwrap_or(self.zoom) * (1. + step);
+        self.pinch_raw = Some(raw);
+        let shown = if raw > MAX_ZOOM {
+            MAX_ZOOM * (raw / MAX_ZOOM).powf(RUBBER)
+        } else if raw < MIN_ZOOM {
+            MIN_ZOOM * (raw / MIN_ZOOM).powf(RUBBER)
+        } else {
+            raw
+        };
+        self.zoom_to(shown, at, cx);
+    }
+
+    /// Eases the zoom back inside its limits after a pinch went past them.
+    fn spring_zoom(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.scroll_gen += 1;
+        let generation = self.scroll_gen;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let more = this
+                    .update(cx, |this, cx| {
+                        if this.scroll_gen != generation || this.pinch_raw.is_some() {
+                            return false;
+                        }
+                        let rest = this.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                        let gap = rest - this.zoom;
+                        let done = gap.abs() < 0.002;
+                        let next = if done { rest } else { this.zoom + gap * 0.25 };
+                        this.zoom_to(next, at, cx);
+                        !done
+                    })
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Zooms by `factor` about the window position `at`, which stays under the pointer.
+    fn zoom_at(&mut self, factor: f32, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.mode != Mode::Canvas {
+            return;
+        }
+        let new = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_to(new, at, cx);
+    }
+
+    /// Shows the canvas at zoom `new` about the window position `at`.
+    fn zoom_to(&mut self, new: f32, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let old = self.zoom;
+        if (new - old).abs() < f32::EPSILON {
+            return;
+        }
+        let ratio = new / old;
+        self.pan = point(
+            at.x - (at.x - self.pan.x) * ratio,
+            at.y - (at.y - self.pan.y) * ratio,
+        );
+        self.zoom = new;
+        self.clamp_pan();
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &self.controls {
+            controls.scroll.flash();
+        }
+        cx.notify();
+    }
+
+    /// The middle of the visible canvas, which keys and the zoom label zoom about.
+    fn viewport_centre(&self) -> Point<Pixels> {
+        point(self.viewport.width / 2., self.viewport.height / 2.)
     }
 
     /// Follows a drag of a scroll bar's knob or a click in its track, which moved the visible
@@ -617,14 +975,29 @@ impl BoxView {
     /// Converts a window position into canvas coordinates.
     fn to_canvas(&self, position: Point<Pixels>) -> (f32, f32) {
         (
-            f32::from(position.x - self.pan.x),
-            f32::from(position.y - self.pan.y),
+            f32::from(position.x - self.pan.x) / self.zoom,
+            f32::from(position.y - self.pan.y) / self.zoom,
         )
     }
 
-    /// Top-left corner of an item in window coordinates.
+    /// Top-left corner of an item in window coordinates. The item is pinned to the canvas by
+    /// the middle of its top edge, where its icon hangs from, so zooming keeps every icon on
+    /// its own spot instead of sliding it against the dots.
     fn item_origin(&self, item: &Item) -> Point<Pixels> {
-        point(self.pan.x + px(item.x), self.pan.y + px(item.y))
+        point(
+            self.screen_left(item.x),
+            self.pan.y + px(item.y * self.zoom),
+        )
+    }
+
+    /// The window x of the left edge of an item whose canvas left is `x`.
+    fn screen_left(&self, x: f32) -> Pixels {
+        self.pan.x + px((x + ITEM_WIDTH / 2.) * self.zoom - ITEM_WIDTH / 2.)
+    }
+
+    /// The canvas left of an item drawn with its left edge at window x `left`.
+    fn canvas_left(&self, left: Pixels) -> f32 {
+        (f32::from(left - self.pan.x) + ITEM_WIDTH / 2.) / self.zoom - ITEM_WIDTH / 2.
     }
 
     /// Where the first of `count` dropped items lands: centred under the cursor,
@@ -636,6 +1009,8 @@ impl BoxView {
             _ => point(self.viewport.width / 2., self.viewport.height / 2.),
         };
         let (x, y) = self.to_canvas(position);
+        // Items hang from the middle of their top edge, so the row is centred on the cursor
+        // in canvas units; the card's height shrinks and grows with the zoom.
         (x - ITEM_WIDTH / 2. - row_width / 2., y - CARD_HEIGHT / 2.)
     }
 
@@ -649,6 +1024,8 @@ impl BoxView {
         let added = self.doc.add_paths(&paths, x, y);
         for (index, id) in added.iter().enumerate() {
             self.appear_delay.insert(*id, index as f32 * 0.05);
+            self.landed
+                .insert(*id, (std::time::Instant::now(), Landing::Added));
         }
         if let Some(&last) = added.last() {
             self.selected = Some(last);
@@ -718,6 +1095,7 @@ impl BoxView {
         cx.stop_propagation();
         window.focus(&self.focus);
         self.selected = Some(id);
+        self.picked.clear();
         #[cfg(target_os = "macos")]
         self.preview(false);
         if event.click_count >= 2 {
@@ -729,47 +1107,188 @@ impl BoxView {
                     id,
                     grab: event.position - self.item_origin(item),
                     moved: false,
+                    at: event.position,
                 });
             }
         }
         cx.notify();
     }
 
+    /// How much bigger than its size item `id` is drawn now: lifted while dragged, and
+    /// bouncing for a moment after it lands.
+    fn pop(&self, id: u64, lifted: bool) -> f32 {
+        if lifted {
+            let t = self.lifted_at.map_or(1., |at| at.elapsed().as_secs_f32());
+            return 1. + LIFT * (1. - (-t / 0.06).exp());
+        }
+        let Some((at, landing)) = self.landed.get(&id) else {
+            return 1.;
+        };
+        let delay = self.appear_delay.get(&id).copied().unwrap_or(0.);
+        let t = at.elapsed().as_secs_f32();
+        match landing {
+            Landing::Added => {
+                let t = (t - delay).max(0.);
+                1. - 0.45 * (-7. * t).exp() * (13. * t).cos()
+            }
+            Landing::Dropped => 1. + LIFT * (-8. * t).exp() * (16. * t).cos(),
+        }
+    }
+
+    /// Whether some item is still bouncing or growing, so frames keep coming.
+    fn popping(&self) -> bool {
+        self.lifted_at
+            .is_some_and(|at| at.elapsed().as_secs_f32() < 0.4)
+            || self
+                .landed
+                .values()
+                .any(|(at, _)| at.elapsed().as_secs_f32() < 1.2)
+    }
+
+    /// The folder on the canvas under what is being dragged: an item of the box, or files
+    /// coming in from Finder.
+    fn folder_under_drag(&self) -> Option<u64> {
+        let (at, dragged) = match (&self.drag, &self.drop_preview) {
+            (Some(drag), _) if drag.moved => (drag.at, Some(drag.id)),
+            (_, Some(preview)) => (preview.position, None),
+            _ => return None,
+        };
+        let side = ICON_SIZE * self.zoom + 8.;
+        self.doc
+            .items
+            .iter()
+            .rev()
+            .filter(|item| item.kind == ItemKind::Folder && Some(item.id) != dragged)
+            .find(|item| {
+                let middle = self.screen_left(item.x) + px(ITEM_WIDTH / 2.);
+                let top = self.pan.y + px(item.y * self.zoom);
+                (at.x - middle).abs() <= px(side / 2.) && at.y >= top && at.y <= top + px(side)
+            })
+            .map(|item| item.id)
+    }
+
+    fn is_picked(&self, id: u64) -> bool {
+        self.selected == Some(id) || self.picked.contains(&id)
+    }
+
+    fn start_marquee(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.picked.clear();
+        self.marquee = Some(Marquee { start: at, now: at });
+        cx.notify();
+    }
+
+    /// Picks the items under the rectangle being dragged.
+    fn update_marquee(&mut self) {
+        let Some(marquee) = self.marquee else { return };
+        let (left, right) = (
+            f32::from(marquee.start.x.min(marquee.now.x)),
+            f32::from(marquee.start.x.max(marquee.now.x)),
+        );
+        let (top, bottom) = (
+            f32::from(marquee.start.y.min(marquee.now.y)),
+            f32::from(marquee.start.y.max(marquee.now.y)),
+        );
+        let hit =
+            |x0: f32, y0: f32, x1: f32, y1: f32| left < x1 && right > x0 && top < y1 && bottom > y0;
+        let picked: Vec<u64> = match self.mode {
+            Mode::Canvas => self
+                .doc
+                .items
+                .iter()
+                .filter(|item| {
+                    let origin = self.item_origin(item);
+                    let middle = f32::from(origin.x) + ITEM_WIDTH / 2.;
+                    let top = f32::from(origin.y);
+                    hit(middle - 40., top, middle + 40., top + ITEM_HEIGHT)
+                })
+                .map(|item| item.id)
+                .collect(),
+            // The column view picks by dragging on its own.
+            Mode::Columns => Vec::new(),
+        };
+        self.selected = picked.last().copied();
+        self.picked = picked.into_iter().collect();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marquee.is_some() {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.marquee = None;
+            } else {
+                if let Some(marquee) = &mut self.marquee {
+                    marquee.now = event.position;
+                }
+                self.update_marquee();
+            }
+            cx.notify();
+            return;
+        }
         let Some(drag) = &self.drag else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             self.end_drag(cx);
             return;
         }
         let id = drag.id;
-        let (x, y) = self.to_canvas(event.position - drag.grab);
+        let origin = event.position - drag.grab;
+        if let Some(drag) = &mut self.drag {
+            drag.at = event.position;
+        }
+        let (_, y) = self.to_canvas(origin);
+        let x = self.canvas_left(origin.x);
         self.doc.move_item(id, x, y);
         if let Some(drag) = &mut self.drag {
+            if !drag.moved {
+                self.lifted_at = Some(std::time::Instant::now());
+            }
             drag.moved = true;
         }
         cx.notify();
     }
 
     fn end_drag(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some() {
+            cx.notify();
+        }
         if let Some(drag) = self.drag.take() {
             if drag.moved {
+                self.landed
+                    .insert(drag.id, (std::time::Instant::now(), Landing::Dropped));
                 self.save();
             }
+            self.lifted_at = None;
             cx.notify();
         }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Command with plus, minus or zero zooms like every Mac app.
+        if event.keystroke.modifiers.platform {
+            let centre = self.viewport_centre();
+            match event.keystroke.key.as_str() {
+                "=" | "+" => return self.zoom_at(ZOOM_STEP, centre, cx),
+                "-" => return self.zoom_at(1. / ZOOM_STEP, centre, cx),
+                "0" => return self.zoom_at(1. / self.zoom, centre, cx),
+                "1" => return self.set_mode(Mode::Canvas, cx),
+                "2" => return self.set_mode(Mode::Columns, cx),
+                _ => {}
+            }
+        }
         match event.keystroke.key.as_str() {
             "backspace" | "delete" => {
-                if let Some(id) = self.selected.take() {
-                    self.doc.remove(id);
+                let mut ids: Vec<u64> = self.picked.drain().collect();
+                ids.extend(self.selected.take());
+                if !ids.is_empty() {
+                    for id in ids {
+                        self.doc.remove(id);
+                    }
                     self.save();
                     cx.notify();
                 }
             }
             "escape" => {
                 self.selected = None;
+                self.picked.clear();
                 cx.notify();
             }
             "enter" => {
@@ -830,7 +1349,7 @@ impl BoxView {
     }
 
     fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let pan = self.pan;
+        let (pan, zoom, between) = (self.pan, self.zoom, self.between_dots);
         let mut items: Vec<gpui::AnyElement> = self
             .doc
             .items
@@ -841,6 +1360,8 @@ impl BoxView {
             items.extend(self.render_ghosts(preview));
         }
 
+        // Under the toolbar too, as Finder's content runs under its glass: the toolbar stays
+        // clear over the canvas and the soft shade keeps it readable.
         div()
             .id("canvas")
             .absolute()
@@ -851,19 +1372,27 @@ impl BoxView {
             .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus);
-                    this.selected = None;
-                    cx.notify();
+                    this.start_marquee(event.position, cx);
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                this.scroll_by(event.delta.pixel_delta(window.line_height()), cx);
+                let delta = event.delta.pixel_delta(window.line_height());
+                // Scrolling with Command or Control held zooms, as it does in Maps and Finder.
+                if event.modifiers.platform || event.modifiers.control {
+                    let factor = (1. + f32::from(delta.y) * 0.01).max(0.5);
+                    this.zoom_at(factor, event.position, cx);
+                } else if matches!(event.delta, gpui::ScrollDelta::Pixels(_)) {
+                    this.scroll_elastic(delta, event.touch_phase, cx);
+                } else {
+                    this.scroll_by(delta, cx);
+                }
             }))
             .child(
                 canvas(
                     |_, _, _| (),
-                    move |bounds, _, window, _| paint_dots(bounds, pan, window),
+                    move |bounds, _, window, _| paint_dots(bounds, pan, zoom, between, window),
                 )
                 .absolute()
                 .size_full(),
@@ -878,14 +1407,73 @@ impl BoxView {
 
     fn render_canvas_item(&self, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
         let id = item.id;
-        let selected = self.selected == Some(id);
+        let selected = self.is_picked(id);
         let lifted = self
             .drag
             .as_ref()
             .is_some_and(|drag| drag.id == id && drag.moved);
-        let left = self.pan.x + px(item.x);
-        let top = self.pan.y + px(item.y) - if lifted { px(3.) } else { px(0.) };
+        let left = self.screen_left(item.x);
+        let top = self.pan.y + px(item.y * self.zoom) - if lifted { px(3.) } else { px(0.) };
         let delay = self.appear_delay.get(&id).copied().unwrap_or(0.);
+        let pop = self.pop(id, lifted);
+        let fade = selected || self.was_selected.borrow().contains(&id);
+        if selected {
+            self.was_selected.borrow_mut().insert(id);
+        }
+        // A folder opens while it is carried, and while something is carried over it.
+        let target = self.open_folder == Some(id);
+        let open = target || lifted;
+        let closing = !open && self.was_open.borrow().contains(&id);
+        if open {
+            self.was_open.borrow_mut().insert(id);
+        }
+        let face = match (&self.open_icon, self.icon(item)) {
+            (Some(open_icon), Some(icon))
+                if item.kind == ItemKind::Folder && (open || closing) =>
+            {
+                folder_face(icon, open_icon.clone(), open, target, id, self.zoom * pop)
+            }
+            (_, icon) => finder_face(item, icon, false, lifted, self.zoom * pop),
+        };
+        let face = if fade {
+            face.with_animation(
+                (if selected { "select" } else { "deselect" }, id as usize),
+                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                move |this, t| {
+                    let mut tint = palette().selection;
+                    tint.a *= if selected { t } else { 1. - t };
+                    this.bg(tint)
+                },
+            )
+            .into_any_element()
+        } else {
+            face.into_any_element()
+        };
+        let label = item_label(item.name(), false, item.exists());
+        let label = if fade {
+            label
+                .with_animation(
+                    (
+                        if selected {
+                            "select-label"
+                        } else {
+                            "deselect-label"
+                        },
+                        id as usize,
+                    ),
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    move |this, t| {
+                        let on = if selected { t } else { 1. - t };
+                        let mut accent: Hsla = rgb(ACCENT).into();
+                        accent.a = on;
+                        this.bg(accent)
+                            .when(on > 0.5, |this| this.text_color(gpui::white()))
+                    },
+                )
+                .into_any_element()
+        } else {
+            label.into_any_element()
+        };
 
         div()
             .id(("item", id as usize))
@@ -908,8 +1496,8 @@ impl BoxView {
                     this.on_item_mouse_down(id, event, window, cx)
                 }),
             )
-            .child(finder_face(item, self.icon(item), selected, lifted))
-            .child(item_label(item.name(), selected, item.exists()))
+            .child(face)
+            .child(label)
             .with_animation(
                 ("appear", id as usize),
                 Animation::new(Duration::from_secs_f32(0.45 + delay))
@@ -925,17 +1513,17 @@ impl BoxView {
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                let top = self.pan.y + px(y);
+                let top = self.pan.y + px(y * self.zoom);
                 div()
                     .absolute()
-                    .left(self.pan.x + px(x + index as f32 * DROP_STEP_X))
+                    .left(self.screen_left(x + index as f32 * DROP_STEP_X))
                     .top(top)
                     .w(px(ITEM_WIDTH))
                     .flex()
                     .flex_col()
                     .items_center()
                     .gap(px(8.))
-                    .child(ghost_face(item, self.icon(item)))
+                    .child(ghost_face(item, self.icon(item), self.zoom))
                     .child(item_label(item.name(), false, true))
                     .with_animation(
                         ("ghost", index),
@@ -948,202 +1536,26 @@ impl BoxView {
     }
 
     fn icon(&self, item: &Item) -> Option<PathBuf> {
-        self.icons.get(&item.path).cloned().flatten()
+        self.icons.get(&item.path).and_then(|(_, icon)| icon.clone())
     }
 
-    /// Notes the row under the pointer, and the one it left, whose highlight fades out.
+    /// Finder's column view, AppKit's own browser. It runs under the toolbar as Finder's
+    /// does: its columns inset themselves below the bar and scroll under its glass.
     #[cfg(target_os = "macos")]
-    fn hover_row(&mut self, id: u64, inside: bool, cx: &mut Context<Self>) {
-        if inside {
-            if self.hovered_row == Some(id) {
-                return;
-            }
-            // The row left may already have reported it; keep its fade-out then.
-            if let Some(previous) = self.hovered_row.replace(id) {
-                self.left_row = Some(previous);
-            }
-        } else if self.hovered_row == Some(id) {
-            self.hovered_row = None;
-            self.left_row = Some(id);
-        } else {
-            return;
-        }
-        cx.notify();
-    }
-
-    /// The grey highlight of a row under the pointer, fading in, or of the row it just left,
-    /// fading out.
-    #[cfg(target_os = "macos")]
-    fn row_hover(&self, id: u64) -> Option<gpui::AnyElement> {
-        let entering = self.hovered_row == Some(id);
-        if !entering && self.left_row != Some(id) {
-            return None;
-        }
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .rounded(px(7.))
-                .bg(rgb(palette().pressed))
-                .with_animation(
-                    (
-                        if entering {
-                            "row-hover-in"
-                        } else {
-                            "row-hover-out"
-                        },
-                        id as usize,
-                    ),
-                    Animation::new(Duration::from_millis(ROW_FADE)).with_easing(ease_out_quint()),
-                    move |this, t| this.opacity(if entering { t } else { 1. - t }),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// The list: Finder's columns, drawn by GPUI, with rounded rows that fill with the accent
-    /// color when selected.
-    #[cfg(target_os = "macos")]
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = |text: &'static str| div().text_color(rgb(palette().quiet)).child(text);
+    fn render_columns(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("list")
             .absolute()
-            .top(px(layout::BAR as f32))
+            .top_0()
             .left_0()
             .right_0()
             .bottom_0()
-            .flex()
-            .flex_col()
-            .text_size(px(LABEL_SIZE))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    window.focus(&this.focus);
-                    this.selected = None;
-                    cx.notify();
-                }),
-            )
-            .child(
-                list_columns(
-                    div()
-                        .flex_none()
-                        .h(px(LIST_HEADER))
-                        .mx(px(LIST_SIDE))
-                        .px(px(LIST_ROW_PAD))
-                        .text_size(px(11.))
-                        .font_weight(gpui::FontWeight::MEDIUM),
-                    header("Name"),
-                    header("Date Modified"),
-                    header("Size"),
-                    header("Kind"),
-                )
-                .border_b_1()
-                .border_color(rgb(palette().hairline)),
-            )
-            .child(
-                div()
-                    .id("list-rows")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px(px(LIST_SIDE))
-                    .pt(px(6.))
-                    // Room for the last rows to scroll out from under the footer.
-                    .pb(px(layout::BOTTOM_EDGE as f32))
-                    .flex()
-                    .flex_col()
-                    .when(self.doc.items.is_empty(), |this| this.child(empty_hint()))
-                    .children(
-                        self.doc
-                            .items
-                            .iter()
-                            .enumerate()
-                            .map(|(index, item)| {
-                                self.render_list_row(index, item, cx).into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-            )
-    }
-
-    #[cfg(target_os = "macos")]
-    fn render_list_row(
-        &self,
-        index: usize,
-        item: &Item,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let id = item.id;
-        let selected = self.selected == Some(id);
-        let (ink, quiet): (Hsla, Hsla) = if selected {
-            (rgb(0xffffff).into(), hsla(0., 0., 1., 0.8))
-        } else {
-            (rgb(palette().ink).into(), rgb(palette().quiet).into())
-        };
-        let icon = self
-            .icon(item)
-            .or_else(|| item.is_image().then(|| item.path.clone()));
-        let blank = [String::new(), String::new(), String::new()];
-        let [date, size, kind] = self.details.get(&item.path).unwrap_or(&blank).clone();
-        let row = div()
-            .id(("row", id as usize))
-            .flex_none()
-            .h(px(LIST_ROW))
-            .px(px(LIST_ROW_PAD))
-            .rounded(px(7.))
-            .when(selected, |this| this.bg(rgb(ACCENT)))
-            .when(!selected && index % 2 == 1, |this| {
-                this.bg(rgb(palette().stripe))
+            .when_some(self.controls.as_ref(), |this, controls| {
+                this.child(native(controls.columns.native()).fill())
             })
-            .relative()
-            .when(!selected, |this| this.children(self.row_hover(id)))
-            .when(!item.exists(), |this| this.opacity(0.4))
-            .on_hover(
-                cx.listener(move |this, inside: &bool, _, cx| this.hover_row(id, *inside, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event, window, cx| {
-                    this.on_item_mouse_down(id, event, window, cx)
-                }),
-            );
-        list_columns(
-            row,
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child(match icon {
-                    Some(path) => img(path)
-                        .flex_none()
-                        .size(px(LIST_ICON))
-                        .object_fit(ObjectFit::Contain)
-                        .into_any_element(),
-                    None => div().flex_none().size(px(LIST_ICON)).into_any_element(),
-                })
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(ink)
-                        .child(item.name()),
-                ),
-            div().truncate().text_color(quiet).child(date),
-            div().text_color(quiet).child(size),
-            div().truncate().text_color(quiet).child(kind),
-        )
-        .with_animation(
-            ("row-appear", id as usize),
-            Animation::new(Duration::from_millis(260 + 20 * index.min(12) as u64))
-                .with_easing(ease_out_quint()),
-            |this, t| this.opacity(t),
-        )
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("list")
             .absolute()
@@ -1296,8 +1708,9 @@ impl BoxView {
                         ),
                     )
                     .child(
-                        mode_button("mode-list", "icons/list.svg", Mode::List)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::List, cx))),
+                        mode_button("mode-list", "icons/list.svg", Mode::Columns).on_click(
+                            cx.listener(|this, _, _, cx| this.set_mode(Mode::Columns, cx)),
+                        ),
                     ),
             )
             .child(
@@ -1320,8 +1733,33 @@ impl BoxView {
 
 impl Render for BoxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The in-between dots switch at the middle of each halving, with a margin either side
+        // so a zoom resting near it does not flicker.
+        let mut spacing = DOT_SPACING * self.zoom;
+        while spacing < DOT_SPACING / 2. {
+            spacing *= 2.;
+        }
+        let closeness = (spacing - DOT_SPACING / 2.) / (DOT_SPACING / 2.);
+        let (dense, since) = self.dense_dots;
+        if (dense && closeness < 0.4) || (!dense && closeness > 0.6) {
+            self.dense_dots = (!dense, std::time::Instant::now());
+        }
+        let (dense, since) = (self.dense_dots.0, self.dense_dots.1.max(since));
+        let t = (since.elapsed().as_secs_f32() / DOT_FADE).min(1.);
+        let t = 1. - (1. - t).powi(3);
+        self.between_dots = if dense { t } else { 1. - t };
+        if t < 1. {
+            window.request_animation_frame();
+        }
+        if self.popping() {
+            window.request_animation_frame();
+        } else {
+            self.landed.clear();
+        }
         self.viewport = window.viewport_size();
-        if self.drag.is_none() {
+        self.open_folder = self.folder_under_drag();
+        // A canvas pulled past an edge stays there until it springs back.
+        if self.drag.is_none() && !self.fingers && !self.springing {
             self.clamp_pan();
         }
         DARK_MODE.set(matches!(
@@ -1363,7 +1801,25 @@ impl Render for BoxView {
             }))
             .map(|this| match self.mode {
                 Mode::Canvas => this.child(self.render_canvas(cx)),
-                Mode::List => this.child(self.render_list(cx)),
+                Mode::Columns => this.child(self.render_columns(cx)),
+            })
+            .when_some(self.marquee, |this, marquee| {
+                let (left, top) = (
+                    marquee.start.x.min(marquee.now.x),
+                    marquee.start.y.min(marquee.now.y),
+                );
+                this.child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(marquee.start.x.max(marquee.now.x) - left)
+                        .h(marquee.start.y.max(marquee.now.y) - top)
+                        .rounded(px(2.))
+                        .border_1()
+                        .border_color(hsla(216. / 360., 0.92, 0.57, 0.8))
+                        .bg(hsla(216. / 360., 0.92, 0.57, 0.12)),
+                )
             });
         #[cfg(not(target_os = "macos"))]
         let root = root.child(self.render_top_bar(cx));
@@ -1386,27 +1842,30 @@ impl Render for BoxView {
                         .top_0()
                         .left_0()
                         .right_0()
-                        .h(px(layout::TOP_EDGE as f32))
-                        .child(native(controls.top_edge.native()).fill()),
+                        .h(px(layout::BAR as f32))
+                        .child(native(controls.toolbar.band()).fill()),
                 )
+                // The zoom, bottom left, level with the add button.
+                .when(self.mode == Mode::Canvas, |root| {
+                    root.child(
+                        div()
+                            .absolute()
+                            // Over the add button, centred on it; it shows while the zoom
+                            // changes and fades out after.
+                            .bottom(px((layout::TOOLBAR_SIDE + layout::ADD + 4.) as f32))
+                            .right(px(layout::TOOLBAR_SIDE as f32))
+                            .w(px(layout::ADD as f32))
+                            .flex()
+                            .justify_center()
+                            .child(native(controls.zoom_label.native())),
+                    )
+                })
+                // The window's main action, bottom right.
                 .child(
                     div()
                         .absolute()
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(layout::BOTTOM_EDGE as f32))
-                        .child(native(controls.bottom_edge.native()).fill()),
-                )
-                // The footer: the window's main action, centred under the content.
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(layout::ADD_BOTTOM as f32))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
+                        .bottom(px(layout::TOOLBAR_SIDE as f32))
+                        .right(px(layout::TOOLBAR_SIDE as f32))
                         .child(native(controls.add.native())),
                 )
             })
@@ -1415,19 +1874,15 @@ impl Render for BoxView {
     }
 }
 
-/// A soft white fade along every edge of the canvas, like Freeform's.
-fn edge_fades() -> [impl IntoElement; 4] {
+/// A soft fade along the canvas's sides and bottom, like Freeform's. The top needs none: the
+/// toolbar's own bar covers it. macOS has no native fade for these edges; its scroll edge
+/// effect only appears where a bar overlaps a scroll view.
+fn edge_fades() -> [impl IntoElement; 3] {
     let canvas = rgb(palette().canvas);
     let white = linear_color_stop(canvas, 0.);
     let clear = linear_color_stop(Rgba { a: 0., ..canvas }, 1.);
     let edge = || div().absolute();
     [
-        edge()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(EDGE_FADE))
-            .bg(linear_gradient(180., white, clear)),
         edge()
             .bottom_0()
             .left_0()
@@ -1449,23 +1904,65 @@ fn edge_fades() -> [impl IntoElement; 4] {
     ]
 }
 
-fn paint_dots(bounds: Bounds<Pixels>, pan: Point<Pixels>, window: &mut Window) {
+/// The dot grid, zoomed with the canvas like Freeform's: the dots spread and grow as it zooms
+/// in, and when they get too close every other one drops out.
+/// AppKit's rubber band: fingers `travel` points past an edge move the content this far, never
+/// quite `extent`, the size of the view.
+fn rubber(travel: f32, extent: f32) -> f32 {
+    let c = 0.55;
+    let x = travel.abs();
+    (1. - 1. / (x * c / extent + 1.)) * extent * travel.signum()
+}
+
+/// The fingers' travel that [`rubber`] turns into `offset`.
+fn unrubber(offset: f32, extent: f32) -> f32 {
+    let c = 0.55;
+    let y = offset.abs().min(extent * 0.999);
+    (extent / c) * (1. / (1. - y / extent) - 1.) * offset.signum()
+}
+
+fn paint_dots(
+    bounds: Bounds<Pixels>,
+    pan: Point<Pixels>,
+    zoom: f32,
+    between: f32,
+    window: &mut Window,
+) {
     let color: Rgba = rgb(palette().dot);
-    let start_x = f32::from(pan.x).rem_euclid(DOT_SPACING);
-    let start_y = f32::from(pan.y).rem_euclid(DOT_SPACING);
+    let mut spacing = DOT_SPACING * zoom;
+    while spacing < DOT_SPACING / 2. {
+        spacing *= 2.;
+    }
+    let radius = (DOT_RADIUS * zoom.sqrt()).clamp(0.75, 2.5);
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
-    let dot = size(px(DOT_RADIUS * 2.), px(DOT_RADIUS * 2.));
-
-    let mut y = start_y;
-    while y < height {
-        let mut x = start_x;
-        while x < width {
-            let origin = bounds.origin + point(px(x - DOT_RADIUS), px(y - DOT_RADIUS));
-            window.paint_quad(fill(Bounds::new(origin, dot), color).corner_radii(px(DOT_RADIUS)));
-            x += DOT_SPACING;
+    let dot = size(px(radius * 2.), px(radius * 2.));
+    // Index the dots from the canvas origin, so the same ones fade wherever it is panned.
+    let first = |pan: f32| (-pan / spacing).ceil() as i64;
+    let (first_x, first_y) = (first(f32::from(pan.x)), first(f32::from(pan.y)));
+    let mut row = first_y;
+    loop {
+        let y = f32::from(pan.y) + row as f32 * spacing;
+        if y >= height {
+            break;
         }
-        y += DOT_SPACING;
+        let mut column = first_x;
+        loop {
+            let x = f32::from(pan.x) + column as f32 * spacing;
+            if x >= width {
+                break;
+            }
+            let odd = column.rem_euclid(2) == 1 || row.rem_euclid(2) == 1;
+            let alpha = if odd { between } else { 1. };
+            if alpha > 0.01 {
+                let origin = bounds.origin + point(px(x - radius), px(y - radius));
+                let mut shade = color;
+                shade.a *= alpha;
+                window.paint_quad(fill(Bounds::new(origin, dot), shade).corner_radii(px(radius)));
+            }
+            column += 1;
+        }
+        row += 1;
     }
 }
 
@@ -1502,14 +1999,20 @@ fn shadow(x: f32, y: f32, blur: f32, alpha: f32) -> BoxShadow {
 
 /// An item the way Finder's icon view draws it: the file's own icon, or a thumbnail for
 /// images, on a grey rounded backdrop while selected.
-fn finder_face(item: &Item, icon: Option<PathBuf>, selected: bool, lifted: bool) -> gpui::Div {
+fn finder_face(
+    item: &Item,
+    icon: Option<PathBuf>,
+    selected: bool,
+    lifted: bool,
+    scale: f32,
+) -> gpui::Div {
     let picture = if item.is_image() {
         Some(item.path.clone())
     } else {
         icon
     };
     let Some(picture) = picture else {
-        return card_face(item, selected, lifted);
+        return card_face(item, selected, lifted, scale);
     };
     div()
         .p(px(4.))
@@ -1519,23 +2022,61 @@ fn finder_face(item: &Item, icon: Option<PathBuf>, selected: bool, lifted: bool)
         .when(!item.exists(), |this| this.opacity(0.4))
         .child(
             img(picture)
-                .size(px(ICON_SIZE))
+                .size(px(ICON_SIZE * scale))
                 .object_fit(ObjectFit::Contain),
         )
 }
 
-/// Finder's icon for `path` as a PNG in the data directory, rendered the first time it is
-/// asked for.
-#[cfg(target_os = "macos")]
-fn finder_icon_file(path: &Path) -> Option<PathBuf> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
+/// A folder opening while it is dragged or something is dragged over it, or closing after:
+/// its own icon gives way to Finder's open folder with a short cross-fade, under a grey
+/// highlight when it is the drop `target`, as Finder's is.
+fn folder_face(
+    closed: PathBuf,
+    open: PathBuf,
+    opening: bool,
+    target: bool,
+    id: u64,
+    scale: f32,
+) -> gpui::Div {
+    let size = px(ICON_SIZE * scale);
+    let fade = || Animation::new(Duration::from_millis(OPEN_FADE_MS)).with_easing(ease_out_quint());
+    let key = |name: &'static str| (name, id as usize);
+    div()
+        .relative()
+        .p(px(4.))
+        .rounded(px(6.))
+        .when(target, |this| this.bg(palette().selection))
+        .child(
+            img(closed)
+                .size(size)
+                .object_fit(ObjectFit::Contain)
+                .with_animation(
+                    key(if opening { "lid-up" } else { "lid-down" }),
+                    fade(),
+                    move |this, t| this.opacity(if opening { 1. - t } else { t }),
+                ),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(4.))
+                .left(px(4.))
+                .child(img(open).size(size).object_fit(ObjectFit::Contain))
+                .with_animation(
+                    key(if opening { "open-in" } else { "open-out" }),
+                    fade(),
+                    move |this, t| this.opacity(if opening { t } else { 1. - t }),
+                ),
+        )
+}
 
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+/// Finder's open folder as a PNG in the data directory, rendered the first time.
+#[cfg(target_os = "macos")]
+fn open_folder_file() -> Option<PathBuf> {
     let dir = ambry_core::data_dir().ok()?.join("icons");
-    let file = dir.join(format!("{:016x}.png", hasher.finish()));
+    let file = dir.join(format!("open-folder-{}.png", ICON_SIZE as u32));
     if !file.exists() {
-        let png = ambry_macos::finder::icon_png(path, ICON_SIZE.into())?;
+        let png = ambry_macos::finder::open_folder_png(ICON_SIZE.into())?;
         std::fs::create_dir_all(&dir).ok()?;
         std::fs::write(&file, png).ok()?;
     }
@@ -1543,7 +2084,34 @@ fn finder_icon_file(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn finder_icon_file(_path: &Path) -> Option<PathBuf> {
+fn open_folder_file() -> Option<PathBuf> {
+    None
+}
+
+/// Finder's picture for `path` as a PNG in the data directory: the thumbnail Finder's icon
+/// view shows, or its plain icon when Quick Look has none. Rendered the first time it is asked
+/// for at this `stamp`, the file's modification time, so it follows the file's changes.
+#[cfg(target_os = "macos")]
+fn finder_icon_file(path: &Path, stamp: Option<std::time::SystemTime>) -> Option<PathBuf> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    stamp.hash(&mut hasher);
+    let dir = ambry_core::data_dir().ok()?.join("icons");
+    let file = dir.join(format!("{:016x}.png", hasher.finish()));
+    if !file.exists() {
+        std::fs::create_dir_all(&dir).ok()?;
+        if !ambry_macos::finder::thumbnail_png(path, ICON_SIZE.into(), &file) {
+            let png = ambry_macos::finder::icon_png(path, ICON_SIZE.into())?;
+            std::fs::write(&file, png).ok()?;
+        }
+    }
+    Some(file)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn finder_icon_file(_path: &Path, _stamp: Option<std::time::SystemTime>) -> Option<PathBuf> {
     None
 }
 
@@ -1563,25 +2131,7 @@ fn file_details(path: &Path) -> [String; 3] {
     [date, size, kind]
 }
 
-/// Lays out a list row's cells in Finder's columns: the name takes the room left.
-#[cfg(target_os = "macos")]
-fn list_columns(
-    row: impl IntoElement + ParentElement + Styled,
-    name: impl IntoElement + Styled,
-    date: impl IntoElement + Styled,
-    size: impl IntoElement + Styled,
-    kind: impl IntoElement + Styled,
-) -> impl IntoElement + ParentElement + Styled {
-    row.flex()
-        .items_center()
-        .gap(px(16.))
-        .child(name.flex_1().min_w_0())
-        .child(date.flex_none().w(px(170.)))
-        .child(size.flex_none().w(px(72.)))
-        .child(kind.flex_none().w(px(150.)))
-}
-
-fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
+fn card_face(item: &Item, selected: bool, lifted: bool, scale: f32) -> gpui::Div {
     let border: Hsla = if selected {
         rgb(ACCENT).into()
     } else {
@@ -1589,7 +2139,7 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
     };
     let face = match item.kind {
         ItemKind::Folder => div()
-            .size(px(CARD_HEIGHT))
+            .size(px(CARD_HEIGHT * scale))
             .rounded(px(10.))
             .when(selected, |this| this.bg(rgb(palette().pressed)))
             .flex()
@@ -1598,13 +2148,13 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
             .child(
                 svg()
                     .path("icons/folder.svg")
-                    .size(px(64.))
+                    .size(px(64. * scale))
                     .text_color(rgb(0x5aa0f2)),
             ),
         ItemKind::File => div()
             .relative()
-            .w(px(CARD_WIDTH))
-            .h(px(CARD_HEIGHT))
+            .w(px(CARD_WIDTH * scale))
+            .h(px(CARD_HEIGHT * scale))
             .rounded(px(6.))
             .overflow_hidden()
             .bg(linear_gradient(
@@ -1644,21 +2194,25 @@ fn card_face(item: &Item, selected: bool, lifted: bool) -> gpui::Div {
 }
 
 /// The card a file will become, drawn under the cursor while it is dragged in.
-fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
+fn ghost_face(item: &Item, icon: Option<PathBuf>, scale: f32) -> gpui::AnyElement {
     if let Some(icon) = icon {
         return div()
             .p(px(4.))
             .opacity(0.6)
-            .child(img(icon).size(px(ICON_SIZE)).object_fit(ObjectFit::Contain))
+            .child(
+                img(icon)
+                    .size(px(ICON_SIZE * scale))
+                    .object_fit(ObjectFit::Contain),
+            )
             .into_any_element();
     }
     let (width, radius) = match item.kind {
-        ItemKind::Folder => (CARD_HEIGHT, 10.),
-        ItemKind::File => (CARD_WIDTH, 6.),
+        ItemKind::Folder => (CARD_HEIGHT * scale, 10.),
+        ItemKind::File => (CARD_WIDTH * scale, 6.),
     };
     div()
         .w(px(width))
-        .h(px(CARD_HEIGHT))
+        .h(px(CARD_HEIGHT * scale))
         .rounded(px(radius))
         .border_1()
         .border_dashed()
@@ -1674,7 +2228,7 @@ fn ghost_face(item: &Item, icon: Option<PathBuf>) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn item_label(name: String, selected: bool, exists: bool) -> impl IntoElement {
+fn item_label(name: String, selected: bool, exists: bool) -> gpui::Div {
     div()
         .max_w(px(ITEM_WIDTH))
         .px(px(6.))
@@ -1738,7 +2292,7 @@ fn avatar_path() -> Option<PathBuf> {
 fn default_mode() -> Mode {
     #[cfg(target_os = "macos")]
     if ambry_macos::settings::opens_in_list() {
-        return Mode::List;
+        return Mode::Columns;
     }
     Mode::Canvas
 }
