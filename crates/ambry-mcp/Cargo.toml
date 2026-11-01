@@ -1,0 +1,17 @@
+[package]
+name = "ambry-mcp"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "ambry-mcp"
+path = "src/main.rs"
+
+[dependencies]
+ambry-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

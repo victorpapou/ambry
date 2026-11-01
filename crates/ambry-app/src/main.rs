@@ -85,7 +85,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             ambry_macos::settings::apply_appearance();
             set_up_menus(cx);
-            let store = Store::in_data_dir("inbox").expect("no data directory");
+            let store = Store::default_box(DEFAULT_BOX).expect("no home directory");
             let doc = store.load_or_new(DEFAULT_BOX).unwrap_or_else(|err| {
                 eprintln!("could not load {}: {err:#}", store.path().display());
                 BoxDoc::new(DEFAULT_BOX)

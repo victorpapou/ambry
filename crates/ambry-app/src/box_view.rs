@@ -227,6 +227,8 @@ struct NativeControls {
     zoom_label: ambry_macos::ZoomLabel,
     /// Finder's column view.
     columns: ambry_macos::ColumnBrowser,
+    /// The canvas as a native icon view, unless `AMBRY_GPUI_CANVAS=1` keeps the GPUI one.
+    icons: Option<ambry_macos::IconCanvas>,
     /// The knob proportions and values last shown, to touch AppKit only when they change.
     shown_scroll: Option<[f64; 4]>,
     /// Where Quick Look sends the item it moved to.
@@ -243,6 +245,7 @@ enum ControlEvent {
     NewBox,
     RenameBox(usize, String),
     Columns(ambry_macos::ColumnEvent),
+    Icons(ambry_macos::IconEvent),
     /// A scroll bar moved the visible part of the canvas to this top-left, counted from the
     /// top-left of [`BoxView::scroll_area`].
     Scroll(f64, f64),
@@ -366,6 +369,16 @@ impl BoxView {
             let columns = ambry_macos::ColumnBrowser::new(ns_view, move |event| {
                 browsed.try_send(ControlEvent::Columns(event)).ok();
             })?;
+            let icons = if std::env::var_os("AMBRY_GPUI_CANVAS").is_some_and(|value| value == "1") {
+                None
+            } else {
+                let iconed = previewed.clone();
+                ambry_macos::IconCanvas::new(ns_view, move |event| {
+                    iconed.try_send(ControlEvent::Icons(event)).ok();
+                })
+            };
+            // The native canvas zooms on its own.
+            pinch.set_enabled(icons.is_none());
             let zoom_label = ambry_macos::ZoomLabel::new(ns_view, move || {
                 reset.try_send(ControlEvent::ZoomReset).ok();
             })?;
@@ -379,7 +392,7 @@ impl BoxView {
                     added.try_send(ControlEvent::Add).ok();
                 },
             )?;
-            add.set_white();
+            // AppKit's own glass, as Apple's apps show a floating action.
             NativeControls {
                 ns_view,
                 toolbar,
@@ -390,6 +403,7 @@ impl BoxView {
                 _pinch: pinch,
                 zoom_label,
                 columns,
+                icons,
                 shown_scroll: None,
                 events: previewed,
             }
@@ -459,6 +473,7 @@ impl BoxView {
                         this.open_box(store, cx);
                     }
                     ControlEvent::Scroll(x, y) => this.on_scroller(x, y, cx),
+                    ControlEvent::Icons(event) => this.on_icons(event, cx),
                     ControlEvent::ZoomReset => {
                         let centre = this.viewport_centre();
                         this.zoom_at(1. / this.zoom, centre, cx)
@@ -544,7 +559,34 @@ impl BoxView {
             controls.scroll.set(width, height, x, y);
             controls.shown_scroll = Some(scroll);
         }
-        controls.scroll.native().set_hidden(!in_canvas);
+        controls
+            .scroll
+            .native()
+            .set_hidden(!in_canvas || controls.icons.is_some());
+        if let Some(icons) = &controls.icons {
+            icons.native().set_hidden(!in_canvas);
+            icons.set_items(
+                self.doc
+                    .items
+                    .iter()
+                    .map(|item| ambry_macos::IconItem {
+                        id: item.id,
+                        path: item.path.clone(),
+                        name: item.name(),
+                        x: f64::from(item.x),
+                        y: f64::from(item.y),
+                        missing: !item.exists(),
+                    })
+                    .collect(),
+            );
+            let mut picked: Vec<u64> = self.picked.iter().copied().collect();
+            picked.sort_unstable();
+            if let Some(selected) = self.selected {
+                picked.retain(|id| *id != selected);
+                picked.push(selected);
+            }
+            icons.select(&picked);
+        }
         controls.toolbar.set_canvas(in_canvas);
         controls
             .zoom_label
@@ -608,6 +650,59 @@ impl BoxView {
         cx.notify();
     }
 
+    /// The native icon canvas, when it is the one in use.
+    #[cfg(target_os = "macos")]
+    fn native_canvas(&self) -> Option<&ambry_macos::IconCanvas> {
+        self.controls.as_ref()?.icons.as_ref()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_icons(&mut self, event: ambry_macos::IconEvent, cx: &mut Context<Self>) {
+        use ambry_macos::IconEvent;
+        match event {
+            IconEvent::Select(ids) => {
+                self.selected = ids.last().copied();
+                self.picked = ids.into_iter().collect();
+                self.preview(false);
+            }
+            IconEvent::Move(moves) => {
+                for (id, x, y) in moves {
+                    self.doc.move_item(id, x as f32, y as f32);
+                }
+                self.save();
+            }
+            IconEvent::Open(ids) => {
+                for id in ids {
+                    self.open_item(id, cx);
+                }
+            }
+            IconEvent::Remove(ids) => {
+                for id in ids {
+                    self.doc.remove(id);
+                }
+                self.selected = None;
+                self.picked.clear();
+                self.save();
+            }
+            IconEvent::Drop(paths, x, y) => {
+                let row_width = paths.len().saturating_sub(1) as f32 * DROP_STEP_X;
+                let added = self.doc.add_paths(
+                    &paths,
+                    x as f32 - ITEM_WIDTH / 2. - row_width / 2.,
+                    y as f32 - CARD_HEIGHT / 2.,
+                );
+                if let Some(&last) = added.last() {
+                    self.selected = Some(last);
+                    self.picked = added.into_iter().collect();
+                    self.save();
+                }
+            }
+            IconEvent::QuickLook => self.preview(true),
+            IconEvent::Zoom(zoom) => self.zoom = zoom as f32,
+        }
+        cx.notify();
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.mode = mode;
         #[cfg(target_os = "macos")]
@@ -615,6 +710,10 @@ impl BoxView {
             controls
                 .toolbar
                 .select_mode(if mode == Mode::Canvas { 0 } else { 1 });
+            if let (Mode::Canvas, Some(icons)) = (mode, &controls.icons) {
+                icons.native().set_hidden(false);
+                icons.focus();
+            }
         }
         cx.notify();
     }
@@ -933,6 +1032,11 @@ impl BoxView {
         if self.mode != Mode::Canvas {
             return;
         }
+        #[cfg(target_os = "macos")]
+        if let Some(icons) = self.native_canvas() {
+            icons.zoom_to(f64::from((self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM)));
+            return;
+        }
         let new = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         self.zoom_to(new, at, cx);
     }
@@ -1004,6 +1108,14 @@ impl BoxView {
     /// or in the middle of the visible canvas when there is no cursor position.
     fn drop_origin(&self, count: usize, at: Option<Point<Pixels>>) -> (f32, f32) {
         let row_width = count.saturating_sub(1) as f32 * DROP_STEP_X;
+        #[cfg(target_os = "macos")]
+        if let Some(icons) = self.native_canvas() {
+            let (x, y) = icons.visible_centre();
+            return (
+                x as f32 - ITEM_WIDTH / 2. - row_width / 2.,
+                y as f32 - CARD_HEIGHT / 2.,
+            );
+        }
         let position = match (self.mode, at) {
             (Mode::Canvas, Some(position)) => position,
             _ => point(self.viewport.width / 2., self.viewport.height / 2.),
@@ -1346,6 +1458,20 @@ impl BoxView {
             1 => "1 item".into(),
             n => format!("{n} items").into(),
         }
+    }
+
+    /// The native icon view, under the toolbar too, as Finder's content runs under its glass.
+    #[cfg(target_os = "macos")]
+    fn render_native_canvas(&self) -> impl IntoElement {
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .when_some(self.native_canvas(), |this, icons| {
+                this.child(native(icons.native()).fill())
+            })
     }
 
     fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1800,6 +1926,10 @@ impl Render for BoxView {
                 this.add_paths(paths.paths().to_vec(), Some(window.mouse_position()), cx);
             }))
             .map(|this| match self.mode {
+                #[cfg(target_os = "macos")]
+                Mode::Canvas if self.native_canvas().is_some() => {
+                    this.child(self.render_native_canvas())
+                }
                 Mode::Canvas => this.child(self.render_canvas(cx)),
                 Mode::Columns => this.child(self.render_columns(cx)),
             })

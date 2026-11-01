@@ -87,6 +87,7 @@ dependencies = [
 name = "ambry-macos"
 version = "0.1.0"
 dependencies = [
+ "ambry-core",
  "block2",
  "objc2",
  "objc2-app-kit",
@@ -95,6 +96,16 @@ dependencies = [
  "objc2-quick-look-thumbnailing",
  "objc2-quick-look-ui",
  "security-framework",
+]
+
+[[package]]
+name = "ambry-mcp"
+version = "0.1.0"
+dependencies = [
+ "ambry-core",
+ "anyhow",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
