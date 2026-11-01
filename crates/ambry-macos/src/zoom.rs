@@ -93,4 +93,9 @@ impl PinchZoom {
             recognizer,
         })
     }
+
+    /// Turns the gesture off while another view zooms on its own.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.recognizer.setEnabled(enabled);
+    }
 }

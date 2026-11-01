@@ -90,7 +90,11 @@ impl Memory {
         self.log(Change {
             time: now(),
             actor: actor.into(),
-            action: if existed { Action::Write } else { Action::Create },
+            action: if existed {
+                Action::Write
+            } else {
+                Action::Create
+            },
             path: format!("{MEMORY_DIR}/{note}"),
             before,
         })
@@ -283,7 +287,10 @@ mod tests {
             .unwrap();
         let notes = memory.list();
         assert_eq!(
-            notes.iter().map(|note| note.path.as_str()).collect::<Vec<_>>(),
+            notes
+                .iter()
+                .map(|note| note.path.as_str())
+                .collect::<Vec<_>>(),
             ["deploy.md", "team/rules.md"]
         );
         assert_eq!(notes[0].title, "Deploy");
@@ -292,7 +299,11 @@ mod tests {
             .edit("deploy.md", "make ship", "make release", "agent:test")
             .unwrap();
         assert!(memory.read("deploy.md").unwrap().contains("make release"));
-        assert!(memory.edit("deploy.md", "nowhere", "x", "agent:test").is_err());
+        assert!(
+            memory
+                .edit("deploy.md", "nowhere", "x", "agent:test")
+                .is_err()
+        );
 
         let journal = memory.journal();
         assert_eq!(journal.len(), 3);
@@ -312,8 +323,18 @@ mod tests {
     fn refuses_paths_outside_memory() {
         let dir = tempfile::tempdir().unwrap();
         let memory = Memory::new(dir.path());
-        for bad in ["../AGENTS.md", "/etc/passwd.md", "notes.txt", ".hidden.md", "", "a/../../b.md"] {
-            assert!(memory.write(bad, "x", "agent").is_err(), "{bad} was allowed");
+        for bad in [
+            "../AGENTS.md",
+            "/etc/passwd.md",
+            "notes.txt",
+            ".hidden.md",
+            "",
+            "a/../../b.md",
+        ] {
+            assert!(
+                memory.write(bad, "x", "agent").is_err(),
+                "{bad} was allowed"
+            );
         }
         assert!(!dir.path().join("AGENTS.md").exists());
     }

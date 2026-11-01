@@ -118,10 +118,20 @@ pub fn overview(root: &Path, doc: &BoxDoc) -> String {
 /// What a read found.
 #[derive(Debug, PartialEq)]
 pub enum Read {
-    Text { path: PathBuf, text: String, truncated: bool },
-    Folder { path: PathBuf, entries: Vec<String> },
+    Text {
+        path: PathBuf,
+        text: String,
+        truncated: bool,
+    },
+    Folder {
+        path: PathBuf,
+        entries: Vec<String>,
+    },
     /// A file that is not text, like a picture: its size, so the agent knows it is there.
-    Binary { path: PathBuf, bytes: u64 },
+    Binary {
+        path: PathBuf,
+        bytes: u64,
+    },
 }
 
 /// Reads `requested`: a path relative to the box's folder, or an absolute path to a dropped
@@ -293,14 +303,22 @@ mod tests {
         fs::create_dir_all(outside.join("assets")).unwrap();
         fs::write(outside.join("brief.md"), "# Brief\nLaunch on Friday\n").unwrap();
         fs::write(outside.join("assets/notes.txt"), "the launch slogan\n").unwrap();
-        fs::write(outside.join("assets/logo.png"), [0x89, 0x50, 0xff, 0xfe, 0x00]).unwrap();
+        fs::write(
+            outside.join("assets/logo.png"),
+            [0x89, 0x50, 0xff, 0xfe, 0x00],
+        )
+        .unwrap();
         fs::write(dir.path().join("secret.txt"), "launch codes").unwrap();
         let root = dir.path().join("Box");
         let mut doc = BoxDoc::new("Launch");
         doc.add_paths(&[outside.join("brief.md"), outside.join("assets")], 0., 0.);
         Store::new(&root).save(&doc).unwrap();
         Memory::new(&root)
-            .write("decisions.md", "# Decisions\nLaunch moved to Friday\n", "agent")
+            .write(
+                "decisions.md",
+                "# Decisions\nLaunch moved to Friday\n",
+                "agent",
+            )
             .unwrap();
         (dir, root, doc)
     }
@@ -323,7 +341,12 @@ mod tests {
             Read::Folder { ref entries, .. } if entries == &["logo.png", "notes.txt"]
         ));
         assert!(matches!(
-            read(&root, &doc, outside.join("assets/logo.png").to_str().unwrap()).unwrap(),
+            read(
+                &root,
+                &doc,
+                outside.join("assets/logo.png").to_str().unwrap()
+            )
+            .unwrap(),
             Read::Binary { bytes: 5, .. }
         ));
         for bad in [

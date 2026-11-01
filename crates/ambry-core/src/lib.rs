@@ -426,7 +426,13 @@ pub fn new_box_path(root: &Path, name: &str) -> PathBuf {
     let stem: String = name
         .trim()
         .chars()
-        .map(|c| if matches!(c, '/' | ':' | '\\') || c.is_control() { '-' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | ':' | '\\') || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     let stem = stem.trim_start_matches('.');
     let stem = if stem.is_empty() { "Box" } else { stem };
@@ -620,8 +626,16 @@ mod tests {
         assert!(root.join(".ambry/box.json").is_file());
         assert!(root.join("memory").is_dir());
         assert!(root.join("skills").is_dir());
-        assert!(fs::read_to_string(root.join("AGENTS.md")).unwrap().starts_with("# Inbox"));
-        assert!(fs::read_to_string(root.join("CONTEXT.md")).unwrap().contains("photo.PNG"));
+        assert!(
+            fs::read_to_string(root.join("AGENTS.md"))
+                .unwrap()
+                .starts_with("# Inbox")
+        );
+        assert!(
+            fs::read_to_string(root.join("CONTEXT.md"))
+                .unwrap()
+                .contains("photo.PNG")
+        );
 
         // AGENTS.md belongs to people once it exists.
         fs::write(root.join("AGENTS.md"), "mine").unwrap();

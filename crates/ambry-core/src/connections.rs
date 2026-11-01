@@ -56,7 +56,12 @@ pub fn presets() -> Vec<Connection> {
             enabled: false,
         },
         mcp("slack", "Slack", "https://mcp.slack.com/mcp", "number"),
-        mcp("figma", "Figma", "https://mcp.figma.com/mcp", "pencil.and.outline"),
+        mcp(
+            "figma",
+            "Figma",
+            "https://mcp.figma.com/mcp",
+            "pencil.and.outline",
+        ),
         mcp("notion", "Notion", "https://mcp.notion.com/mcp", "doc.text"),
         mcp(
             "github",
@@ -64,7 +69,12 @@ pub fn presets() -> Vec<Connection> {
             "https://api.githubcopilot.com/mcp/",
             "chevron.left.forwardslash.chevron.right",
         ),
-        mcp("linear", "Linear", "https://mcp.linear.app/mcp", "line.3.horizontal"),
+        mcp(
+            "linear",
+            "Linear",
+            "https://mcp.linear.app/mcp",
+            "line.3.horizontal",
+        ),
     ]
 }
 
@@ -91,8 +101,11 @@ impl Connections {
     }
 
     pub fn save(&self) -> Result<()> {
-        write_atomic(&self.path, serde_json::to_string_pretty(&self.list)?.as_bytes())
-            .with_context(|| format!("saving {}", self.path.display()))
+        write_atomic(
+            &self.path,
+            serde_json::to_string_pretty(&self.list)?.as_bytes(),
+        )
+        .with_context(|| format!("saving {}", self.path.display()))
     }
 
     pub fn get(&self, id: &str) -> Option<&Connection> {
@@ -112,7 +125,8 @@ impl Connections {
         if name.is_empty() {
             bail!("give the server a name");
         }
-        if !(url.starts_with("https://") || url.starts_with("http://localhost")
+        if !(url.starts_with("https://")
+            || url.starts_with("http://localhost")
             || url.starts_with("http://127.0.0.1"))
         {
             bail!("the address must start with https://");
@@ -164,10 +178,14 @@ mod tests {
         let mut connections = Connections::load(dir.path());
         assert_eq!(connections.list.len(), presets().len());
         connections.set_enabled("slack", true);
-        let id = connections.add_mcp("Our Wiki", "https://wiki.example.com/mcp").unwrap();
+        let id = connections
+            .add_mcp("Our Wiki", "https://wiki.example.com/mcp")
+            .unwrap();
         assert_eq!(id, "our-wiki");
         assert_eq!(
-            connections.add_mcp("Our Wiki", "https://x.example.com/mcp").unwrap(),
+            connections
+                .add_mcp("Our Wiki", "https://x.example.com/mcp")
+                .unwrap(),
             "our-wiki-2"
         );
         assert!(connections.add_mcp("Plain", "http://example.com").is_err());
@@ -175,7 +193,10 @@ mod tests {
 
         let mut loaded = Connections::load(dir.path());
         assert!(loaded.get("slack").unwrap().enabled);
-        assert_eq!(loaded.get("our-wiki").unwrap().url, "https://wiki.example.com/mcp");
+        assert_eq!(
+            loaded.get("our-wiki").unwrap().url,
+            "https://wiki.example.com/mcp"
+        );
         loaded.remove("our-wiki");
         loaded.remove("figma");
         assert!(loaded.get("our-wiki").is_none());

@@ -80,10 +80,7 @@ impl Server {
     }
 
     fn initialize(&mut self, params: &Value) -> Value {
-        if let Some(name) = params
-            .pointer("/clientInfo/name")
-            .and_then(Value::as_str)
-        {
+        if let Some(name) = params.pointer("/clientInfo/name").and_then(Value::as_str) {
             self.client = format!("agent:{name}");
         }
         let asked = params
@@ -350,7 +347,12 @@ mod tests {
         let list = call(&mut server, 2, "tools/list", json!({}));
         assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 9);
 
-        let overview = call(&mut server, 3, "tools/call", json!({ "name": "box_overview" }));
+        let overview = call(
+            &mut server,
+            3,
+            "tools/call",
+            json!({ "name": "box_overview" }),
+        );
         assert!(tool_text(&overview).contains("brief.md"));
 
         let read = call(
