@@ -87,6 +87,7 @@ dependencies = [
 name = "ambry-macos"
 version = "0.1.0"
 dependencies = [
+ "ambry-core",
  "block2",
  "objc2",
  "objc2-app-kit",

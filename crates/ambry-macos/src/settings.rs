@@ -49,14 +49,6 @@ const MODELS: [(&str, &str); 3] = [
     ("Claude Haiku 5.5", "claude-haiku-5-5"),
 ];
 
-/// The services Ambry will connect to, shown before their connections exist.
-const SERVICES: [(&str, &str); 4] = [
-    ("Slack", "number"),
-    ("Figma", "pencil.and.outline"),
-    ("Notion", "doc.text"),
-    ("GitHub", "chevron.left.forwardslash.chevron.right"),
-];
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pane {
     General,
@@ -538,29 +530,158 @@ fn connections(mtm: MainThreadMarker, targets: &mut Vec<Retained<Target>>) -> Ve
             .into_super(),
         ),
     ];
-    for (index, (name, glyph)) in SERVICES.iter().enumerate() {
+    let Ok(data) = ambry_core::data_dir() else {
+        return rows;
+    };
+    let saved = ambry_core::connections::Connections::load(&data);
+    let presets: Vec<String> = ambry_core::connections::presets()
+        .into_iter()
+        .map(|preset| preset.id)
+        .collect();
+    let servers = saved
+        .list
+        .iter()
+        .filter(|connection| connection.kind == ambry_core::connections::Kind::Mcp);
+    for (index, connection) in servers.enumerate() {
         let icon = NSImageView::initWithFrame(NSImageView::alloc(mtm), NSRect::ZERO);
-        icon.setImage(symbol(glyph, name).as_deref());
+        icon.setImage(symbol(&connection.symbol, &connection.name).as_deref());
         icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-        let title = NSTextField::labelWithString(&NSString::from_str(name), mtm);
+        let title = NSTextField::labelWithString(&NSString::from_str(&connection.name), mtm);
         width(&title, 70.);
-        let connect = unsafe {
-            NSButton::buttonWithTitle_target_action(&NSString::from_str("Connect"), None, None, mtm)
-        };
-        connect.setEnabled(false);
-        let soon = caption(mtm, "Coming soon");
-        let line = row(
-            mtm,
-            &[
-                icon.into_super().into_super(),
-                title.into_super().into_super(),
-                connect.into_super().into_super(),
-                soon.into_super().into_super(),
-            ],
-        );
-        rows.push((if index == 0 { Some("Services:") } else { None }, line));
+        let host = connection
+            .url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let address = NSTextField::labelWithString(&NSString::from_str(&host), mtm);
+        address.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        address.setFont(Some(&NSFont::systemFontOfSize(
+            NSFont::smallSystemFontSize(),
+        )));
+        address.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByTruncatingMiddle);
+        width(&address, 170.);
+        let id = connection.id.clone();
+        let data_dir = data.clone();
+        let toggle = checkbox(mtm, "On", connection.enabled, targets, move |on| {
+            let mut saved = ambry_core::connections::Connections::load(&data_dir);
+            saved.set_enabled(&id, on);
+            if let Err(err) = saved.save() {
+                eprintln!("could not save connections: {err:#}");
+            }
+        });
+        let mut views = vec![
+            icon.into_super().into_super(),
+            title.into_super().into_super(),
+            address.into_super().into_super(),
+            toggle,
+        ];
+        if !presets.contains(&connection.id) {
+            let id = connection.id.clone();
+            let data_dir = data.clone();
+            views.push(push_button(mtm, "Remove", targets, move || {
+                let mut saved = ambry_core::connections::Connections::load(&data_dir);
+                saved.remove(&id);
+                if let Err(err) = saved.save() {
+                    eprintln!("could not save connections: {err:#}");
+                }
+                reshow(Pane::Connections);
+            }));
+        }
+        rows.push((
+            if index == 0 {
+                Some("MCP servers:")
+            } else {
+                None
+            },
+            row(mtm, &views),
+        ));
     }
+    let data_dir = data.clone();
+    rows.push((
+        None,
+        push_button(mtm, "Add MCP Server…", targets, move || {
+            if let Some((name, url)) = ask_for_server() {
+                let mut saved = ambry_core::connections::Connections::load(&data_dir);
+                match saved.add_mcp(&name, &url).and_then(|_| saved.save()) {
+                    Ok(()) => reshow(Pane::Connections),
+                    Err(err) => warn(&format!("{err:#}")),
+                }
+            }
+        }),
+    ));
+    rows.push((
+        None,
+        caption(
+            mtm,
+            "Ambry reads chats, threads and designs through these servers and saves them as \
+             Markdown in a box’s sources folder. Signing in with each service comes next.",
+        )
+        .into_super()
+        .into_super(),
+    ));
     rows
+}
+
+/// Shows `pane` again once the current event is handled, so the button that asked for it
+/// is not dropped while it is still being pressed.
+fn reshow(pane: Pane) {
+    let block = block2::RcBlock::new(move || {
+        let open = OPEN.with_borrow(|open| open.clone());
+        if let (Some(open), Some(mtm)) = (open, MainThreadMarker::new()) {
+            show_pane(mtm, &open, pane, false);
+        }
+    });
+    // SAFETY: the main queue runs the block on the main thread, where it was made.
+    unsafe { objc2_foundation::NSOperationQueue::mainQueue().addOperationWithBlock(&block) };
+}
+
+/// Asks for a server's name and address in a sheet-like alert.
+fn ask_for_server() -> Option<(String, String)> {
+    let mtm = MainThreadMarker::new()?;
+    let alert = objc2_app_kit::NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Add an MCP server"));
+    alert.setInformativeText(&NSString::from_str(
+        "The server’s address usually ends in /mcp. Ambry signs in with it when it is first used.",
+    ));
+    alert.addButtonWithTitle(&NSString::from_str("Add"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let name = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    name.setPlaceholderString(Some(&NSString::from_str("Name, like Linear")));
+    let url = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    url.setPlaceholderString(Some(&NSString::from_str("https://example.com/mcp")));
+    for field in [&name, &url] {
+        width(field, FIELD_WIDTH);
+    }
+    let stack = objc2_app_kit::NSStackView::stackViewWithViews(
+        &NSArray::from_retained_slice(&[
+            name.clone().into_super().into_super(),
+            url.clone().into_super().into_super(),
+        ]),
+        mtm,
+    );
+    stack.setOrientation(objc2_app_kit::NSUserInterfaceLayoutOrientation::Vertical);
+    stack.setSpacing(8.);
+    stack.setFrameSize(NSSize::new(FIELD_WIDTH, 52.));
+    alert.setAccessoryView(Some(&stack));
+    alert.window().setInitialFirstResponder(Some(&name));
+    if alert.runModal() != objc2_app_kit::NSAlertFirstButtonReturn {
+        return None;
+    }
+    Some((
+        name.stringValue().to_string(),
+        url.stringValue().to_string(),
+    ))
+}
+
+fn warn(text: &str) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let alert = objc2_app_kit::NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Could not add the server"));
+    alert.setInformativeText(&NSString::from_str(text));
+    alert.runModal();
 }
 
 fn popup(
