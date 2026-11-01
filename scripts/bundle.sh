@@ -28,6 +28,8 @@ if [ -n "$classic" ]; then
 else
   cp target/release/ambry "$app/Contents/MacOS/Ambry"
 fi
+# The box's MCP server, for agents: claude mcp add ambry -- <app>/Contents/MacOS/ambry-mcp
+cp target/release/ambry-mcp "$app/Contents/MacOS/ambry-mcp"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

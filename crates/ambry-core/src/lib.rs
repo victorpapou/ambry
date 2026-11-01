@@ -1,7 +1,24 @@
 //! Box model and on-disk storage for Ambry.
 //!
-//! A box is a canvas of items that point at files and folders on disk.
-//! The prototype keeps one box per JSON file; SQLite comes later.
+//! A box is a folder on disk that people and agents share. The items people drop on its canvas
+//! are links to files and folders elsewhere; what agents need lives in the folder itself:
+//!
+//! ```text
+//! <box>/
+//!   AGENTS.md            rules and goal of the box, written by people
+//!   CONTEXT.md           an index of everything in the box, kept up to date by Ambry
+//!   memory/*.md          notes agents write and people correct
+//!   skills/<n>/SKILL.md  procedures, "how we do things here"
+//!   sources/<p>/*.md     snapshots of chats, threads and designs from connected services
+//!   .ambry/box.json      name, icon, items and where they sit on the canvas
+//!   .ambry/journal.jsonl every change an agent made, with a copy of what it replaced
+//! ```
+//!
+//! Any agent can read a box without Ambry; `ambry-mcp` serves the same folder over MCP.
+
+pub mod access;
+pub mod connections;
+pub mod memory;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -330,16 +347,49 @@ impl BoxDoc {
     }
 }
 
-/// `~/Library/Application Support/Ambry` on macOS.
+/// `~/Library/Application Support/Ambry` on macOS: settings and caches, not boxes.
 pub fn data_dir() -> Result<PathBuf> {
     Ok(dirs::data_dir()
         .context("no data directory on this system")?
         .join("Ambry"))
 }
 
+/// Where boxes live: `~/Ambry`, or `$AMBRY_HOME` when it is set.
+pub fn boxes_root() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("AMBRY_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    Ok(dirs::home_dir()
+        .context("no home directory on this system")?
+        .join("Ambry"))
+}
+
+/// The folder inside a box that only Ambry writes.
+pub const META_DIR: &str = ".ambry";
+pub const BOX_FILE: &str = "box.json";
+pub const AGENTS_FILE: &str = "AGENTS.md";
+pub const CONTEXT_FILE: &str = "CONTEXT.md";
+pub const MEMORY_DIR: &str = "memory";
+pub const SKILLS_DIR: &str = "skills";
+pub const SOURCES_DIR: &str = "sources";
+
+/// What a new box's AGENTS.md says until someone rewrites it.
+fn agents_template(name: &str) -> String {
+    format!(
+        "# {name}\n\n\
+         What this box is for, in a sentence or two.\n\n\
+         ## Rules for agents\n\n\
+         - Read CONTEXT.md first: it lists every file in this box.\n\
+         - Save what you learn that the next session would need in memory/, one file per subject.\n\
+         - Keep notes short and dated. Correct a note instead of adding a second one.\n\
+         - Procedures live in skills/<name>/SKILL.md.\n"
+    )
+}
+
 /// A saved box as the box switcher lists it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoxEntry {
+    /// The box's folder.
     pub path: PathBuf,
     pub name: String,
     pub icon: BoxIcon,
@@ -347,15 +397,15 @@ pub struct BoxEntry {
     pub items: usize,
 }
 
-/// Every box saved in `dir`, by name.
-pub fn list_boxes(dir: &Path) -> Vec<BoxEntry> {
-    let Ok(entries) = fs::read_dir(dir) else {
+/// Every box in `root`, by name.
+pub fn list_boxes(root: &Path) -> Vec<BoxEntry> {
+    let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
     let mut boxes: Vec<BoxEntry> = entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter(|path| path.join(META_DIR).join(BOX_FILE).is_file())
         .filter_map(|path| {
             let doc = Store::new(&path).load_or_new("").ok()?;
             Some(BoxEntry {
@@ -370,71 +420,139 @@ pub fn list_boxes(dir: &Path) -> Vec<BoxEntry> {
     boxes
 }
 
-/// A file in `dir` for a new box called `name` that no other box uses yet.
-pub fn new_box_path(dir: &Path, name: &str) -> PathBuf {
+/// A folder in `root` for a new box called `name` that no other box uses yet, named like the
+/// box so people find it in Finder.
+pub fn new_box_path(root: &Path, name: &str) -> PathBuf {
     let stem: String = name
-        .to_lowercase()
+        .trim()
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .map(|c| if matches!(c, '/' | ':' | '\\') || c.is_control() { '-' } else { c })
         .collect();
-    let stem = if stem.is_empty() {
-        "box".to_string()
-    } else {
-        stem
-    };
-    let mut path = dir.join(format!("{stem}.json"));
+    let stem = stem.trim_start_matches('.');
+    let stem = if stem.is_empty() { "Box" } else { stem };
+    let mut path = root.join(stem);
     let mut n = 2;
     while path.exists() {
-        path = dir.join(format!("{stem}-{n}.json"));
+        path = root.join(format!("{stem} {n}"));
         n += 1;
     }
     path
 }
 
-/// Reads and writes a box as pretty JSON.
+/// Moves boxes saved by earlier builds, one JSON file each in `old_dir`, into folders in
+/// `root`. Each old file is renamed to `*.json.migrated` once its box is moved, so this runs
+/// once. Returns the folders made.
+pub fn migrate_legacy(old_dir: &Path, root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(old_dir) else {
+        return Vec::new();
+    };
+    let mut made = Vec::new();
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(json) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<BoxDoc>(&json) else {
+            continue;
+        };
+        let folder = new_box_path(root, &doc.name);
+        if Store::new(&folder).save(&doc).is_err() {
+            continue;
+        }
+        let _ = fs::rename(&path, path.with_extension("json.migrated"));
+        made.push(folder);
+    }
+    made
+}
+
+/// Reads and writes a box's folder.
 pub struct Store {
     path: PathBuf,
 }
 
 impl Store {
+    /// The box in folder `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    /// `~/Library/Application Support/Ambry/boxes/<file_name>.json` on macOS.
-    pub fn in_data_dir(file_name: &str) -> Result<Self> {
-        let dir = data_dir()?.join("boxes");
-        Ok(Self::new(dir.join(format!("{file_name}.json"))))
+    /// The box called `name` in [`boxes_root`], after moving any boxes earlier builds saved.
+    pub fn default_box(name: &str) -> Result<Self> {
+        let root = boxes_root()?;
+        if let Ok(old) = data_dir().map(|dir| dir.join("boxes")) {
+            migrate_legacy(&old, &root);
+        }
+        let existing = list_boxes(&root)
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.path);
+        Ok(Self::new(existing.unwrap_or_else(|| root.join(name))))
     }
 
+    /// The box's folder.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The folder this box is saved in, with the other boxes.
+    /// The folder this box sits in, with the other boxes.
     pub fn dir(&self) -> &Path {
         self.path.parent().unwrap_or(Path::new("."))
     }
 
-    /// Loads the box, or returns a new empty one named `default_name` if none is saved yet.
-    pub fn load_or_new(&self, default_name: &str) -> Result<BoxDoc> {
-        if !self.path.exists() {
-            return Ok(BoxDoc::new(default_name));
-        }
-        let json = fs::read_to_string(&self.path)
-            .with_context(|| format!("reading {}", self.path.display()))?;
-        serde_json::from_str(&json).with_context(|| format!("parsing {}", self.path.display()))
+    fn file(&self) -> PathBuf {
+        self.path.join(META_DIR).join(BOX_FILE)
     }
 
-    pub fn save(&self, doc: &BoxDoc) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
+    /// Loads the box, or returns a new empty one named `default_name` if none is saved yet.
+    pub fn load_or_new(&self, default_name: &str) -> Result<BoxDoc> {
+        let file = self.file();
+        if !file.exists() {
+            return Ok(BoxDoc::new(default_name));
         }
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(doc)?)?;
-        fs::rename(&tmp, &self.path)?;
-        Ok(())
+        let json =
+            fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+        serde_json::from_str(&json).with_context(|| format!("parsing {}", file.display()))
     }
+
+    /// Saves the box, makes the folders agents expect if they are missing, and rewrites
+    /// CONTEXT.md.
+    pub fn save(&self, doc: &BoxDoc) -> Result<()> {
+        let meta = self.path.join(META_DIR);
+        fs::create_dir_all(&meta).with_context(|| format!("creating {}", meta.display()))?;
+        for dir in [MEMORY_DIR, SKILLS_DIR] {
+            fs::create_dir_all(self.path.join(dir))?;
+        }
+        let agents = self.path.join(AGENTS_FILE);
+        if !agents.exists() {
+            fs::write(&agents, agents_template(&doc.name))?;
+        }
+        write_atomic(&self.file(), serde_json::to_string_pretty(doc)?.as_bytes())?;
+        self.refresh_context(doc)
+    }
+
+    /// Rewrites CONTEXT.md, after memory or skills changed.
+    pub fn refresh_context(&self, doc: &BoxDoc) -> Result<()> {
+        write_atomic(
+            &self.path.join(CONTEXT_FILE),
+            access::context_markdown(&self.path, doc).as_bytes(),
+        )
+    }
+}
+
+/// Writes `bytes` to a temporary file next to `path` and moves it over `path`, so readers
+/// never see half a file.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -465,12 +583,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut work = BoxDoc::new("Work");
         work.icon.symbol = "briefcase".into();
-        Store::new(dir.path().join("work.json"))
-            .save(&work)
-            .unwrap();
-        Store::new(dir.path().join("inbox.json"))
+        Store::new(dir.path().join("Work")).save(&work).unwrap();
+        Store::new(dir.path().join("Inbox"))
             .save(&BoxDoc::new("Inbox"))
             .unwrap();
+        // A folder that is not a box is left out.
+        fs::create_dir(dir.path().join("Photos")).unwrap();
 
         let boxes = list_boxes(dir.path());
         let names: Vec<_> = boxes.iter().map(|entry| entry.name.as_str()).collect();
@@ -480,24 +598,35 @@ mod tests {
 
         assert_eq!(
             new_box_path(dir.path(), "New Box"),
-            dir.path().join("new-box.json")
+            dir.path().join("New Box")
         );
-        assert_eq!(
-            new_box_path(dir.path(), "Work"),
-            dir.path().join("work-2.json")
-        );
+        assert_eq!(new_box_path(dir.path(), "Work"), dir.path().join("Work 2"));
+        assert_eq!(new_box_path(dir.path(), "a/b"), dir.path().join("a-b"));
+        assert_eq!(new_box_path(dir.path(), "..."), dir.path().join("Box"));
     }
 
     #[test]
-    fn store_round_trips() {
+    fn store_round_trips_and_lays_out_the_folder() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(dir.path().join("boxes/inbox.json"));
+        let store = Store::new(dir.path().join("Inbox"));
         let mut doc = store.load_or_new("Inbox").unwrap();
         assert_eq!(doc.name, "Inbox");
 
         doc.add_paths(&[dir.path().join("photo.PNG")], 0.0, 0.0);
         doc.move_item(1, 50.0, 60.0);
         store.save(&doc).unwrap();
+
+        let root = store.path();
+        assert!(root.join(".ambry/box.json").is_file());
+        assert!(root.join("memory").is_dir());
+        assert!(root.join("skills").is_dir());
+        assert!(fs::read_to_string(root.join("AGENTS.md")).unwrap().starts_with("# Inbox"));
+        assert!(fs::read_to_string(root.join("CONTEXT.md")).unwrap().contains("photo.PNG"));
+
+        // AGENTS.md belongs to people once it exists.
+        fs::write(root.join("AGENTS.md"), "mine").unwrap();
+        store.save(&doc).unwrap();
+        assert_eq!(fs::read_to_string(root.join("AGENTS.md")).unwrap(), "mine");
 
         let loaded = store.load_or_new("ignored").unwrap();
         assert_eq!(loaded, doc);
@@ -508,5 +637,24 @@ mod tests {
         assert!(loaded.items.is_empty());
         // Ids keep growing after a removal.
         assert_eq!(loaded.add_paths(&[dir.path().join("b")], 0.0, 0.0), vec![2]);
+    }
+
+    #[test]
+    fn migrates_json_boxes_once() {
+        let old = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut doc = BoxDoc::new("Launch");
+        doc.add_paths(&[old.path().join("plan.md")], 0.0, 0.0);
+        fs::write(
+            old.path().join("launch.json"),
+            serde_json::to_string(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let made = migrate_legacy(old.path(), root.path());
+        assert_eq!(made, vec![root.path().join("Launch")]);
+        assert_eq!(Store::new(&made[0]).load_or_new("").unwrap(), doc);
+        assert!(old.path().join("launch.json.migrated").exists());
+        assert!(migrate_legacy(old.path(), root.path()).is_empty());
     }
 }

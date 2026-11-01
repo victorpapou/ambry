@@ -98,6 +98,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ambry-mcp"
+version = "0.1.0"
+dependencies = [
+ "ambry-core",
+ "anyhow",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
