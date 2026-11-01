@@ -932,6 +932,9 @@ impl IconCanvas {
         scroll.setHasVerticalScroller(true);
         scroll.setHasHorizontalScroller(true);
         scroll.setAutohidesScrollers(true);
+        // A canvas pans in every direction at once, not locked to the axis the fingers
+        // started along, as a document does.
+        scroll.setUsesPredominantAxisScrolling(false);
         scroll.setAllowsMagnification(true);
         scroll.setMinMagnification(MIN_ZOOM);
         scroll.setMaxMagnification(MAX_ZOOM);

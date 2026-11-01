@@ -392,7 +392,7 @@ impl BoxView {
                     added.try_send(ControlEvent::Add).ok();
                 },
             )?;
-            add.set_white();
+            // AppKit's own glass, as Apple's apps show a floating action.
             NativeControls {
                 ns_view,
                 toolbar,
